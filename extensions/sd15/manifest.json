@@ -1,0 +1,156 @@
+{
+  "id": "sd15",
+  "name": "Stable Diffusion 1.5",
+  "type": "model",
+  "description": "Self-contained SD15 model extension scaffold for local text-to-image and image-to-image workflows.",
+  "version": "0.1.0",
+  "author": "Standalone Extension",
+  "generator_class": "SD15Generator",
+  "tags": [
+    "text-to-image",
+    "image-to-image",
+    "stable-diffusion",
+    "local"
+  ],
+  "nodes": [
+    {
+      "id": "text-to-image",
+      "name": "Text to Image",
+      "input": "text",
+      "output": "image",
+      "hf_repo": "runwayml/stable-diffusion-v1-5",
+      "download_check": "model_index.json",
+      "params_schema": [
+        {
+          "id": "prompt",
+          "label": "Prompt",
+          "type": "string",
+          "default": "",
+          "tooltip": "Prompt text to generate from."
+        },
+        {
+          "id": "negative_prompt",
+          "label": "Negative Prompt",
+          "type": "string",
+          "default": "",
+          "tooltip": "Optional prompt describing what to avoid."
+        },
+        {
+          "id": "width",
+          "label": "Width",
+          "type": "int",
+          "default": 512,
+          "min": 64,
+          "max": 2048
+        },
+        {
+          "id": "height",
+          "label": "Height",
+          "type": "int",
+          "default": 512,
+          "min": 64,
+          "max": 2048
+        },
+        {
+          "id": "steps",
+          "label": "Steps",
+          "type": "int",
+          "default": 30,
+          "min": 1,
+          "max": 150
+        },
+        {
+          "id": "guidance_scale",
+          "label": "Guidance Scale",
+          "type": "float",
+          "default": 7.5,
+          "min": 0,
+          "max": 50,
+          "tooltip": "How strongly generation follows the prompt."
+        },
+        {
+          "id": "seed",
+          "label": "Seed",
+          "type": "int",
+          "default": 42,
+          "min": 0,
+          "max": 2147483647
+        }
+      ]
+    },
+    {
+      "id": "image-to-image",
+      "name": "Image to Image",
+      "input": "image",
+      "output": "image",
+      "hf_repo": "runwayml/stable-diffusion-v1-5",
+      "download_check": "model_index.json",
+      "params_schema": [
+        {
+          "id": "prompt",
+          "label": "Prompt",
+          "type": "string",
+          "default": "",
+          "tooltip": "Optional prompt describing the desired edit target."
+        },
+        {
+          "id": "negative_prompt",
+          "label": "Negative Prompt",
+          "type": "string",
+          "default": "",
+          "tooltip": "Optional prompt describing what to avoid during the edit."
+        },
+        {
+          "id": "width",
+          "label": "Width",
+          "type": "int",
+          "default": 512,
+          "min": 64,
+          "max": 2048
+        },
+        {
+          "id": "height",
+          "label": "Height",
+          "type": "int",
+          "default": 512,
+          "min": 64,
+          "max": 2048
+        },
+        {
+          "id": "strength",
+          "label": "Strength",
+          "type": "float",
+          "default": 0.75,
+          "min": 0,
+          "max": 1,
+          "tooltip": "How strongly the source image should be transformed."
+        },
+        {
+          "id": "steps",
+          "label": "Steps",
+          "type": "int",
+          "default": 30,
+          "min": 1,
+          "max": 150
+        },
+        {
+          "id": "guidance_scale",
+          "label": "Guidance Scale",
+          "type": "float",
+          "default": 7.5,
+          "min": 0,
+          "max": 50,
+          "tooltip": "How strongly generation follows the prompt."
+        },
+        {
+          "id": "seed",
+          "label": "Seed",
+          "type": "int",
+          "default": 42,
+          "min": 0,
+          "max": 2147483647
+        }
+      ]
+    }
+  ]
+}

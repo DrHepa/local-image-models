@@ -1,0 +1,82 @@
+{
+  "id": "flux-schnell",
+  "name": "FLUX Schnell",
+  "type": "model",
+  "description": "Self-contained FLUX Schnell model extension scaffold for local text-to-image workflows.",
+  "version": "0.1.0",
+  "author": "Standalone Extension",
+  "generator_class": "FluxSchnellGenerator",
+  "tags": [
+    "text-to-image",
+    "flux",
+    "fast",
+    "local"
+  ],
+  "nodes": [
+    {
+      "id": "text-to-image",
+      "name": "Text to Image",
+      "input": "text",
+      "output": "image",
+      "hf_repo": "black-forest-labs/FLUX.1-schnell",
+      "download_check": "model_index.json",
+      "params_schema": [
+        {
+          "id": "prompt",
+          "label": "Prompt",
+          "type": "string",
+          "default": "",
+          "tooltip": "Prompt text for FLUX Schnell text-to-image generation."
+        },
+        {
+          "id": "negative_prompt",
+          "label": "Negative Prompt",
+          "type": "string",
+          "default": "",
+          "tooltip": "Optional prompt describing what to avoid."
+        },
+        {
+          "id": "width",
+          "label": "Width",
+          "type": "int",
+          "default": 1024,
+          "min": 64,
+          "max": 2048
+        },
+        {
+          "id": "height",
+          "label": "Height",
+          "type": "int",
+          "default": 1024,
+          "min": 64,
+          "max": 2048
+        },
+        {
+          "id": "steps",
+          "label": "Steps",
+          "type": "int",
+          "default": 4,
+          "min": 1,
+          "max": 150
+        },
+        {
+          "id": "guidance_scale",
+          "label": "Guidance Scale",
+          "type": "float",
+          "default": 0,
+          "min": 0,
+          "max": 50,
+          "tooltip": "Reserved for backend compatibility; scaffold defaults to 0.0."
+        },
+        {
+          "id": "seed",
+          "label": "Seed",
+          "type": "int",
+          "default": 42,
+          "min": 0,
+          "max": 2147483647
+        }
+      ]
+    }
+  ]
+}
