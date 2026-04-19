@@ -18,7 +18,7 @@ RUNTIME_ROOT = REPO_ROOT / "shared" / "runtime"
 if str(RUNTIME_ROOT) not in sys.path:
     sys.path.insert(0, str(RUNTIME_ROOT))
 
-from local_image_runtime import bootstrap, install_contract, runtime_adapter, weights  # noqa: E402
+from local_image_runtime import bootstrap, dependencies, install_contract, runtime_adapter, weights  # noqa: E402
 from local_image_runtime.dependencies import DependencyInstallStep, DependencyPlan  # noqa: E402
 
 
@@ -29,6 +29,22 @@ EXTENSION_IDS = ("sd15", "sdxl-base", "flux-schnell")
 
 class RuntimeHarnessTests(unittest.TestCase):
     maxDiff = None
+
+    def _canonical_runtime_file(self, relative_name: str) -> Path:
+        return REPO_ROOT / "shared" / "runtime" / "local_image_runtime" / relative_name
+
+    def _vendored_runtime_file(self, extension_id: str, relative_name: str) -> Path:
+        return REPO_ROOT / "extensions" / extension_id / "src" / "local_image_runtime" / relative_name
+
+    def _resolve_plan(self, *, python_tag: str, cuda_version: str) -> DependencyPlan:
+        return dependencies.resolve_dependency_plan(
+            extension_id="sd15",
+            dependency_family="sd15",
+            readiness_imports=(),
+            platform_info=SUPPORTED_PLATFORM,
+            python_tag=python_tag,
+            cuda_version=cuda_version,
+        )
 
     def _extension_manifest(self, extension_id: str) -> str:
         return (REPO_ROOT / "extensions" / extension_id / "manifest.json").read_text(encoding="utf-8")
@@ -94,6 +110,9 @@ class RuntimeHarnessTests(unittest.TestCase):
             ),
             readiness_imports=(),
         )
+
+    def _fake_torch_plan(self, extension_id: str, *, python_tag: str, cuda_version: str) -> DependencyPlan:
+        return self._resolve_plan(python_tag=python_tag, cuda_version=cuda_version)
 
     def _run_checked_side_effect(self, *, command, step_name, cwd=None):
         if step_name != "create_venv":
@@ -306,6 +325,163 @@ class RuntimeHarnessTests(unittest.TestCase):
         self.assertEqual(record["status"], bootstrap.EXTENSION_STATUS_ERROR)
         self.assertEqual(record["error"], "pip install failed for diffusers==0.35.1")
 
+    def test_torch_dependency_failure_persists_contextual_index_diagnostics(self) -> None:
+        extension_id = "sd15"
+        runtime_root = self._make_runtime_root(extension_id)
+        plan = self._fake_torch_plan(extension_id, python_tag="cp312", cuda_version="12.8")
+        torch_index_url = dependencies._TORCH_EXTRA_INDEX_URLS[plan.cuda_variant]
+        raw_detail = "Could not fetch URL https://download.pytorch.org/whl/cu128/triton/: connection refused"
+        expected_context = (
+            f"install_shared_torch failed for cuda_variant '{plan.cuda_variant}' using PyTorch index "
+            f"'{torch_index_url}'. Verify that the PyTorch index is reachable and compatible with "
+            "the selected CUDA variant."
+        )
+
+        def fail_on_torch_step(*, venv_python, install_step, cwd):
+            if install_step.name == "install_shared_torch":
+                raise install_contract.SetupExecutionError(
+                    step_name=install_step.name,
+                    detail=raw_detail,
+                )
+            return None
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.dict(
+                    os.environ,
+                    {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)},
+                    clear=False,
+                )
+            )
+            stack.enter_context(
+                patch("local_image_runtime.install_contract.detect_platform", return_value=SUPPORTED_PLATFORM)
+            )
+            stack.enter_context(
+                patch("local_image_runtime.install_contract.resolve_dependency_plan", return_value=plan)
+            )
+            stack.enter_context(
+                patch("local_image_runtime.install_contract._run_checked", side_effect=self._run_checked_side_effect)
+            )
+            stack.enter_context(
+                patch("local_image_runtime.install_contract._install_dependency_step", side_effect=fail_on_torch_step)
+            )
+            stack.enter_context(
+                patch("local_image_runtime.bootstrap._smoke_test_runtime_imports", return_value=(True, "stubbed imports"))
+            )
+            result = install_contract.run_install_setup_contract(
+                extension_id=extension_id,
+                stdin_text=self._payload(runtime_root),
+            )
+
+        self.assertEqual(result.status, bootstrap.SETUP_STATUS_FAILED)
+        self.assertEqual(result.steps[-1].name, "install_shared_torch")
+        self.assertEqual(result.steps[-1].status, "failed")
+        self.assertIn(raw_detail, result.diagnostics)
+        self.assertIn(expected_context, result.diagnostics)
+
+        with patch.dict(
+            os.environ,
+            {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)},
+            clear=False,
+        ):
+            snapshot = bootstrap.bootstrap_runtime(extension_id=extension_id)
+        record = bootstrap.get_extension_record(snapshot, extension_id)
+        self.assertEqual(record["setup"]["status"], bootstrap.SETUP_STATUS_FAILED)
+        self.assertEqual(record["status"], bootstrap.EXTENSION_STATUS_ERROR)
+        self.assertEqual(record["error"], raw_detail)
+        self.assertIn(expected_context, record["setup"]["diagnostics"])
+
+    def test_resolve_dependency_plan_builds_torch_step_for_cp311_cu124(self) -> None:
+        plan = self._resolve_plan(python_tag="cp311", cuda_version="12.4")
+
+        torch_step = plan.shared_steps[0]
+        self.assertEqual(torch_step.name, "install_shared_torch")
+        self.assertEqual(
+            torch_step.extra_args,
+            (
+                "--index-url",
+                dependencies._PYPI_INDEX_URL,
+                "--extra-index-url",
+                dependencies._TORCH_EXTRA_INDEX_URLS["cu124"],
+                "--no-cache-dir",
+            ),
+        )
+        self.assertEqual(
+            torch_step.packages,
+            (
+                dependencies._TORCH_WHEELS["cu124"]["cp311"]["torch"],
+                dependencies._TORCH_WHEELS["cu124"]["cp311"]["torchvision"],
+            ),
+        )
+
+    def test_resolve_dependency_plan_builds_torch_step_for_cp312_cu128(self) -> None:
+        plan = self._resolve_plan(python_tag="cp312", cuda_version="12.8")
+
+        torch_step = plan.shared_steps[0]
+        self.assertEqual(plan.cuda_variant, "cu128")
+        self.assertEqual(torch_step.name, "install_shared_torch")
+        self.assertEqual(
+            torch_step.extra_args,
+            (
+                "--index-url",
+                dependencies._PYPI_INDEX_URL,
+                "--extra-index-url",
+                dependencies._TORCH_EXTRA_INDEX_URLS["cu128"],
+                "--no-cache-dir",
+            ),
+        )
+        self.assertEqual(
+            torch_step.packages,
+            (
+                dependencies._TORCH_WHEELS["cu128"]["cp312"]["torch"],
+                dependencies._TORCH_WHEELS["cu128"]["cp312"]["torchvision"],
+            ),
+        )
+
+    def test_pip_install_command_keeps_indexes_before_direct_wheels(self) -> None:
+        command = dependencies.pip_install_command(
+            venv_python="/tmp/runtime/bin/python",
+            extra_args=(
+                "--index-url",
+                "https://pypi.org/simple",
+                "--extra-index-url",
+                "https://download.pytorch.org/whl/cu128",
+                "--no-cache-dir",
+            ),
+            packages=(
+                dependencies._TORCH_WHEELS["cu128"]["cp312"]["torch"],
+                dependencies._TORCH_WHEELS["cu128"]["cp312"]["torchvision"],
+            ),
+        )
+
+        self.assertEqual(
+            command,
+            [
+                "/tmp/runtime/bin/python",
+                "-m",
+                "pip",
+                "install",
+                "--index-url",
+                "https://pypi.org/simple",
+                "--extra-index-url",
+                "https://download.pytorch.org/whl/cu128",
+                "--no-cache-dir",
+                dependencies._TORCH_WHEELS["cu128"]["cp312"]["torch"],
+                dependencies._TORCH_WHEELS["cu128"]["cp312"]["torchvision"],
+            ],
+        )
+
+    def test_select_cuda_variant_preserves_verified_matrix(self) -> None:
+        self.assertEqual(dependencies._select_cuda_variant("12.8"), "cu128")
+        self.assertEqual(dependencies._select_cuda_variant("12.4"), "cu124")
+
+    def test_select_cuda_variant_rejects_unverified_cuda(self) -> None:
+        with self.assertRaisesRegex(
+            dependencies.DependencyPlanError,
+            "Verified variants are cu124 and cu128 only",
+        ):
+            dependencies._select_cuda_variant("12.3")
+
     def test_bootstrap_reconciles_stale_ready_state_to_installed(self) -> None:
         extension_id = "sd15"
         runtime_root = self._make_runtime_root(extension_id)
@@ -407,6 +583,16 @@ class RuntimeHarnessTests(unittest.TestCase):
             expected_missing,
         )
         self.assertIn(expected_missing, "\n".join(image_node["diagnostics"]))
+
+    def test_vendored_runtime_matches_canonical_dependencies_and_install_contract(self) -> None:
+        for relative_name in ("dependencies.py", "install_contract.py"):
+            canonical_text = self._canonical_runtime_file(relative_name).read_text(encoding="utf-8")
+            for extension_id in EXTENSION_IDS:
+                with self.subTest(extension_id=extension_id, relative_name=relative_name):
+                    vendored_text = self._vendored_runtime_file(extension_id, relative_name).read_text(
+                        encoding="utf-8"
+                    )
+                    self.assertEqual(vendored_text, canonical_text)
 
 
 if __name__ == "__main__":

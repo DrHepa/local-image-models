@@ -24,6 +24,7 @@ from .dependencies import (
     DependencyInstallStep,
     DependencyPlan,
     DependencyPlanError,
+    _TORCH_EXTRA_INDEX_URLS,
     pip_install_command,
     python_tag_from_interpreter,
     resolve_dependency_plan,
@@ -180,6 +181,19 @@ def _detail_for_plan(plan: DependencyPlan) -> str:
     return (
         f"Selected verified dependency plan for {plan.platform_system}/{plan.platform_machine}, "
         f"Python {plan.python_tag}, {plan.cuda_variant}, family '{plan.dependency_family}'."
+    )
+
+
+def _torch_failure_diagnostic(*, exc: SetupExecutionError, plan: DependencyPlan | None) -> str | None:
+    if exc.step_name != "install_shared_torch" or plan is None:
+        return None
+    torch_index_url = _TORCH_EXTRA_INDEX_URLS.get(plan.cuda_variant)
+    if torch_index_url is None:
+        return None
+    return (
+        f"install_shared_torch failed for cuda_variant '{plan.cuda_variant}' using PyTorch index "
+        f"'{torch_index_url}'. Verify that the PyTorch index is reachable and compatible with "
+        "the selected CUDA variant."
     )
 
 
@@ -426,6 +440,9 @@ def run_install_setup_contract(
     except SetupExecutionError as exc:
         execution_steps.append(_step(exc.step_name, "failed", exc.detail))
         diagnostics.append(exc.detail)
+        torch_diagnostic = _torch_failure_diagnostic(exc=exc, plan=plan)
+        if torch_diagnostic is not None:
+            diagnostics.append(torch_diagnostic)
         return _persist_failed_result(
             snapshot=installing_snapshot,
             extension_id=extension_id,

@@ -9,6 +9,11 @@ from typing import Iterable
 
 LINUX_ARM64_MACHINES = frozenset({"aarch64", "arm64"})
 SUPPORTED_SYSTEM = "linux"
+_PYPI_INDEX_URL = "https://pypi.org/simple"
+_TORCH_EXTRA_INDEX_URLS = {
+    "cu124": "https://download.pytorch.org/whl/cu124",
+    "cu128": "https://download.pytorch.org/whl/cu128",
+}
 
 _TORCH_WHEELS = {
     "cu124": {
@@ -162,10 +167,21 @@ def _torch_step(cuda_variant: str, python_tag: str) -> DependencyInstallStep:
         raise DependencyPlanError(
             f"No verified Linux ARM64 PyTorch wheels for {cuda_variant} and Python ABI '{python_tag}'. Supported ABI tags: {supported_tags}."
         )
+
     return DependencyInstallStep(
         name="install_shared_torch",
         packages=(wheel_map["torch"], wheel_map["torchvision"]),
-        extra_args=("--no-cache-dir",),
+        extra_args=_torch_step_extra_args(cuda_variant),
+    )
+
+
+def _torch_step_extra_args(cuda_variant: str) -> tuple[str, ...]:
+    return (
+        "--index-url",
+        _PYPI_INDEX_URL,
+        "--extra-index-url",
+        _TORCH_EXTRA_INDEX_URLS[cuda_variant],
+        "--no-cache-dir",
     )
 
 
