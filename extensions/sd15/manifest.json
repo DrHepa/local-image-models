@@ -4,7 +4,7 @@
   "type": "model",
   "description": "Self-contained SD15 model extension scaffold for local text-to-image and image-to-image workflows.",
   "version": "0.1.0",
-  "author": "Standalone Extension",
+  "author": "DrHepa",
   "generator_class": "SD15Generator",
   "tags": [
     "text-to-image",

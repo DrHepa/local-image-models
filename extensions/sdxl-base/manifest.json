@@ -4,7 +4,7 @@
   "type": "model",
   "description": "Self-contained SDXL Base model extension scaffold for local text-to-image and image-to-image workflows.",
   "version": "0.1.0",
-  "author": "Standalone Extension",
+  "author": "DrHepa",
   "generator_class": "SDXLBaseGenerator",
   "tags": [
     "text-to-image",

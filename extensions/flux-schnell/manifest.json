@@ -4,7 +4,7 @@
   "type": "model",
   "description": "Self-contained FLUX Schnell model extension scaffold for local text-to-image workflows.",
   "version": "0.1.0",
-  "author": "Standalone Extension",
+  "author": "DrHepa",
   "generator_class": "FluxSchnellGenerator",
   "tags": [
     "text-to-image",
