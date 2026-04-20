@@ -194,6 +194,7 @@ def execute(
     emit_log: Callable[[str], None],
 ) -> dict[str, Any]:
     _require_supported_node(extension_id, request.node_id)
+    effective_workspace_dir = request.workspace_dir or str(runtime.paths.outputs_dir)
     emit_progress(35, "validating-request")
 
     legacy_model_id = _resolve_legacy_model_id(request.params, extension_id)
@@ -205,7 +206,7 @@ def execute(
             if legacy_model_id is not None
             else ""
         )
-        + "."
+        + f". Workspace: {effective_workspace_dir}."
     )
     emit_progress(55, "checking-extension")
 
@@ -222,7 +223,7 @@ def execute(
     raise BackendNotImplementedError(
         f"Generation backend is not implemented yet for node '{request.node_id}' with extension '{extension_id}'. "
         f"Validation passed and the runtime scaffold is ready. Next step: implement the backend adapter in "
-        f"shared/runtime/local_image_runtime/pipeline.py and write outputs to {runtime.paths.outputs_dir}. "
+        f"shared/runtime/local_image_runtime/pipeline.py and write outputs to {effective_workspace_dir}. "
         f"Validated request summary: prompt={'yes' if payload_details.prompt else 'no'}, "
         f"source_image={'yes' if payload_details.source_image_path else 'no'}, "
         f"legacy_model_id={'yes' if payload_details.legacy_model_id else 'no'}, "

@@ -8,8 +8,10 @@ import sys
 import tempfile
 import unittest
 from contextlib import ExitStack
+from importlib.util import module_from_spec, spec_from_file_location
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -18,7 +20,14 @@ RUNTIME_ROOT = REPO_ROOT / "shared" / "runtime"
 if str(RUNTIME_ROOT) not in sys.path:
     sys.path.insert(0, str(RUNTIME_ROOT))
 
-from local_image_runtime import bootstrap, dependencies, install_contract, runtime_adapter, weights  # noqa: E402
+from local_image_runtime import (  # noqa: E402
+    bootstrap,
+    dependencies,
+    install_contract,
+    pipeline,
+    runtime_adapter,
+    weights,
+)
 from local_image_runtime.dependencies import DependencyInstallStep, DependencyPlan  # noqa: E402
 
 
@@ -48,6 +57,27 @@ class RuntimeHarnessTests(unittest.TestCase):
 
     def _extension_manifest(self, extension_id: str) -> str:
         return (REPO_ROOT / "extensions" / extension_id / "manifest.json").read_text(encoding="utf-8")
+
+    def _extension_manifest_data(self, extension_id: str) -> dict[str, object]:
+        return json.loads(self._extension_manifest(extension_id))
+
+    def _load_generator_class(self, extension_id: str) -> type[object]:
+        manifest = self._extension_manifest_data(extension_id)
+        generator_path = REPO_ROOT / "extensions" / extension_id / "generator.py"
+        spec = spec_from_file_location(f"test_generator_{extension_id.replace('-', '_')}", generator_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = module_from_spec(spec)
+        spec.loader.exec_module(module)
+        generator_class_name = manifest["generator_class"]
+        self.assertIsInstance(generator_class_name, str)
+        return getattr(module, generator_class_name)
+
+    def _make_model_dir(self, extension_id: str, model_dir_name: str) -> Path:
+        root = Path(tempfile.mkdtemp(prefix=f"model-dir-{extension_id}-"))
+        model_dir = root / extension_id / model_dir_name
+        model_dir.mkdir(parents=True, exist_ok=True)
+        return model_dir
 
     def _make_runtime_root(self, extension_id: str) -> Path:
         runtime_root = Path(tempfile.mkdtemp(prefix=f"local-image-{extension_id}-"))
@@ -557,9 +587,302 @@ class RuntimeHarnessTests(unittest.TestCase):
 
                 output = stdout.getvalue()
                 self.assertEqual(exit_code, 1)
+                self.assertIn('"label": "runtime-ready"', output)
                 self.assertIn('"label": "backend-dispatch"', output)
+                self.assertIn("Runtime ready at", output)
                 self.assertIn("Generation backend is not implemented yet", output)
                 self.assertNotIn("not installed", output.lower())
+
+    def test_run_payload_reaches_backend_not_implemented_after_ready_setup(self) -> None:
+        payload = json.loads(self._generator_payload().getvalue())
+
+        for extension_id in EXTENSION_IDS:
+            with self.subTest(extension_id=extension_id):
+                runtime_root, result = self._run_setup_success(extension_id)
+                self.assertEqual(result.status, bootstrap.SETUP_STATUS_READY)
+
+                with patch.dict(
+                    os.environ,
+                    {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)},
+                    clear=False,
+                ), patch(
+                    "local_image_runtime.bootstrap._smoke_test_runtime_imports",
+                    return_value=(True, "stubbed imports"),
+                ):
+                    with self.assertRaisesRegex(
+                        pipeline.BackendNotImplementedError,
+                        "Generation backend is not implemented yet",
+                    ) as exc_info:
+                        runtime_adapter.run_payload(
+                            payload,
+                            extension_id=extension_id,
+                            runtime_root=str(runtime_root),
+                        )
+
+                self.assertIn("Validation passed and the runtime scaffold is ready", str(exc_info.exception))
+                self.assertNotIn("not installed", str(exc_info.exception).lower())
+
+    def test_extension_generator_classes_expose_basegenerator_contract(self) -> None:
+        expected_nodes = {
+            "sd15": "text-to-image",
+            "sdxl-base": "text-to-image",
+            "flux-schnell": "text-to-image",
+        }
+
+        for extension_id, node_id in expected_nodes.items():
+            with self.subTest(extension_id=extension_id, node_id=node_id):
+                generator_class = self._load_generator_class(extension_id)
+                model_dir = self._make_model_dir(extension_id, node_id)
+                outputs_dir = Path(tempfile.mkdtemp(prefix=f"outputs-{extension_id}-"))
+
+                generator = generator_class(model_dir, outputs_dir)
+
+                self.assertEqual(generator.model_dir, model_dir)
+                self.assertEqual(generator.outputs_dir, outputs_dir)
+                self.assertTrue(callable(generator.load))
+                self.assertTrue(callable(generator.generate))
+                self.assertTrue(callable(generator.unload))
+                self.assertTrue(callable(generator.params_schema))
+                self.assertIsInstance(generator.params_schema(), list)
+                self.assertGreater(len(generator.params_schema()), 0)
+
+    def test_extension_generator_resolves_node_from_model_dir_name(self) -> None:
+        cases = (
+            ("sd15", "text-to-image", "text-to-image"),
+            ("sd15", "image-to-image", "image-to-image"),
+            ("sdxl-base", "text-to-image", "text-to-image"),
+            ("sdxl-base", "image-to-image", "image-to-image"),
+            ("flux-schnell", "weights-cache", "text-to-image"),
+        )
+
+        for extension_id, model_dir_name, expected_node_id in cases:
+            with self.subTest(
+                extension_id=extension_id,
+                model_dir_name=model_dir_name,
+                expected_node_id=expected_node_id,
+            ):
+                generator_class = self._load_generator_class(extension_id)
+                model_dir = self._make_model_dir(extension_id, model_dir_name)
+                outputs_dir = Path(tempfile.mkdtemp(prefix=f"outputs-{extension_id}-"))
+
+                generator = generator_class(model_dir, outputs_dir)
+
+                self.assertEqual(generator.node_id, expected_node_id)
+
+    def test_extension_generator_rejects_unsupported_model_dir_name(self) -> None:
+        generator_class = self._load_generator_class("sd15")
+        model_dir = self._make_model_dir("sd15", "not-a-real-node")
+        outputs_dir = Path(tempfile.mkdtemp(prefix="outputs-sd15-"))
+
+        with self.assertRaisesRegex(
+            runtime_adapter.DomainError,
+            "Could not resolve node for extension 'sd15' from model_dir.name 'not-a-real-node'",
+        ):
+            generator_class(model_dir, outputs_dir)
+
+    def test_extension_generator_load_and_unload_manage_runtime_snapshot(self) -> None:
+        generator_class = self._load_generator_class("sd15")
+        model_dir = self._make_model_dir("sd15", "text-to-image")
+        outputs_dir = Path(tempfile.mkdtemp(prefix="outputs-sd15-"))
+        runtime_snapshot = object()
+
+        with patch("local_image_runtime.runtime_adapter.bootstrap_runtime", return_value=runtime_snapshot) as bootstrap_mock:
+            generator = generator_class(model_dir, outputs_dir)
+
+            generator.load()
+            generator.load()
+            self.assertIs(generator._runtime_snapshot, runtime_snapshot)
+            self.assertIs(generator._model, runtime_snapshot)
+            self.assertEqual(bootstrap_mock.call_count, 1)
+
+            generator.unload()
+            self.assertIsNone(generator._runtime_snapshot)
+            self.assertIsNone(generator._model)
+
+            generator.load()
+            self.assertEqual(bootstrap_mock.call_count, 2)
+
+    def test_extension_generator_generate_maps_text_to_image_request(self) -> None:
+        cases = (
+            ("sd15", {"prompt": "primary prompt", "input": {"text": "legacy prompt"}}, "primary prompt"),
+            ("sdxl-base", {"input": {"text": "legacy only prompt"}}, None),
+            ("flux-schnell", {"prompt": "flux prompt", "input": {"text": "ignored fallback"}}, "flux prompt"),
+        )
+
+        for extension_id, params, expected_prompt in cases:
+            with self.subTest(extension_id=extension_id, params=params):
+                generator_class = self._load_generator_class(extension_id)
+                model_dir = self._make_model_dir(extension_id, "text-to-image")
+                outputs_dir = Path(tempfile.mkdtemp(prefix=f"outputs-{extension_id}-"))
+                runtime_snapshot = object()
+                result_path = outputs_dir / f"{extension_id}.png"
+                progress_events: list[tuple[int, str]] = []
+
+                def execute_side_effect(request, runtime, extension_id, emit_progress, emit_log):
+                    self.assertEqual(request.node_id, "text-to-image")
+                    self.assertEqual(request.workspace_dir, str(outputs_dir))
+                    self.assertEqual(request.input.get("text"), params.get("input", {}).get("text"))
+                    self.assertEqual(request.params.get("prompt"), expected_prompt)
+                    self.assertFalse((outputs_dir / ".modly-inputs").exists())
+                    emit_progress(61, "mapped")
+                    emit_log("mapping-ready")
+                    return {"output_path": str(result_path)}
+
+                with patch(
+                    "local_image_runtime.runtime_adapter.bootstrap_runtime",
+                    return_value=runtime_snapshot,
+                ), patch(
+                    "local_image_runtime.runtime_adapter.execute",
+                    side_effect=execute_side_effect,
+                ):
+                    generator = generator_class(model_dir, outputs_dir)
+                    actual_path = generator.generate(
+                        b"ignored-image-bytes",
+                        params,
+                        progress_cb=lambda percent, label: progress_events.append((percent, label)),
+                    )
+
+                self.assertEqual(actual_path, result_path)
+                self.assertEqual(progress_events, [(61, "mapped")])
+
+    def test_extension_generator_generate_maps_image_to_image_request(self) -> None:
+        cases = (
+            ("sd15", {"prompt": "variation", "strength": 0.35, "steps": 4}),
+            ("sdxl-base", {"strength": 0.8, "guidance_scale": 6.5}),
+        )
+
+        for extension_id, params in cases:
+            with self.subTest(extension_id=extension_id, params=params):
+                generator_class = self._load_generator_class(extension_id)
+                model_dir = self._make_model_dir(extension_id, "image-to-image")
+                outputs_dir = Path(tempfile.mkdtemp(prefix=f"outputs-{extension_id}-"))
+                runtime_snapshot = object()
+                result_path = outputs_dir / f"{extension_id}-variation.png"
+                image_bytes = b"fake-image-bytes"
+
+                def execute_side_effect(request, runtime, extension_id, emit_progress, emit_log):
+                    self.assertEqual(request.node_id, "image-to-image")
+                    self.assertEqual(request.workspace_dir, str(outputs_dir))
+                    materialized_input = Path(request.input["filePath"])
+                    self.assertTrue(materialized_input.is_absolute())
+                    self.assertTrue(materialized_input.exists())
+                    self.assertEqual(materialized_input.read_bytes(), image_bytes)
+                    self.assertEqual(materialized_input.parent, outputs_dir / ".modly-inputs")
+                    self.assertEqual(request.params.get("strength"), params["strength"])
+                    return {"output_path": str(result_path)}
+
+                with patch(
+                    "local_image_runtime.runtime_adapter.bootstrap_runtime",
+                    return_value=runtime_snapshot,
+                ), patch(
+                    "local_image_runtime.runtime_adapter.execute",
+                    side_effect=execute_side_effect,
+                ):
+                    generator = generator_class(model_dir, outputs_dir)
+                    actual_path = generator.generate(image_bytes, params)
+
+                self.assertEqual(actual_path, result_path)
+
+    def test_extension_generator_generate_rejects_invalid_image_to_image_strength(self) -> None:
+        generator_class = self._load_generator_class("sd15")
+        model_dir = self._make_model_dir("sd15", "image-to-image")
+        outputs_dir = Path(tempfile.mkdtemp(prefix="outputs-sd15-"))
+        runtime_snapshot = object()
+
+        def validate_request_only(request, runtime, extension_id, emit_progress, emit_log):
+            pipeline._validate_node_payload(request, legacy_model_id=None)
+            return {"output_path": str(outputs_dir / "never-created.png")}
+
+        with patch(
+            "local_image_runtime.runtime_adapter.bootstrap_runtime",
+            return_value=runtime_snapshot,
+        ), patch(
+            "local_image_runtime.runtime_adapter.execute",
+            side_effect=validate_request_only,
+        ):
+            generator = generator_class(model_dir, outputs_dir)
+            with self.assertRaisesRegex(
+                pipeline.RequestValidationError,
+                "image-to-image requires params.strength between 0.0 and 1.0",
+            ):
+                generator.generate(b"fake-image-bytes", {"prompt": "variation"})
+
+    def test_extension_generator_generate_accepts_output_path_within_outputs_dir(self) -> None:
+        generator_class = self._load_generator_class("sd15")
+        model_dir = self._make_model_dir("sd15", "text-to-image")
+        outputs_dir = Path(tempfile.mkdtemp(prefix="outputs-sd15-"))
+        runtime_snapshot = object()
+        nested_dir = outputs_dir / "nested"
+        nested_dir.mkdir(parents=True, exist_ok=True)
+        expected_path = nested_dir / "result.png"
+
+        with patch(
+            "local_image_runtime.runtime_adapter.bootstrap_runtime",
+            return_value=runtime_snapshot,
+        ), patch(
+            "local_image_runtime.runtime_adapter.execute",
+            return_value={"output_path": str(expected_path)},
+        ):
+            generator = generator_class(model_dir, outputs_dir)
+            actual_path = generator.generate(b"", {"prompt": "contained output"})
+
+        self.assertEqual(actual_path, expected_path)
+
+    def test_extension_generator_generate_rejects_output_path_outside_outputs_dir(self) -> None:
+        generator_class = self._load_generator_class("sd15")
+        model_dir = self._make_model_dir("sd15", "text-to-image")
+        outputs_dir = Path(tempfile.mkdtemp(prefix="outputs-sd15-"))
+        runtime_snapshot = object()
+        outside_path = outputs_dir.parent / "escaped.png"
+
+        with patch(
+            "local_image_runtime.runtime_adapter.bootstrap_runtime",
+            return_value=runtime_snapshot,
+        ), patch(
+            "local_image_runtime.runtime_adapter.execute",
+            return_value={"output_path": str(outside_path)},
+        ):
+            generator = generator_class(model_dir, outputs_dir)
+            with self.assertRaisesRegex(
+                runtime_adapter.DomainError,
+                "outside configured outputs_dir",
+            ):
+                generator.generate(b"", {"prompt": "escaped output"})
+
+    def test_pipeline_execute_uses_request_workspace_dir_in_logs_and_errors(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-override-"))
+        runtime_outputs_dir = Path(tempfile.mkdtemp(prefix="runtime-outputs-"))
+        runtime_models_dir = Path(tempfile.mkdtemp(prefix="runtime-models-"))
+        runtime = SimpleNamespace(
+            paths=SimpleNamespace(outputs_dir=runtime_outputs_dir, models_dir=runtime_models_dir)
+        )
+        request = pipeline.ExecutionRequest(
+            node_id="text-to-image",
+            input={"text": "workspace prompt"},
+            params={"prompt": "workspace prompt", "steps": 4},
+            workspace_dir=str(workspace_dir),
+        )
+        progress_events: list[tuple[int, str]] = []
+        logs: list[str] = []
+
+        with patch(
+            "local_image_runtime.pipeline.extension_is_installed",
+            return_value=True,
+        ), patch(
+            "local_image_runtime.pipeline.get_extension_record",
+            return_value={},
+        ):
+            with self.assertRaisesRegex(pipeline.BackendNotImplementedError, str(workspace_dir)):
+                pipeline.execute(
+                    request,
+                    runtime,
+                    extension_id="sd15",
+                    emit_progress=lambda percent, label: progress_events.append((percent, label)),
+                    emit_log=logs.append,
+                )
+
+        self.assertIn(f"Workspace: {workspace_dir}.", logs[0])
+        self.assertEqual(progress_events[-1], (75, "backend-dispatch"))
 
     def test_weight_readiness_is_node_scoped_and_reports_exact_missing_path(self) -> None:
         extension_id = "sd15"
@@ -584,8 +907,13 @@ class RuntimeHarnessTests(unittest.TestCase):
         )
         self.assertIn(expected_missing, "\n".join(image_node["diagnostics"]))
 
-    def test_vendored_runtime_matches_canonical_dependencies_and_install_contract(self) -> None:
-        for relative_name in ("dependencies.py", "install_contract.py"):
+    def test_vendored_runtime_matches_canonical_runtime_sources(self) -> None:
+        for relative_name in (
+            "dependencies.py",
+            "install_contract.py",
+            "runtime_adapter.py",
+            "pipeline.py",
+        ):
             canonical_text = self._canonical_runtime_file(relative_name).read_text(encoding="utf-8")
             for extension_id in EXTENSION_IDS:
                 with self.subTest(extension_id=extension_id, relative_name=relative_name):
