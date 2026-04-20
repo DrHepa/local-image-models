@@ -87,6 +87,104 @@ class RuntimeHarnessTests(unittest.TestCase):
         )
         return runtime_root
 
+    def _make_runtime_snapshot(
+        self,
+        *,
+        outputs_dir: Path | None = None,
+        models_dir: Path | None = None,
+    ) -> SimpleNamespace:
+        resolved_outputs_dir = outputs_dir or Path(tempfile.mkdtemp(prefix="runtime-outputs-"))
+        resolved_models_dir = models_dir or Path(tempfile.mkdtemp(prefix="runtime-models-"))
+        return SimpleNamespace(
+            paths=SimpleNamespace(
+                outputs_dir=resolved_outputs_dir,
+                models_dir=resolved_models_dir,
+            )
+        )
+
+    def _make_executable_python(self, root: Path) -> Path:
+        python_path = root / "venv" / "bin" / "python"
+        python_path.parent.mkdir(parents=True, exist_ok=True)
+        python_path.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        python_path.chmod(0o755)
+        return python_path
+
+    def _completed_process(self, *, stdout: str, returncode: int = 0) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=["fake-child"], returncode=returncode, stdout=stdout, stderr="")
+
+    def _parse_ndjson_events(self, payload: str) -> list[dict[str, object]]:
+        return [json.loads(line) for line in payload.splitlines() if line.strip()]
+
+    def _make_real_runner_loader(
+        self,
+        *,
+        marker: str,
+        invocations: list[dict[str, object]],
+    ) -> SimpleNamespace:
+        class FakeImage:
+            def __init__(self, image_marker: str) -> None:
+                self.image_marker = image_marker
+
+            def save(self, output_path: str) -> None:
+                Path(output_path).write_bytes(f"generated:{self.image_marker}".encode("utf-8"))
+
+        class FakePipeline:
+            def __init__(self, *, pipeline_marker: str, model_dir: str) -> None:
+                self.pipeline_marker = pipeline_marker
+                self.model_dir = model_dir
+
+            def __call__(self, **kwargs):
+                invocations.append(
+                    {
+                        "marker": self.pipeline_marker,
+                        "model_dir": self.model_dir,
+                        "kwargs": kwargs,
+                    }
+                )
+                return SimpleNamespace(images=[FakeImage(self.pipeline_marker)])
+
+        return SimpleNamespace(
+            from_pretrained=lambda model_dir: FakePipeline(pipeline_marker=marker, model_dir=model_dir)
+        )
+
+    def _run_real_runner_subprocess(
+        self,
+        *,
+        loader_map: dict[tuple[str, str], object],
+        source_image_token: object | None = None,
+    ):
+        import local_image_runtime.inference_runner as inference_runner
+
+        def run_side_effect(command, *, input, text, capture_output, check):
+            self.assertTrue(text)
+            self.assertTrue(capture_output)
+            self.assertTrue(check)
+
+            stdout = StringIO()
+            with patch.dict(inference_runner._PIPELINE_LOADERS, loader_map, clear=True), patch.object(
+                inference_runner, "_seeded_generator", return_value="generator-token"
+            ):
+                if source_image_token is None:
+                    exit_code = inference_runner.run_child_main(stdin=StringIO(input), stdout=stdout)
+                else:
+                    with patch.object(
+                        inference_runner,
+                        "_open_source_image",
+                        return_value=source_image_token,
+                    ):
+                        exit_code = inference_runner.run_child_main(stdin=StringIO(input), stdout=stdout)
+
+            if exit_code != 0:
+                raise subprocess.CalledProcessError(
+                    returncode=exit_code,
+                    cmd=command,
+                    output=stdout.getvalue(),
+                    stderr="",
+                )
+            return self._completed_process(stdout=stdout.getvalue())
+
+        return run_side_effect
+
     def _payload(self, runtime_root: Path) -> str:
         return json.dumps(
             {
@@ -563,13 +661,35 @@ class RuntimeHarnessTests(unittest.TestCase):
         self.assertEqual(record["status"], bootstrap.EXTENSION_STATUS_INSTALLED)
         self.assertIsNotNone(record["installed_at"])
 
-    def test_generator_reaches_backend_not_implemented_after_ready_setup(self) -> None:
-        for extension_id in EXTENSION_IDS:
+    def test_generator_reaches_real_runner_success_after_ready_setup(self) -> None:
+        cases = (
+            ("sd15", "stable-diffusion", "stable-text"),
+            ("sdxl-base", "sdxl", "sdxl-text"),
+            ("flux-schnell", "flux", "flux-text"),
+        )
+
+        for extension_id, expected_family, expected_marker in cases:
             with self.subTest(extension_id=extension_id):
                 runtime_root, result = self._run_setup_success(extension_id)
                 self.assertEqual(result.status, bootstrap.SETUP_STATUS_READY)
-
                 stdout = StringIO()
+                outputs_dir = Path(tempfile.mkdtemp(prefix=f"generator-main-{extension_id}-"))
+                invocations: list[dict[str, object]] = []
+                payload = {
+                    "nodeId": "text-to-image",
+                    "workspaceDir": str(outputs_dir),
+                    "input": {"text": f"legacy prompt {extension_id}"},
+                    "params": {
+                        "prompt": f"hero image {extension_id}",
+                        "negative_prompt": f"avoid artifacts {extension_id}",
+                        "steps": 4,
+                        "width": 512,
+                        "height": 512,
+                        "guidance_scale": 7.5,
+                        "seed": 42,
+                    },
+                }
+
                 with patch.dict(
                     os.environ,
                     {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)},
@@ -577,29 +697,109 @@ class RuntimeHarnessTests(unittest.TestCase):
                 ), patch(
                     "local_image_runtime.bootstrap._smoke_test_runtime_imports",
                     return_value=(True, "stubbed imports"),
+                ), patch(
+                    "local_image_runtime.pipeline.subprocess.run",
+                    side_effect=self._run_real_runner_subprocess(
+                        loader_map={(expected_family, "text-to-image"): self._make_real_runner_loader(
+                            marker=expected_marker,
+                            invocations=invocations,
+                        )}
+                    ),
                 ):
                     exit_code = runtime_adapter.run_generator_main(
                         extension_id=extension_id,
                         runtime_root=str(runtime_root),
-                        stdin=self._generator_payload(),
+                        stdin=StringIO(json.dumps(payload) + "\n"),
                         stdout=stdout,
                     )
 
                 output = stdout.getvalue()
-                self.assertEqual(exit_code, 1)
+                events = self._parse_ndjson_events(output)
+                done_event = events[-1]
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(len(invocations), 1)
+                self.assertEqual(invocations[0]["marker"], expected_marker)
+                self.assertEqual(invocations[0]["kwargs"]["negative_prompt"], payload["params"]["negative_prompt"])
+                self.assertTrue(Path(done_event["result"]["output_path"]).exists())
+                self.assertTrue(str(done_event["result"]["output_path"]).startswith(str(outputs_dir)))
+                self.assertEqual(
+                    done_event["result"]["metadata"],
+                    {
+                        "family": expected_family,
+                        "node_id": "text-to-image",
+                        "seed": 42,
+                        "negative_prompt_used": True,
+                        "source_image_used": False,
+                    },
+                )
                 self.assertIn('"label": "runtime-ready"', output)
                 self.assertIn('"label": "backend-dispatch"', output)
-                self.assertIn("Runtime ready at", output)
-                self.assertIn("Generation backend is not implemented yet", output)
-                self.assertNotIn("not installed", output.lower())
 
-    def test_run_payload_reaches_backend_not_implemented_after_ready_setup(self) -> None:
-        payload = json.loads(self._generator_payload().getvalue())
+    def test_run_generator_main_surfaces_child_runner_errors_clearly(self) -> None:
+        runtime_root, result = self._run_setup_success("sd15")
+        self.assertEqual(result.status, bootstrap.SETUP_STATUS_READY)
+        stdout = StringIO()
 
-        for extension_id in EXTENSION_IDS:
+        payload = {
+            "nodeId": "text-to-image",
+            "workspaceDir": str(Path(tempfile.mkdtemp(prefix="generator-main-error-"))),
+            "input": {"text": "broken"},
+            "params": {"prompt": "broken", "steps": 4},
+        }
+
+        with patch.dict(
+            os.environ,
+            {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)},
+            clear=False,
+        ), patch(
+            "local_image_runtime.bootstrap._smoke_test_runtime_imports",
+            return_value=(True, "stubbed imports"),
+        ), patch(
+            "local_image_runtime.pipeline.subprocess.run",
+            side_effect=self._run_real_runner_subprocess(loader_map={}, source_image_token=object()),
+        ):
+            exit_code = runtime_adapter.run_generator_main(
+                extension_id="sd15",
+                runtime_root=str(runtime_root),
+                stdin=StringIO(json.dumps(payload) + "\n"),
+                stdout=stdout,
+            )
+
+        events = self._parse_ndjson_events(stdout.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(events[-1]["type"], "error")
+        self.assertEqual(
+            events[-1]["message"],
+            "Unsupported inference backend for family 'stable-diffusion' and node 'text-to-image'",
+        )
+
+    def test_run_payload_reaches_real_runner_success_after_ready_setup(self) -> None:
+        cases = (
+            ("sd15", "stable-diffusion", "stable-text"),
+            ("sdxl-base", "sdxl", "sdxl-text"),
+            ("flux-schnell", "flux", "flux-text"),
+        )
+
+        for extension_id, expected_family, expected_marker in cases:
             with self.subTest(extension_id=extension_id):
                 runtime_root, result = self._run_setup_success(extension_id)
                 self.assertEqual(result.status, bootstrap.SETUP_STATUS_READY)
+                outputs_dir = Path(tempfile.mkdtemp(prefix=f"run-payload-{extension_id}-"))
+                invocations: list[dict[str, object]] = []
+                payload = {
+                    "nodeId": "text-to-image",
+                    "workspaceDir": str(outputs_dir),
+                    "input": {"text": f"legacy {extension_id}"},
+                    "params": {
+                        "prompt": f"payload prompt {extension_id}",
+                        "negative_prompt": f"payload negative {extension_id}",
+                        "steps": 4,
+                        "width": 512,
+                        "height": 512,
+                        "guidance_scale": 7.5,
+                        "seed": 42,
+                    },
+                }
 
                 with patch.dict(
                     os.environ,
@@ -608,19 +808,68 @@ class RuntimeHarnessTests(unittest.TestCase):
                 ), patch(
                     "local_image_runtime.bootstrap._smoke_test_runtime_imports",
                     return_value=(True, "stubbed imports"),
+                ), patch(
+                    "local_image_runtime.pipeline.subprocess.run",
+                    side_effect=self._run_real_runner_subprocess(
+                        loader_map={(expected_family, "text-to-image"): self._make_real_runner_loader(
+                            marker=expected_marker,
+                            invocations=invocations,
+                        )}
+                    ),
                 ):
-                    with self.assertRaisesRegex(
-                        pipeline.BackendNotImplementedError,
-                        "Generation backend is not implemented yet",
-                    ) as exc_info:
-                        runtime_adapter.run_payload(
-                            payload,
-                            extension_id=extension_id,
-                            runtime_root=str(runtime_root),
-                        )
+                    result_payload = runtime_adapter.run_payload(
+                        payload,
+                        extension_id=extension_id,
+                        runtime_root=str(runtime_root),
+                    )
 
-                self.assertIn("Validation passed and the runtime scaffold is ready", str(exc_info.exception))
-                self.assertNotIn("not installed", str(exc_info.exception).lower())
+                self.assertEqual(result_payload["extension_id"], extension_id)
+                self.assertEqual(len(invocations), 1)
+                self.assertEqual(invocations[0]["kwargs"]["negative_prompt"], payload["params"]["negative_prompt"])
+                self.assertTrue(Path(result_payload["result"]["output_path"]).exists())
+                self.assertTrue(str(result_payload["result"]["output_path"]).startswith(str(outputs_dir)))
+                self.assertEqual(
+                    result_payload["result"]["metadata"],
+                    {
+                        "family": expected_family,
+                        "node_id": "text-to-image",
+                        "seed": 42,
+                        "negative_prompt_used": True,
+                        "source_image_used": False,
+                    },
+                )
+
+    def test_run_payload_surfaces_child_runner_errors_clearly(self) -> None:
+        runtime_root, result = self._run_setup_success("sd15")
+        self.assertEqual(result.status, bootstrap.SETUP_STATUS_READY)
+        outputs_dir = Path(tempfile.mkdtemp(prefix="run-payload-error-"))
+        payload = {
+            "nodeId": "text-to-image",
+            "workspaceDir": str(outputs_dir),
+            "input": {"text": "broken"},
+            "params": {"prompt": "broken", "steps": 4},
+        }
+
+        with patch.dict(
+            os.environ,
+            {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)},
+            clear=False,
+        ), patch(
+            "local_image_runtime.bootstrap._smoke_test_runtime_imports",
+            return_value=(True, "stubbed imports"),
+        ), patch(
+            "local_image_runtime.pipeline.subprocess.run",
+            side_effect=self._run_real_runner_subprocess(loader_map={}),
+        ):
+            with self.assertRaisesRegex(
+                runtime_adapter.DomainError,
+                "Unsupported inference backend for family 'stable-diffusion' and node 'text-to-image'",
+            ):
+                runtime_adapter.run_payload(
+                    payload,
+                    extension_id="sd15",
+                    runtime_root=str(runtime_root),
+                )
 
     def test_extension_generator_classes_expose_basegenerator_contract(self) -> None:
         expected_nodes = {
@@ -702,48 +951,65 @@ class RuntimeHarnessTests(unittest.TestCase):
             generator.load()
             self.assertEqual(bootstrap_mock.call_count, 2)
 
-    def test_extension_generator_generate_maps_text_to_image_request(self) -> None:
+    def test_extension_generator_generate_reaches_real_runner_for_text_to_image(self) -> None:
         cases = (
-            ("sd15", {"prompt": "primary prompt", "input": {"text": "legacy prompt"}}, "primary prompt"),
-            ("sdxl-base", {"input": {"text": "legacy only prompt"}}, None),
-            ("flux-schnell", {"prompt": "flux prompt", "input": {"text": "ignored fallback"}}, "flux prompt"),
+            ("sd15", "stable-diffusion", "stable-text"),
+            ("sdxl-base", "sdxl", "sdxl-text"),
+            ("flux-schnell", "flux", "flux-text"),
         )
 
-        for extension_id, params, expected_prompt in cases:
-            with self.subTest(extension_id=extension_id, params=params):
+        for extension_id, expected_family, expected_marker in cases:
+            with self.subTest(extension_id=extension_id):
+                runtime_root = self._make_runtime_root(extension_id)
+                _, result = self._run_setup_success(extension_id, runtime_root=runtime_root)
+                self.assertEqual(result.status, bootstrap.SETUP_STATUS_READY)
                 generator_class = self._load_generator_class(extension_id)
+                original_runtime_root = generator_class.runtime_root
+                generator_class.runtime_root = str(runtime_root)
                 model_dir = self._make_model_dir(extension_id, "text-to-image")
                 outputs_dir = Path(tempfile.mkdtemp(prefix=f"outputs-{extension_id}-"))
-                runtime_snapshot = object()
-                result_path = outputs_dir / f"{extension_id}.png"
                 progress_events: list[tuple[int, str]] = []
+                invocations: list[dict[str, object]] = []
+                params = {
+                    "prompt": f"generator prompt {extension_id}",
+                    "negative_prompt": f"generator negative {extension_id}",
+                    "steps": 4,
+                    "width": 512,
+                    "height": 512,
+                    "guidance_scale": 7.5,
+                    "seed": 42,
+                    "input": {"text": f"legacy generator text {extension_id}"},
+                }
 
-                def execute_side_effect(request, runtime, extension_id, emit_progress, emit_log):
-                    self.assertEqual(request.node_id, "text-to-image")
-                    self.assertEqual(request.workspace_dir, str(outputs_dir))
-                    self.assertEqual(request.input.get("text"), params.get("input", {}).get("text"))
-                    self.assertEqual(request.params.get("prompt"), expected_prompt)
-                    self.assertFalse((outputs_dir / ".modly-inputs").exists())
-                    emit_progress(61, "mapped")
-                    emit_log("mapping-ready")
-                    return {"output_path": str(result_path)}
+                try:
+                    with patch(
+                        "local_image_runtime.bootstrap._smoke_test_runtime_imports",
+                        return_value=(True, "stubbed imports"),
+                    ), patch(
+                        "local_image_runtime.pipeline.subprocess.run",
+                        side_effect=self._run_real_runner_subprocess(
+                            loader_map={(expected_family, "text-to-image"): self._make_real_runner_loader(
+                                marker=expected_marker,
+                                invocations=invocations,
+                            )}
+                        ),
+                    ):
+                        generator = generator_class(model_dir, outputs_dir)
+                        actual_path = generator.generate(
+                            b"ignored-image-bytes",
+                            params,
+                            progress_cb=lambda percent, label: progress_events.append((percent, label)),
+                        )
+                finally:
+                    generator_class.runtime_root = original_runtime_root
 
-                with patch(
-                    "local_image_runtime.runtime_adapter.bootstrap_runtime",
-                    return_value=runtime_snapshot,
-                ), patch(
-                    "local_image_runtime.runtime_adapter.execute",
-                    side_effect=execute_side_effect,
-                ):
-                    generator = generator_class(model_dir, outputs_dir)
-                    actual_path = generator.generate(
-                        b"ignored-image-bytes",
-                        params,
-                        progress_cb=lambda percent, label: progress_events.append((percent, label)),
-                    )
-
-                self.assertEqual(actual_path, result_path)
-                self.assertEqual(progress_events, [(61, "mapped")])
+                self.assertEqual(len(invocations), 1)
+                self.assertEqual(invocations[0]["kwargs"]["prompt"], params["prompt"])
+                self.assertEqual(invocations[0]["kwargs"]["negative_prompt"], params["negative_prompt"])
+                self.assertFalse((outputs_dir / ".modly-inputs").exists())
+                self.assertTrue(actual_path.exists())
+                self.assertTrue(str(actual_path).startswith(str(outputs_dir)))
+                self.assertIn((75, "backend-dispatch"), progress_events)
 
     def test_extension_generator_generate_maps_image_to_image_request(self) -> None:
         cases = (
@@ -807,6 +1073,21 @@ class RuntimeHarnessTests(unittest.TestCase):
             ):
                 generator.generate(b"fake-image-bytes", {"prompt": "variation"})
 
+    def test_pipeline_validate_node_payload_rejects_nonexistent_image_to_image_source_file(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-missing-source-"))
+        request = pipeline.ExecutionRequest(
+            node_id="image-to-image",
+            input={"filePath": "missing-source.png"},
+            params={"prompt": "variation", "strength": 0.55, "steps": 4},
+            workspace_dir=str(workspace_dir),
+        )
+
+        with self.assertRaisesRegex(
+            pipeline.RequestValidationError,
+            "image-to-image input.filePath must point to an existing local file",
+        ):
+            pipeline._validate_node_payload(request, legacy_model_id=None)
+
     def test_extension_generator_generate_accepts_output_path_within_outputs_dir(self) -> None:
         generator_class = self._load_generator_class("sd15")
         model_dir = self._make_model_dir("sd15", "text-to-image")
@@ -849,6 +1130,249 @@ class RuntimeHarnessTests(unittest.TestCase):
             ):
                 generator.generate(b"", {"prompt": "escaped output"})
 
+    def test_pipeline_execute_serializes_subprocess_payload_by_family_and_node(self) -> None:
+        cases = (
+            (
+                "sd15",
+                pipeline.ExecutionRequest(
+                    node_id="text-to-image",
+                    input={"text": "legacy lighthouse prompt"},
+                    params={
+                        "prompt": "lighthouse at dusk",
+                        "negative_prompt": "blurry",
+                        "steps": 4,
+                        "width": 512,
+                        "height": 512,
+                        "guidance_scale": 7.5,
+                        "seed": 42,
+                    },
+                ),
+                "stable-diffusion",
+                None,
+            ),
+            (
+                "sdxl-base",
+                pipeline.ExecutionRequest(
+                    node_id="image-to-image",
+                    input={},
+                    params={
+                        "prompt": "cinematic variation",
+                        "negative_prompt": "low quality",
+                        "strength": 0.55,
+                        "steps": 5,
+                    },
+                ),
+                "sdxl",
+                "source.png",
+            ),
+        )
+
+        for extension_id, request, expected_family, source_name in cases:
+            with self.subTest(extension_id=extension_id, node_id=request.node_id):
+                workspace_dir = Path(tempfile.mkdtemp(prefix=f"workspace-{extension_id}-"))
+                runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
+                runtime_root = Path(tempfile.mkdtemp(prefix=f"ext-root-{extension_id}-"))
+                venv_python = self._make_executable_python(runtime_root)
+                extension_record = {
+                    "venv_python": str(venv_python),
+                    "model_dir": str(runtime.paths.models_dir / extension_id),
+                }
+                progress_events: list[tuple[int, str]] = []
+                logs: list[str] = []
+
+                if source_name is not None:
+                    source_path = workspace_dir / source_name
+                    source_path.write_bytes(b"fake-image")
+                    request = pipeline.ExecutionRequest(
+                        node_id=request.node_id,
+                        input={"filePath": source_name},
+                        params=request.params,
+                        workspace_dir=str(workspace_dir),
+                    )
+                else:
+                    source_path = None
+                    request = pipeline.ExecutionRequest(
+                        node_id=request.node_id,
+                        input=request.input,
+                        params=request.params,
+                        workspace_dir=str(workspace_dir),
+                    )
+
+                expected_output_path = workspace_dir / f"{extension_id}-{request.node_id}.png"
+
+                def run_side_effect(command, *, input, text, capture_output, check):
+                    self.assertEqual(command, [str(venv_python), "-m", "local_image_runtime.inference_runner"])
+                    self.assertTrue(text)
+                    self.assertTrue(capture_output)
+                    self.assertTrue(check)
+
+                    payload = json.loads(input)
+                    self.assertEqual(payload["extension_id"], extension_id)
+                    self.assertEqual(payload["family"], expected_family)
+                    self.assertEqual(payload["node_id"], request.node_id)
+                    self.assertEqual(payload["workspace_dir"], str(workspace_dir))
+                    self.assertEqual(payload["model_dir"], extension_record["model_dir"])
+                    self.assertEqual(payload["prompt"], request.params.get("prompt"))
+                    self.assertEqual(payload["negative_prompt"], request.params.get("negative_prompt"))
+                    self.assertEqual(payload["params"], {
+                        key: value for key, value in request.params.items() if key != "negative_prompt"
+                    })
+                    if source_path is None:
+                        self.assertIsNone(payload["source_image_path"])
+                    else:
+                        self.assertEqual(payload["source_image_path"], str(source_path.resolve()))
+
+                    return self._completed_process(
+                        stdout="\n".join(
+                            (
+                                json.dumps({"type": "progress", "percent": 88, "label": "child-running"}),
+                                json.dumps({"type": "log", "message": "child-log"}),
+                                json.dumps({"type": "done", "result": {"output_path": str(expected_output_path)}}),
+                            )
+                        )
+                        + "\n"
+                    )
+
+                with patch(
+                    "local_image_runtime.pipeline.extension_is_installed",
+                    return_value=True,
+                ), patch(
+                    "local_image_runtime.pipeline.get_extension_record",
+                    return_value=extension_record,
+                ), patch(
+                    "local_image_runtime.pipeline.subprocess.run",
+                    side_effect=run_side_effect,
+                ):
+                    result = pipeline.execute(
+                        request,
+                        runtime,
+                        extension_id=extension_id,
+                        emit_progress=lambda percent, label: progress_events.append((percent, label)),
+                        emit_log=logs.append,
+                    )
+
+                self.assertEqual(result, {"output_path": str(expected_output_path.resolve())})
+                self.assertIn((88, "child-running"), progress_events)
+                self.assertIn("child-log", logs)
+
+    def test_pipeline_execute_requires_executable_venv_python_before_spawn(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-venv-"))
+        runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
+        request = pipeline.ExecutionRequest(
+            node_id="text-to-image",
+            input={"text": "venv check"},
+            params={"prompt": "venv check", "steps": 4},
+            workspace_dir=str(workspace_dir),
+        )
+        runtime_root = Path(tempfile.mkdtemp(prefix="ext-root-venv-"))
+        missing_python = runtime_root / "venv" / "bin" / "python"
+        non_executable_python = runtime_root / "venv" / "bin" / "python-not-executable"
+        non_executable_python.parent.mkdir(parents=True, exist_ok=True)
+        non_executable_python.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+
+        cases = (
+            ({"venv_python": None, "model_dir": str(runtime.paths.models_dir / "sd15")}, "Missing executable venv_python"),
+            ({"venv_python": str(missing_python), "model_dir": str(runtime.paths.models_dir / "sd15")}, str(missing_python)),
+            ({"venv_python": str(non_executable_python), "model_dir": str(runtime.paths.models_dir / "sd15")}, str(non_executable_python)),
+        )
+
+        for extension_record, expected_detail in cases:
+            with self.subTest(venv_python=extension_record["venv_python"]):
+                with patch(
+                    "local_image_runtime.pipeline.extension_is_installed",
+                    return_value=True,
+                ), patch(
+                    "local_image_runtime.pipeline.get_extension_record",
+                    return_value=extension_record,
+                ), patch(
+                    "local_image_runtime.pipeline.subprocess.run",
+                ) as subprocess_run:
+                    with self.assertRaisesRegex(pipeline.DomainError, expected_detail):
+                        pipeline.execute(
+                            request,
+                            runtime,
+                            extension_id="sd15",
+                            emit_progress=lambda percent, label: None,
+                            emit_log=lambda message: None,
+                        )
+
+                subprocess_run.assert_not_called()
+
+    def test_pipeline_execute_rejects_flux_image_to_image_before_spawn(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-flux-img2img-"))
+        runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
+        source_path = workspace_dir / "source.png"
+        source_path.write_bytes(b"fake-image")
+        request = pipeline.ExecutionRequest(
+            node_id="image-to-image",
+            input={"filePath": str(source_path)},
+            params={"prompt": "variation", "strength": 0.55, "steps": 4},
+            workspace_dir=str(workspace_dir),
+        )
+
+        with patch(
+            "local_image_runtime.pipeline.extension_is_installed",
+            return_value=True,
+        ), patch(
+            "local_image_runtime.pipeline.get_extension_record",
+            return_value={
+                "venv_python": str(self._make_executable_python(Path(tempfile.mkdtemp(prefix="ext-root-flux-")))),
+                "model_dir": str(runtime.paths.models_dir / "flux-schnell"),
+            },
+        ), patch(
+            "local_image_runtime.pipeline.subprocess.run",
+        ) as subprocess_run:
+            with self.assertRaisesRegex(
+                pipeline.RequestValidationError,
+                "Extension 'flux-schnell' does not support node 'image-to-image'",
+            ):
+                pipeline.execute(
+                    request,
+                    runtime,
+                    extension_id="flux-schnell",
+                    emit_progress=lambda percent, label: None,
+                    emit_log=lambda message: None,
+                )
+
+        subprocess_run.assert_not_called()
+
+    def test_pipeline_execute_rejects_child_output_path_outside_workspace_dir(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-output-"))
+        runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
+        runtime_root = Path(tempfile.mkdtemp(prefix="ext-root-output-"))
+        venv_python = self._make_executable_python(runtime_root)
+        request = pipeline.ExecutionRequest(
+            node_id="text-to-image",
+            input={"text": "workspace guard"},
+            params={"prompt": "workspace guard", "steps": 4},
+            workspace_dir=str(workspace_dir),
+        )
+        outside_path = workspace_dir.parent / "escaped.png"
+
+        with patch(
+            "local_image_runtime.pipeline.extension_is_installed",
+            return_value=True,
+        ), patch(
+            "local_image_runtime.pipeline.get_extension_record",
+            return_value={
+                "venv_python": str(venv_python),
+                "model_dir": str(runtime.paths.models_dir / "sd15"),
+            },
+        ), patch(
+            "local_image_runtime.pipeline.subprocess.run",
+            return_value=self._completed_process(
+                stdout=json.dumps({"type": "done", "result": {"output_path": str(outside_path)}}) + "\n"
+            ),
+        ):
+            with self.assertRaisesRegex(pipeline.DomainError, "outside workspace_dir"):
+                pipeline.execute(
+                    request,
+                    runtime,
+                    extension_id="sd15",
+                    emit_progress=lambda percent, label: None,
+                    emit_log=lambda message: None,
+                )
+
     def test_pipeline_execute_uses_request_workspace_dir_in_logs_and_errors(self) -> None:
         workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-override-"))
         runtime_outputs_dir = Path(tempfile.mkdtemp(prefix="runtime-outputs-"))
@@ -870,19 +1394,201 @@ class RuntimeHarnessTests(unittest.TestCase):
             return_value=True,
         ), patch(
             "local_image_runtime.pipeline.get_extension_record",
-            return_value={},
-        ):
-            with self.assertRaisesRegex(pipeline.BackendNotImplementedError, str(workspace_dir)):
-                pipeline.execute(
-                    request,
-                    runtime,
-                    extension_id="sd15",
-                    emit_progress=lambda percent, label: progress_events.append((percent, label)),
-                    emit_log=logs.append,
+            return_value={
+                "venv_python": str(self._make_executable_python(Path(tempfile.mkdtemp(prefix="workspace-override-ext-")))),
+                "model_dir": str(runtime_models_dir / "sd15"),
+            },
+        ), patch(
+            "local_image_runtime.pipeline.subprocess.run",
+            side_effect=lambda command, *, input, text, capture_output, check: self._completed_process(
+                stdout=json.dumps(
+                    {
+                        "type": "done",
+                        "result": {"output_path": json.loads(input)["output_path"]},
+                    }
                 )
+                + "\n"
+            ),
+        ):
+            result = pipeline.execute(
+                request,
+                runtime,
+                extension_id="sd15",
+                emit_progress=lambda percent, label: progress_events.append((percent, label)),
+                emit_log=logs.append,
+            )
 
         self.assertIn(f"Workspace: {workspace_dir}.", logs[0])
+        self.assertTrue(result["output_path"].startswith(str(workspace_dir)))
         self.assertEqual(progress_events[-1], (75, "backend-dispatch"))
+
+    def test_inference_runner_reads_json_job_selects_loader_and_emits_done(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        class FakeImage:
+            def __init__(self) -> None:
+                self.saved_paths: list[str] = []
+
+            def save(self, output_path: str) -> None:
+                self.saved_paths.append(output_path)
+
+        class FakePipeline:
+            def __init__(self, *, marker: str) -> None:
+                self.marker = marker
+                self.calls: list[dict[str, object]] = []
+                self.output_image = FakeImage()
+
+            def __call__(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(images=[self.output_image])
+
+        cases = (
+            {
+                "family": "stable-diffusion",
+                "node_id": "text-to-image",
+                "expected_loader": "stable-text",
+                "source_image_path": None,
+            },
+            {
+                "family": "sdxl",
+                "node_id": "image-to-image",
+                "expected_loader": "sdxl-image",
+                "source_image_path": str(Path(tempfile.mkdtemp(prefix="runner-source-")) / "source.png"),
+            },
+            {
+                "family": "flux",
+                "node_id": "text-to-image",
+                "expected_loader": "flux-text",
+                "source_image_path": None,
+            },
+        )
+
+        for case in cases:
+            with self.subTest(family=case["family"], node_id=case["node_id"]):
+                workspace_dir = Path(tempfile.mkdtemp(prefix="runner-workspace-"))
+                output_path = workspace_dir / f"{case['family']}-{case['node_id']}.png"
+                source_image_token = object()
+                fake_pipeline = FakePipeline(marker=str(case["expected_loader"]))
+                fake_loader = SimpleNamespace(from_pretrained=lambda model_dir: fake_pipeline)
+                job = {
+                    "extension_id": "test-extension",
+                    "family": case["family"],
+                    "node_id": case["node_id"],
+                    "model_dir": str(workspace_dir / "model"),
+                    "workspace_dir": str(workspace_dir),
+                    "output_path": str(output_path),
+                    "prompt": "test prompt",
+                    "negative_prompt": "avoid blur",
+                    "source_image_path": case["source_image_path"],
+                    "params": {
+                        "steps": 4,
+                        "width": 512,
+                        "height": 512,
+                        "guidance_scale": 7.5,
+                        "strength": 0.55,
+                        "seed": 42,
+                    },
+                }
+
+                stdin = StringIO(json.dumps(job) + "\n")
+                stdout = StringIO()
+
+                with patch.dict(
+                    inference_runner._PIPELINE_LOADERS,
+                    {
+                        ("stable-diffusion", "text-to-image"): fake_loader,
+                        ("stable-diffusion", "image-to-image"): SimpleNamespace(from_pretrained=lambda model_dir: None),
+                        ("sdxl", "text-to-image"): SimpleNamespace(from_pretrained=lambda model_dir: None),
+                        ("sdxl", "image-to-image"): fake_loader,
+                        ("flux", "text-to-image"): fake_loader,
+                    },
+                    clear=True,
+                ), patch.object(
+                    inference_runner, "_seeded_generator", return_value="generator-token"
+                ), patch.object(
+                    inference_runner, "_open_source_image", return_value=source_image_token
+                ) as open_source_image:
+                    exit_code = inference_runner.run_child_main(stdin=stdin, stdout=stdout)
+
+                self.assertEqual(exit_code, 0)
+                if case["source_image_path"] is None:
+                    open_source_image.assert_not_called()
+                else:
+                    open_source_image.assert_called_once_with(case["source_image_path"])
+
+                self.assertEqual(len(fake_pipeline.calls), 1)
+                invocation = fake_pipeline.calls[0]
+                self.assertEqual(invocation["prompt"], "test prompt")
+                self.assertEqual(invocation["negative_prompt"], "avoid blur")
+                self.assertEqual(invocation["num_inference_steps"], 4)
+                self.assertEqual(invocation["width"], 512)
+                self.assertEqual(invocation["height"], 512)
+                self.assertEqual(invocation["guidance_scale"], 7.5)
+                self.assertEqual(invocation["generator"], "generator-token")
+                if case["source_image_path"] is None:
+                    self.assertNotIn("image", invocation)
+                    self.assertNotIn("strength", invocation)
+                else:
+                    self.assertIs(invocation["image"], source_image_token)
+                    self.assertEqual(invocation["strength"], 0.55)
+
+                self.assertEqual(fake_pipeline.output_image.saved_paths, [str(output_path)])
+                events = self._parse_ndjson_events(stdout.getvalue())
+                self.assertEqual(events[-1]["type"], "done")
+                self.assertEqual(
+                    events[-1]["result"],
+                    {
+                        "output_path": str(output_path),
+                        "metadata": {
+                            "family": case["family"],
+                            "node_id": case["node_id"],
+                            "seed": 42,
+                            "negative_prompt_used": True,
+                            "source_image_used": case["source_image_path"] is not None,
+                        },
+                    },
+                )
+
+    def test_inference_runner_emits_error_ndjson_for_invalid_job_or_unsupported_loader(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        cases = (
+            (
+                StringIO("{not-json}\n"),
+                {},
+                "Invalid JSON job received by inference runner",
+            ),
+            (
+                StringIO(
+                    json.dumps(
+                        {
+                            "family": "flux",
+                            "node_id": "image-to-image",
+                            "model_dir": "/tmp/model",
+                            "workspace_dir": "/tmp/workspace",
+                            "output_path": "/tmp/workspace/out.png",
+                            "prompt": "oops",
+                            "negative_prompt": None,
+                            "source_image_path": None,
+                            "params": {},
+                        }
+                    )
+                    + "\n"
+                ),
+                {("stable-diffusion", "text-to-image"): object()},
+                "Unsupported inference backend for family 'flux' and node 'image-to-image'",
+            ),
+        )
+
+        for stdin, loader_map, expected_message in cases:
+            with self.subTest(expected_message=expected_message):
+                stdout = StringIO()
+                with patch.dict(inference_runner._PIPELINE_LOADERS, loader_map, clear=True):
+                    exit_code = inference_runner.run_child_main(stdin=stdin, stdout=stdout)
+
+                self.assertEqual(exit_code, 1)
+                events = self._parse_ndjson_events(stdout.getvalue())
+                self.assertEqual(events, [{"type": "error", "message": expected_message}])
 
     def test_weight_readiness_is_node_scoped_and_reports_exact_missing_path(self) -> None:
         extension_id = "sd15"
@@ -911,8 +1617,9 @@ class RuntimeHarnessTests(unittest.TestCase):
         for relative_name in (
             "dependencies.py",
             "install_contract.py",
-            "runtime_adapter.py",
             "pipeline.py",
+            "runtime_adapter.py",
+            "inference_runner.py",
         ):
             canonical_text = self._canonical_runtime_file(relative_name).read_text(encoding="utf-8")
             for extension_id in EXTENSION_IDS:

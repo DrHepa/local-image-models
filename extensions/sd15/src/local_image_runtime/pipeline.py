@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from .bootstrap import RuntimeSnapshot, extension_is_installed, get_extension_record
 from .descriptors import get_extension_descriptor, registered_extension_ids
@@ -39,6 +43,13 @@ class ValidatedPayload:
     source_image_path: str | None
     numeric_params: dict[str, float | int]
     legacy_model_id: str | None
+
+
+@dataclass(frozen=True)
+class BackendJob:
+    command: tuple[str, ...]
+    payload: dict[str, Any]
+    workspace_dir: Path
 
 
 def _request_path_candidates(request: ExecutionRequest, raw_path: str) -> tuple[Path, ...]:
@@ -186,6 +197,211 @@ def _validate_node_payload(
     )
 
 
+def _validate_optional_text_param(value: Any, *, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return _validate_text_prompt(value, field_name=field_name)
+
+
+def _resolve_workspace_dir(effective_workspace_dir: str) -> Path:
+    return Path(effective_workspace_dir).expanduser().resolve()
+
+
+def _require_executable_venv_python(extension_record: dict[str, Any], *, extension_id: str) -> Path:
+    raw_venv_python = extension_record.get("venv_python")
+    if not isinstance(raw_venv_python, str) or not raw_venv_python.strip():
+        raise DomainError(
+            f"Missing executable venv_python for extension '{extension_id}'. Run setup install/repair first."
+        )
+
+    venv_python = Path(raw_venv_python.strip()).expanduser()
+    if not venv_python.exists() or not venv_python.is_file() or not os.access(venv_python, os.X_OK):
+        raise DomainError(
+            f"Missing executable venv_python for extension '{extension_id}': {venv_python}"
+        )
+    return venv_python
+
+
+def _build_backend_job(
+    *,
+    request: ExecutionRequest,
+    extension_id: str,
+    extension_record: dict[str, Any],
+    payload_details: ValidatedPayload,
+    effective_workspace_dir: str,
+) -> BackendJob:
+    descriptor = get_extension_descriptor(extension_id)
+    if descriptor is None:
+        supported = ", ".join(sorted(registered_extension_ids()))
+        raise RequestValidationError(
+            f"Unknown extension '{extension_id}'. Supported extensions: {supported}."
+        )
+
+    workspace_dir = _resolve_workspace_dir(effective_workspace_dir)
+    output_path = workspace_dir / (
+        f"generated-{extension_id}-{request.node_id}-{uuid4().hex}.png"
+    )
+    params = dict(request.params)
+    params.pop("negative_prompt", None)
+
+    payload = {
+        "extension_id": extension_id,
+        "family": descriptor.family,
+        "node_id": request.node_id,
+        "model_dir": extension_record.get("model_dir"),
+        "workspace_dir": str(workspace_dir),
+        "output_path": str(output_path),
+        "prompt": payload_details.prompt,
+        "negative_prompt": _validate_optional_text_param(
+            request.params.get("negative_prompt"), field_name="negative_prompt"
+        ),
+        "source_image_path": payload_details.source_image_path,
+        "params": params,
+    }
+    return BackendJob(
+        command=(
+            str(_require_executable_venv_python(extension_record, extension_id=extension_id)),
+            "-m",
+            "local_image_runtime.inference_runner",
+        ),
+        payload=payload,
+        workspace_dir=workspace_dir,
+    )
+
+
+def _command_failure_detail(exc: subprocess.CalledProcessError | OSError) -> str:
+    if isinstance(exc, subprocess.CalledProcessError):
+        detail = (_extract_error_message_from_output(exc.stdout) or exc.stderr or exc.stdout or str(exc)).strip()
+        return detail or str(exc)
+    return str(exc)
+
+
+def _extract_error_message_from_output(stdout: str | None) -> str | None:
+    if not stdout:
+        return None
+
+    message: str | None = None
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "error":
+            continue
+
+        error_message = event.get("message")
+        if isinstance(error_message, str) and error_message.strip():
+            message = error_message.strip()
+    return message
+
+
+def _parse_backend_events(
+    stdout: str,
+    *,
+    emit_progress: Callable[[int, str], None],
+    emit_log: Callable[[str], None],
+) -> dict[str, Any]:
+    done_result: dict[str, Any] | None = None
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise DomainError(f"Backend subprocess emitted invalid NDJSON: {exc}") from exc
+        if not isinstance(event, dict):
+            raise DomainError("Backend subprocess events must be JSON objects.")
+
+        event_type = event.get("type")
+        if event_type == "progress":
+            percent = event.get("percent")
+            label = event.get("label")
+            if isinstance(percent, int) and isinstance(label, str) and label.strip():
+                emit_progress(percent, label)
+            continue
+        if event_type == "log":
+            message = event.get("message")
+            if isinstance(message, str) and message.strip():
+                emit_log(message)
+            continue
+        if event_type == "error":
+            message = event.get("message")
+            raise DomainError(
+                message if isinstance(message, str) and message.strip() else "Backend subprocess reported an error."
+            )
+        if event_type == "done":
+            result = event.get("result")
+            if not isinstance(result, dict):
+                raise DomainError("Backend subprocess done event must include a result object.")
+            done_result = result
+            continue
+
+        raise DomainError(f"Backend subprocess emitted unsupported event type: {event_type!r}")
+
+    if done_result is None:
+        raise DomainError("Backend subprocess did not emit a done event.")
+    return done_result
+
+
+def _resolve_output_path_within_workspace(result: dict[str, Any], *, workspace_dir: Path) -> Path:
+    output_path = result.get("output_path")
+    if not isinstance(output_path, str) or not output_path.strip():
+        raise DomainError("Backend subprocess result must include a non-empty 'output_path'.")
+
+    candidate = Path(output_path.strip())
+    if not candidate.is_absolute():
+        candidate = workspace_dir / candidate
+    resolved_candidate = candidate.expanduser().resolve()
+    try:
+        resolved_candidate.relative_to(workspace_dir)
+    except ValueError as exc:
+        raise DomainError(
+            f"Backend subprocess output_path '{resolved_candidate}' is outside workspace_dir '{workspace_dir}'."
+        ) from exc
+    return resolved_candidate
+
+
+def _run_backend_job(
+    job: BackendJob,
+    *,
+    emit_progress: Callable[[int, str], None],
+    emit_log: Callable[[str], None],
+) -> dict[str, Any]:
+    payload_json = json.dumps(job.payload)
+    try:
+        completed = subprocess.run(
+            list(job.command),
+            input=payload_json,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError) as exc:
+        child_error_message = (
+            _extract_error_message_from_output(exc.stdout)
+            if isinstance(exc, subprocess.CalledProcessError)
+            else None
+        )
+        detail = _command_failure_detail(exc)
+        if child_error_message is not None:
+            raise DomainError(detail) from exc
+        raise DomainError(f"Backend subprocess failed: {detail}") from exc
+
+    result = _parse_backend_events(
+        completed.stdout,
+        emit_progress=emit_progress,
+        emit_log=emit_log,
+    )
+    resolved_output_path = _resolve_output_path_within_workspace(result, workspace_dir=job.workspace_dir)
+    resolved_result = dict(result)
+    resolved_result["output_path"] = str(resolved_output_path)
+    return resolved_result
+
+
 def execute(
     request: ExecutionRequest,
     runtime: RuntimeSnapshot,
@@ -220,12 +436,18 @@ def execute(
         )
 
     emit_progress(75, "backend-dispatch")
-    raise BackendNotImplementedError(
-        f"Generation backend is not implemented yet for node '{request.node_id}' with extension '{extension_id}'. "
-        f"Validation passed and the runtime scaffold is ready. Next step: implement the backend adapter in "
-        f"shared/runtime/local_image_runtime/pipeline.py and write outputs to {effective_workspace_dir}. "
-        f"Validated request summary: prompt={'yes' if payload_details.prompt else 'no'}, "
-        f"source_image={'yes' if payload_details.source_image_path else 'no'}, "
-        f"legacy_model_id={'yes' if payload_details.legacy_model_id else 'no'}, "
-        f"numeric_params={sorted(payload_details.numeric_params)}."
+    job = _build_backend_job(
+        request=request,
+        extension_id=extension_id,
+        extension_record=extension_record,
+        payload_details=payload_details,
+        effective_workspace_dir=effective_workspace_dir,
+    )
+    emit_log(
+        f"Dispatching backend family '{job.payload['family']}' for node '{request.node_id}' using venv '{job.command[0]}'."
+    )
+    return _run_backend_job(
+        job,
+        emit_progress=emit_progress,
+        emit_log=emit_log,
     )
