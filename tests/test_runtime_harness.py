@@ -1022,6 +1022,100 @@ class RuntimeHarnessTests(unittest.TestCase):
                 self.assertTrue(str(actual_path).startswith(str(outputs_dir)))
                 self.assertIn((75, "backend-dispatch"), progress_events)
 
+    def test_extension_generator_generate_serializes_effective_model_dir_to_child_payload(self) -> None:
+        cases = (
+            (
+                "sd15",
+                "text-to-image",
+                "stable-diffusion",
+                "stable-text",
+                b"ignored-image-bytes",
+                {
+                    "prompt": "generator prompt sd15",
+                    "steps": 4,
+                    "input": {"text": "legacy generator text sd15"},
+                },
+                None,
+            ),
+            (
+                "sdxl-base",
+                "image-to-image",
+                "sdxl",
+                "sdxl-image",
+                b"fake-image-bytes",
+                {"prompt": "variation", "strength": 0.35, "steps": 4},
+                object(),
+            ),
+        )
+
+        for (
+            extension_id,
+            node_id,
+            expected_family,
+            expected_marker,
+            image_bytes,
+            params,
+            source_image_token,
+        ) in cases:
+            with self.subTest(extension_id=extension_id, node_id=node_id):
+                runtime_root = self._make_runtime_root(extension_id)
+                _, result = self._run_setup_success(extension_id, runtime_root=runtime_root)
+                self.assertEqual(result.status, bootstrap.SETUP_STATUS_READY)
+                generator_class = self._load_generator_class(extension_id)
+                original_runtime_root = generator_class.runtime_root
+                generator_class.runtime_root = str(runtime_root)
+                model_dir = self._make_model_dir(extension_id, node_id)
+                outputs_dir = Path(tempfile.mkdtemp(prefix=f"outputs-{extension_id}-{node_id}-"))
+                serialized_payloads: list[dict[str, object]] = []
+                invocations: list[dict[str, object]] = []
+
+                real_runner_side_effect = self._run_real_runner_subprocess(
+                    loader_map={
+                        (expected_family, node_id): self._make_real_runner_loader(
+                            marker=expected_marker,
+                            invocations=invocations,
+                        )
+                    },
+                    source_image_token=source_image_token,
+                )
+
+                def capture_serialized_payload(command, *, input, text, capture_output, check, cwd, env):
+                    serialized_payloads.append(json.loads(input))
+                    return real_runner_side_effect(
+                        command,
+                        input=input,
+                        text=text,
+                        capture_output=capture_output,
+                        check=check,
+                        cwd=cwd,
+                        env=env,
+                    )
+
+                try:
+                    with patch(
+                        "local_image_runtime.bootstrap._smoke_test_runtime_imports",
+                        return_value=(True, "stubbed imports"),
+                    ), patch(
+                        "local_image_runtime.pipeline.subprocess.run",
+                        side_effect=capture_serialized_payload,
+                    ):
+                        generator = generator_class(model_dir, outputs_dir)
+                        actual_path = generator.generate(image_bytes, params)
+                finally:
+                    generator_class.runtime_root = original_runtime_root
+
+                self.assertEqual(len(serialized_payloads), 1)
+                self.assertEqual(serialized_payloads[0]["family"], expected_family)
+                self.assertEqual(serialized_payloads[0]["node_id"], node_id)
+                self.assertEqual(
+                    serialized_payloads[0]["model_dir"],
+                    str(model_dir.expanduser().resolve()),
+                )
+                self.assertEqual(len(invocations), 1)
+                self.assertEqual(invocations[0]["model_dir"], str(model_dir.expanduser().resolve()))
+                self.assertTrue(actual_path.exists())
+                self.assertTrue(str(actual_path).startswith(str(outputs_dir)))
+
     def test_extension_generator_generate_maps_image_to_image_request(self) -> None:
         cases = (
             ("sd15", {"prompt": "variation", "strength": 0.35, "steps": 4}),
@@ -1059,6 +1153,51 @@ class RuntimeHarnessTests(unittest.TestCase):
                     actual_path = generator.generate(image_bytes, params)
 
                 self.assertEqual(actual_path, result_path)
+
+    def test_build_generate_request_for_text_to_image_forwards_effective_model_dir_override(self) -> None:
+        generator_class = self._load_generator_class("sd15")
+        model_dir = self._make_model_dir("sd15", "text-to-image")
+        outputs_dir = Path(tempfile.mkdtemp(prefix="outputs-sd15-"))
+        generator = generator_class(model_dir, outputs_dir)
+
+        params = {
+            "prompt": "generator prompt sd15",
+            "steps": 4,
+            "input": {"text": "legacy generator text sd15"},
+        }
+
+        request = generator._build_generate_request(b"ignored-image-bytes", params)
+
+        self.assertEqual(request.node_id, "text-to-image")
+        self.assertEqual(request.input, {"text": "legacy generator text sd15"})
+        self.assertEqual(request.workspace_dir, str(outputs_dir))
+        self.assertEqual(
+            request.model_dir_override,
+            str(model_dir.expanduser().resolve()),
+        )
+
+    def test_build_generate_request_for_image_to_image_forwards_effective_model_dir_override(self) -> None:
+        generator_class = self._load_generator_class("sdxl-base")
+        model_dir = self._make_model_dir("sdxl-base", "image-to-image")
+        outputs_dir = Path(tempfile.mkdtemp(prefix="outputs-sdxl-base-"))
+        generator = generator_class(model_dir, outputs_dir)
+
+        request = generator._build_generate_request(
+            b"fake-image-bytes",
+            {"prompt": "variation", "strength": 0.35, "steps": 4},
+        )
+
+        self.assertEqual(request.node_id, "image-to-image")
+        self.assertEqual(request.workspace_dir, str(outputs_dir))
+        self.assertEqual(
+            request.model_dir_override,
+            str(model_dir.expanduser().resolve()),
+        )
+        materialized_input = Path(request.input["filePath"])
+        self.assertTrue(materialized_input.is_absolute())
+        self.assertTrue(materialized_input.exists())
+        self.assertEqual(materialized_input.read_bytes(), b"fake-image-bytes")
+        self.assertEqual(materialized_input.parent, outputs_dir / ".modly-inputs")
 
     def test_extension_generator_generate_rejects_invalid_image_to_image_strength(self) -> None:
         generator_class = self._load_generator_class("sd15")
@@ -1157,9 +1296,11 @@ class RuntimeHarnessTests(unittest.TestCase):
                         "guidance_scale": 7.5,
                         "seed": 42,
                     },
+                    model_dir_override="/models/modly/sd15",
                 ),
                 "stable-diffusion",
                 None,
+                "/models/modly/sd15",
             ),
             (
                 "sdxl-base",
@@ -1175,10 +1316,11 @@ class RuntimeHarnessTests(unittest.TestCase):
                 ),
                 "sdxl",
                 "source.png",
+                None,
             ),
         )
 
-        for extension_id, request, expected_family, source_name in cases:
+        for extension_id, request, expected_family, source_name, expected_model_dir in cases:
             with self.subTest(extension_id=extension_id, node_id=request.node_id):
                 workspace_dir = Path(tempfile.mkdtemp(prefix=f"workspace-{extension_id}-"))
                 runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
@@ -1200,6 +1342,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                         input={"filePath": source_name},
                         params=request.params,
                         workspace_dir=str(workspace_dir),
+                        model_dir_override=request.model_dir_override,
                     )
                 else:
                     source_path = None
@@ -1208,6 +1351,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                         input=request.input,
                         params=request.params,
                         workspace_dir=str(workspace_dir),
+                        model_dir_override=request.model_dir_override,
                     )
 
                 expected_output_path = workspace_dir / f"{extension_id}-{request.node_id}.png"
@@ -1226,7 +1370,10 @@ class RuntimeHarnessTests(unittest.TestCase):
                     self.assertEqual(payload["family"], expected_family)
                     self.assertEqual(payload["node_id"], request.node_id)
                     self.assertEqual(payload["workspace_dir"], str(workspace_dir))
-                    self.assertEqual(payload["model_dir"], extension_record["model_dir"])
+                    self.assertEqual(
+                        payload["model_dir"],
+                        expected_model_dir or extension_record["model_dir"],
+                    )
                     self.assertEqual(payload["prompt"], request.params.get("prompt"))
                     self.assertEqual(payload["negative_prompt"], request.params.get("negative_prompt"))
                     self.assertEqual(payload["params"], {
@@ -1269,6 +1416,73 @@ class RuntimeHarnessTests(unittest.TestCase):
                 self.assertEqual(result, {"output_path": str(expected_output_path.resolve())})
                 self.assertIn((88, "child-running"), progress_events)
                 self.assertIn("child-log", logs)
+
+    def test_build_backend_job_prefers_model_dir_override_over_extension_record(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-job-override-"))
+        extension_root = Path(tempfile.mkdtemp(prefix="ext-root-job-override-"))
+        (extension_root / "src").mkdir(parents=True, exist_ok=True)
+        venv_python = self._make_executable_python(extension_root)
+        request = pipeline.ExecutionRequest(
+            node_id="text-to-image",
+            input={"text": "lighthouse"},
+            params={"prompt": "lighthouse", "steps": 4},
+            workspace_dir=str(workspace_dir),
+            model_dir_override="/models/modly/sdxl",
+        )
+        payload_details = pipeline.ValidatedPayload(
+            prompt="lighthouse",
+            source_image_path=None,
+            numeric_params={"steps": 4},
+            legacy_model_id=None,
+        )
+
+        job = pipeline._build_backend_job(
+            request=request,
+            extension_id="sd15",
+            extension_record={
+                "venv_python": str(venv_python),
+                "model_dir": "/runtime/local/sdxl",
+            },
+            payload_details=payload_details,
+            effective_workspace_dir=str(workspace_dir),
+        )
+
+        self.assertEqual(job.payload["model_dir"], "/models/modly/sdxl")
+
+    def test_build_backend_job_falls_back_to_extension_record_when_override_missing(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-job-fallback-"))
+        extension_root = Path(tempfile.mkdtemp(prefix="ext-root-job-fallback-"))
+        (extension_root / "src").mkdir(parents=True, exist_ok=True)
+        venv_python = self._make_executable_python(extension_root)
+        payload_details = pipeline.ValidatedPayload(
+            prompt="forest",
+            source_image_path=None,
+            numeric_params={"steps": 8},
+            legacy_model_id=None,
+        )
+
+        for raw_override in (None, "", "   "):
+            with self.subTest(model_dir_override=raw_override):
+                request = pipeline.ExecutionRequest(
+                    node_id="text-to-image",
+                    input={"text": "forest"},
+                    params={"prompt": "forest", "steps": 8},
+                    workspace_dir=str(workspace_dir),
+                    model_dir_override=raw_override,
+                )
+
+                job = pipeline._build_backend_job(
+                    request=request,
+                    extension_id="sd15",
+                    extension_record={
+                        "venv_python": str(venv_python),
+                        "model_dir": "/runtime/local/sdxl",
+                    },
+                    payload_details=payload_details,
+                    effective_workspace_dir=str(workspace_dir),
+                )
+
+                self.assertEqual(job.payload["model_dir"], "/runtime/local/sdxl")
 
     def test_pipeline_execute_prepends_existing_host_pythonpath_without_losing_env(self) -> None:
         workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-pythonpath-"))

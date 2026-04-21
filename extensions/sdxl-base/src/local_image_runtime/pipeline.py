@@ -35,6 +35,7 @@ class ExecutionRequest:
     params: dict[str, Any]
     workspace_dir: str | None = None
     temp_dir: str | None = None
+    model_dir_override: str | None = None
 
 
 @dataclass(frozen=True)
@@ -259,6 +260,18 @@ def _build_backend_env(*, runtime_src_dir: Path) -> dict[str, str]:
     return env
 
 
+def _resolve_backend_model_dir(
+    request: ExecutionRequest,
+    extension_record: dict[str, Any],
+) -> Any:
+    override = request.model_dir_override
+    if isinstance(override, str):
+        normalized_override = override.strip()
+        if normalized_override:
+            return normalized_override
+    return extension_record.get("model_dir")
+
+
 def _build_backend_job(
     *,
     request: ExecutionRequest,
@@ -285,7 +298,7 @@ def _build_backend_job(
         "extension_id": extension_id,
         "family": descriptor.family,
         "node_id": request.node_id,
-        "model_dir": extension_record.get("model_dir"),
+        "model_dir": _resolve_backend_model_dir(request, extension_record),
         "workspace_dir": str(workspace_dir),
         "output_path": str(output_path),
         "prompt": payload_details.prompt,

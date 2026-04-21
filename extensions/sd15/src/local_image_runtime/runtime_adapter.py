@@ -389,6 +389,7 @@ class BaseGeneratorRuntimeAdapter(ImportedBaseGenerator):
     def _build_generate_request(self, image_bytes: bytes, params: dict[str, Any]) -> ExecutionRequest:
         request_params = _coerce_generate_params(params)
         request_input = _nested_input_payload(request_params)
+        model_dir_override = str(self.model_dir.expanduser().resolve())
 
         if self.node_id == "text-to-image":
             prompt = request_params.get("prompt")
@@ -401,6 +402,7 @@ class BaseGeneratorRuntimeAdapter(ImportedBaseGenerator):
                 input={"text": request_input.get("text")} if "text" in request_input else {},
                 params=request_params,
                 workspace_dir=str(self.outputs_dir),
+                model_dir_override=model_dir_override,
             )
 
         if self.node_id == "image-to-image":
@@ -410,6 +412,7 @@ class BaseGeneratorRuntimeAdapter(ImportedBaseGenerator):
                 input={"filePath": str(materialized_input)},
                 params=request_params,
                 workspace_dir=str(self.outputs_dir),
+                model_dir_override=model_dir_override,
             )
 
         raise DomainError(
