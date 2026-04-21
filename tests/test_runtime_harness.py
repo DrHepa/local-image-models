@@ -85,6 +85,7 @@ class RuntimeHarnessTests(unittest.TestCase):
             self._extension_manifest(extension_id),
             encoding="utf-8",
         )
+        (runtime_root / "src").mkdir(parents=True, exist_ok=True)
         return runtime_root
 
     def _make_runtime_snapshot(
@@ -106,6 +107,13 @@ class RuntimeHarnessTests(unittest.TestCase):
         python_path = root / "venv" / "bin" / "python"
         python_path.parent.mkdir(parents=True, exist_ok=True)
         python_path.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        python_path.chmod(0o755)
+        return python_path
+
+    def _make_windows_executable_python(self, root: Path) -> Path:
+        python_path = root / "venv" / "Scripts" / "python.exe"
+        python_path.parent.mkdir(parents=True, exist_ok=True)
+        python_path.write_text("", encoding="utf-8")
         python_path.chmod(0o755)
         return python_path
 
@@ -155,10 +163,13 @@ class RuntimeHarnessTests(unittest.TestCase):
     ):
         import local_image_runtime.inference_runner as inference_runner
 
-        def run_side_effect(command, *, input, text, capture_output, check):
+        def run_side_effect(command, *, input, text, capture_output, check, cwd, env):
             self.assertTrue(text)
             self.assertTrue(capture_output)
             self.assertTrue(check)
+            self.assertIsInstance(cwd, str)
+            self.assertIsInstance(env, dict)
+            self.assertIn("PYTHONPATH", env)
 
             stdout = StringIO()
             with patch.dict(inference_runner._PIPELINE_LOADERS, loader_map, clear=True), patch.object(
@@ -1172,6 +1183,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                 workspace_dir = Path(tempfile.mkdtemp(prefix=f"workspace-{extension_id}-"))
                 runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
                 runtime_root = Path(tempfile.mkdtemp(prefix=f"ext-root-{extension_id}-"))
+                (runtime_root / "src").mkdir(parents=True, exist_ok=True)
                 venv_python = self._make_executable_python(runtime_root)
                 extension_record = {
                     "venv_python": str(venv_python),
@@ -1200,11 +1212,14 @@ class RuntimeHarnessTests(unittest.TestCase):
 
                 expected_output_path = workspace_dir / f"{extension_id}-{request.node_id}.png"
 
-                def run_side_effect(command, *, input, text, capture_output, check):
+                def run_side_effect(command, *, input, text, capture_output, check, cwd, env):
                     self.assertEqual(command, [str(venv_python), "-m", "local_image_runtime.inference_runner"])
                     self.assertTrue(text)
                     self.assertTrue(capture_output)
                     self.assertTrue(check)
+                    self.assertEqual(cwd, str(runtime_root / "src"))
+                    self.assertIsInstance(env, dict)
+                    self.assertEqual(env["PYTHONPATH"], str(runtime_root / "src"))
 
                     payload = json.loads(input)
                     self.assertEqual(payload["extension_id"], extension_id)
@@ -1254,6 +1269,182 @@ class RuntimeHarnessTests(unittest.TestCase):
                 self.assertEqual(result, {"output_path": str(expected_output_path.resolve())})
                 self.assertIn((88, "child-running"), progress_events)
                 self.assertIn("child-log", logs)
+
+    def test_pipeline_execute_prepends_existing_host_pythonpath_without_losing_env(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-pythonpath-"))
+        runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
+        runtime_root = Path(tempfile.mkdtemp(prefix="ext-root-pythonpath-"))
+        runtime_src = runtime_root / "src"
+        runtime_src.mkdir(parents=True, exist_ok=True)
+        venv_python = self._make_executable_python(runtime_root)
+        request = pipeline.ExecutionRequest(
+            node_id="text-to-image",
+            input={"text": "preserve pythonpath"},
+            params={"prompt": "preserve pythonpath", "steps": 4},
+            workspace_dir=str(workspace_dir),
+        )
+        expected_output_path = workspace_dir / "pythonpath-output.png"
+
+        def run_side_effect(command, *, input, text, capture_output, check, cwd, env):
+            self.assertEqual(command, [str(venv_python), "-m", "local_image_runtime.inference_runner"])
+            self.assertTrue(text)
+            self.assertTrue(capture_output)
+            self.assertTrue(check)
+            self.assertEqual(cwd, str(runtime_src))
+            self.assertEqual(
+                env["PYTHONPATH"],
+                str(runtime_src) + os.pathsep + "/host/a:/host/b",
+            )
+            self.assertEqual(env["KEEP_ME"], "1")
+
+            payload = json.loads(input)
+            self.assertEqual(payload["workspace_dir"], str(workspace_dir))
+            return self._completed_process(
+                stdout=json.dumps({"type": "done", "result": {"output_path": str(expected_output_path)}})
+                + "\n"
+            )
+
+        with patch.dict(os.environ, {"PYTHONPATH": "/host/a:/host/b", "KEEP_ME": "1"}, clear=True), patch(
+            "local_image_runtime.pipeline.extension_is_installed",
+            return_value=True,
+        ), patch(
+            "local_image_runtime.pipeline.get_extension_record",
+            return_value={
+                "venv_python": str(venv_python),
+                "model_dir": str(runtime.paths.models_dir / "sd15"),
+            },
+        ), patch(
+            "local_image_runtime.pipeline.subprocess.run",
+            side_effect=run_side_effect,
+        ):
+            result = pipeline.execute(
+                request,
+                runtime,
+                extension_id="sd15",
+                emit_progress=lambda percent, label: None,
+                emit_log=lambda message: None,
+            )
+
+        self.assertEqual(result, {"output_path": str(expected_output_path.resolve())})
+
+    def test_pipeline_execute_fails_before_spawn_when_runtime_src_is_missing(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-missing-src-"))
+        runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
+        runtime_root = Path(tempfile.mkdtemp(prefix="ext-root-missing-src-"))
+        venv_python = self._make_executable_python(runtime_root)
+        request = pipeline.ExecutionRequest(
+            node_id="text-to-image",
+            input={"text": "missing runtime src"},
+            params={"prompt": "missing runtime src", "steps": 4},
+            workspace_dir=str(workspace_dir),
+        )
+
+        with patch(
+            "local_image_runtime.pipeline.extension_is_installed",
+            return_value=True,
+        ), patch(
+            "local_image_runtime.pipeline.get_extension_record",
+            return_value={
+                "venv_python": str(venv_python),
+                "model_dir": str(runtime.paths.models_dir / "sd15"),
+            },
+        ), patch(
+            "local_image_runtime.pipeline.subprocess.run",
+        ) as subprocess_run:
+            with self.assertRaisesRegex(
+                pipeline.DomainError,
+                "Missing vendored runtime src for extension 'sd15'",
+            ):
+                pipeline.execute(
+                    request,
+                    runtime,
+                    extension_id="sd15",
+                    emit_progress=lambda percent, label: None,
+                    emit_log=lambda message: None,
+                )
+
+        subprocess_run.assert_not_called()
+
+    def test_build_backend_job_derives_runtime_src_from_posix_venv_without_ext_dir(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-job-posix-"))
+        runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
+        extension_root = Path(tempfile.mkdtemp(prefix="ext-root-job-posix-"))
+        (extension_root / "src").mkdir(parents=True, exist_ok=True)
+        venv_python = self._make_executable_python(extension_root)
+        request = pipeline.ExecutionRequest(
+            node_id="text-to-image",
+            input={"text": "lighthouse"},
+            params={"prompt": "lighthouse", "steps": 4},
+            workspace_dir=str(workspace_dir),
+        )
+        payload_details = pipeline.ValidatedPayload(
+            prompt="lighthouse",
+            source_image_path=None,
+            numeric_params={"steps": 4},
+            legacy_model_id=None,
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            job = pipeline._build_backend_job(
+                request=request,
+                extension_id="sd15",
+                extension_record={
+                    "venv_python": str(venv_python),
+                    "model_dir": str(runtime.paths.models_dir / "sd15"),
+                },
+                payload_details=payload_details,
+                effective_workspace_dir=str(workspace_dir),
+            )
+
+        self.assertEqual(
+            job.command,
+            (str(venv_python), "-m", "local_image_runtime.inference_runner"),
+        )
+        self.assertEqual(job.cwd, extension_root / "src")
+        self.assertEqual(job.workspace_dir, workspace_dir.resolve())
+        self.assertEqual(job.env["PYTHONPATH"], str(extension_root / "src"))
+
+    def test_build_backend_job_supports_windows_venv_layout_and_prepends_pythonpath(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-job-windows-"))
+        runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
+        extension_root = Path(tempfile.mkdtemp(prefix="ext-root-job-windows-"))
+        (extension_root / "src").mkdir(parents=True, exist_ok=True)
+        venv_python = self._make_windows_executable_python(extension_root)
+        request = pipeline.ExecutionRequest(
+            node_id="text-to-image",
+            input={"text": "forest"},
+            params={"prompt": "forest", "steps": 8},
+            workspace_dir=str(workspace_dir),
+        )
+        payload_details = pipeline.ValidatedPayload(
+            prompt="forest",
+            source_image_path=None,
+            numeric_params={"steps": 8},
+            legacy_model_id=None,
+        )
+
+        with patch.dict(os.environ, {"PYTHONPATH": "/host/a:/host/b", "KEEP_ME": "1"}, clear=True):
+            job = pipeline._build_backend_job(
+                request=request,
+                extension_id="sd15",
+                extension_record={
+                    "venv_python": str(venv_python),
+                    "model_dir": str(runtime.paths.models_dir / "sd15"),
+                },
+                payload_details=payload_details,
+                effective_workspace_dir=str(workspace_dir),
+            )
+
+        self.assertEqual(
+            job.command,
+            (str(venv_python), "-m", "local_image_runtime.inference_runner"),
+        )
+        self.assertEqual(job.cwd, extension_root / "src")
+        self.assertEqual(
+            job.env["PYTHONPATH"],
+            str(extension_root / "src") + os.pathsep + "/host/a:/host/b",
+        )
+        self.assertEqual(job.env["KEEP_ME"], "1")
 
     def test_pipeline_execute_requires_executable_venv_python_before_spawn(self) -> None:
         workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-venv-"))
@@ -1340,6 +1531,7 @@ class RuntimeHarnessTests(unittest.TestCase):
         workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-output-"))
         runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
         runtime_root = Path(tempfile.mkdtemp(prefix="ext-root-output-"))
+        (runtime_root / "src").mkdir(parents=True, exist_ok=True)
         venv_python = self._make_executable_python(runtime_root)
         request = pipeline.ExecutionRequest(
             node_id="text-to-image",
@@ -1377,6 +1569,9 @@ class RuntimeHarnessTests(unittest.TestCase):
         workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-override-"))
         runtime_outputs_dir = Path(tempfile.mkdtemp(prefix="runtime-outputs-"))
         runtime_models_dir = Path(tempfile.mkdtemp(prefix="runtime-models-"))
+        runtime_root = Path(tempfile.mkdtemp(prefix="workspace-override-ext-"))
+        (runtime_root / "src").mkdir(parents=True, exist_ok=True)
+        venv_python = self._make_executable_python(runtime_root)
         runtime = SimpleNamespace(
             paths=SimpleNamespace(outputs_dir=runtime_outputs_dir, models_dir=runtime_models_dir)
         )
@@ -1395,12 +1590,12 @@ class RuntimeHarnessTests(unittest.TestCase):
         ), patch(
             "local_image_runtime.pipeline.get_extension_record",
             return_value={
-                "venv_python": str(self._make_executable_python(Path(tempfile.mkdtemp(prefix="workspace-override-ext-")))),
+                "venv_python": str(venv_python),
                 "model_dir": str(runtime_models_dir / "sd15"),
             },
         ), patch(
             "local_image_runtime.pipeline.subprocess.run",
-            side_effect=lambda command, *, input, text, capture_output, check: self._completed_process(
+            side_effect=lambda command, *, input, text, capture_output, check, cwd, env: self._completed_process(
                 stdout=json.dumps(
                     {
                         "type": "done",

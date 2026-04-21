@@ -50,6 +50,8 @@ class BackendJob:
     command: tuple[str, ...]
     payload: dict[str, Any]
     workspace_dir: Path
+    cwd: Path
+    env: dict[str, str]
 
 
 def _request_path_candidates(request: ExecutionRequest, raw_path: str) -> tuple[Path, ...]:
@@ -222,6 +224,41 @@ def _require_executable_venv_python(extension_record: dict[str, Any], *, extensi
     return venv_python
 
 
+def _derive_runtime_src_dir(*, venv_python: Path, extension_id: str) -> Path:
+    lexical_python = venv_python.expanduser()
+    parent_dir = lexical_python.parent
+    layout_dir = parent_dir.name
+    if layout_dir not in {"bin", "Scripts"}:
+        raise DomainError(
+            f"Invalid virtualenv layout for extension '{extension_id}': {venv_python}"
+        )
+
+    venv_dir = parent_dir.parent
+    if venv_dir.name != "venv":
+        raise DomainError(
+            f"Invalid virtualenv layout for extension '{extension_id}': {venv_python}"
+        )
+
+    runtime_src_dir = venv_dir.parent / "src"
+    if not runtime_src_dir.exists() or not runtime_src_dir.is_dir():
+        raise DomainError(
+            f"Missing vendored runtime src for extension '{extension_id}': {runtime_src_dir}"
+        )
+    return runtime_src_dir
+
+
+def _build_backend_env(*, runtime_src_dir: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    existing_pythonpath = env.get("PYTHONPATH")
+    runtime_src = str(runtime_src_dir)
+    env["PYTHONPATH"] = (
+        f"{runtime_src}{os.pathsep}{existing_pythonpath}"
+        if existing_pythonpath
+        else runtime_src
+    )
+    return env
+
+
 def _build_backend_job(
     *,
     request: ExecutionRequest,
@@ -258,14 +295,18 @@ def _build_backend_job(
         "source_image_path": payload_details.source_image_path,
         "params": params,
     }
+    venv_python = _require_executable_venv_python(extension_record, extension_id=extension_id)
+    runtime_src_dir = _derive_runtime_src_dir(venv_python=venv_python, extension_id=extension_id)
     return BackendJob(
         command=(
-            str(_require_executable_venv_python(extension_record, extension_id=extension_id)),
+            str(venv_python),
             "-m",
             "local_image_runtime.inference_runner",
         ),
         payload=payload,
         workspace_dir=workspace_dir,
+        cwd=runtime_src_dir,
+        env=_build_backend_env(runtime_src_dir=runtime_src_dir),
     )
 
 
@@ -379,6 +420,8 @@ def _run_backend_job(
             text=True,
             capture_output=True,
             check=True,
+            cwd=str(job.cwd),
+            env=job.env,
         )
     except (subprocess.CalledProcessError, OSError) as exc:
         child_error_message = (
