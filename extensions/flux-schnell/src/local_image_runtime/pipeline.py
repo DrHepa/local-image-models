@@ -414,6 +414,11 @@ def _parse_backend_events(
                 raise DomainError("Backend subprocess done event must include a result object.")
             done_result = result
             continue
+        if event_type == "memory":
+            stage = event.get("stage")
+            if isinstance(stage, str) and stage.strip():
+                continue
+            raise DomainError("Backend subprocess memory event must include a non-empty stage string.")
 
         raise DomainError(f"Backend subprocess emitted unsupported event type: {event_type!r}")
 
@@ -482,6 +487,11 @@ def _parse_backend_event_line(
         if not isinstance(result, dict):
             raise DomainError("Backend subprocess done event must include a result object.")
         return ("done", result)
+    if event_type == "memory":
+        stage = event.get("stage")
+        if isinstance(stage, str) and stage.strip():
+            return ("memory", stage.strip())
+        raise DomainError("Backend subprocess memory event must include a non-empty stage string.")
 
     raise DomainError(f"Backend subprocess emitted unsupported event type: {event_type!r}")
 
@@ -572,6 +582,10 @@ def _stream_backend_events(
             continue
         if event_type == "done":
             done_result = event_payload if isinstance(event_payload, dict) else None
+            continue
+        if event_type == "memory":
+            last_activity_at = monotonic()
+            current_stage = str(event_payload)
             continue
         child_error = str(event_payload)
 

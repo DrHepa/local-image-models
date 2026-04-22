@@ -6,6 +6,14 @@ import threading
 from pathlib import Path
 from typing import Any, TextIO
 
+from .diffusers_memory import (
+    apply_post_load_memory_optimizations,
+    build_diffusers_load_attempts,
+    collect_stage_memory_snapshot,
+    is_retryable_diffusers_load_error,
+    should_emit_memory_events,
+)
+
 
 class InferenceRunnerError(RuntimeError):
     """Raised when the child inference runner cannot execute a job."""
@@ -103,10 +111,31 @@ def _resolve_loader(job: dict[str, Any]) -> Any:
     return loader
 
 
-def _instantiate_pipeline(loader: Any, *, model_dir: str) -> Any:
+def _instantiate_pipeline(loader: Any, *, job: dict[str, Any], torch_module: Any | None = None) -> Any:
+    model_dir = _require_string_field(job, "model_dir")
+    family = _require_string_field(job, "family")
+    node_id = _require_string_field(job, "node_id")
+    extension_id = job.get("extension_id") if isinstance(job.get("extension_id"), str) else ""
     resolved_loader = loader() if callable(loader) and not hasattr(loader, "from_pretrained") else loader
     if hasattr(resolved_loader, "from_pretrained"):
-        return resolved_loader.from_pretrained(model_dir)
+        attempts = build_diffusers_load_attempts(
+            extension_id=extension_id,
+            family=family,
+            node_id=node_id,
+            torch_module=torch_module,
+        )
+        last_error: Exception | None = None
+        for _, load_kwargs in attempts:
+            try:
+                return resolved_loader.from_pretrained(model_dir, **load_kwargs)
+            except Exception as exc:
+                last_error = exc
+                if load_kwargs and is_retryable_diffusers_load_error(exc):
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
+        raise InferenceRunnerError("Inference loader did not provide any load attempts.")
     if callable(resolved_loader):
         return resolved_loader(model_dir)
     raise InferenceRunnerError("Inference loader must expose from_pretrained(model_dir) or be callable.")
@@ -227,22 +256,49 @@ def _run_pipeline_with_liveness(
         heartbeat_thread.join(timeout=max(resolved_heartbeat_interval, 1.0))
 
 
+def _emit_memory_event_for_stage(
+    stage: str,
+    *,
+    extension_id: str,
+    torch_module: Any | None,
+    stdout: TextIO | None = None,
+) -> None:
+    if not should_emit_memory_events(extension_id=extension_id):
+        return
+    emit_event("memory", stdout=stdout, **collect_stage_memory_snapshot(stage=stage, torch_module=torch_module))
+
+
 def run_child_job(job: dict[str, Any], *, stdout: TextIO | None = None) -> dict[str, Any]:
     model_dir = _require_string_field(job, "model_dir")
     output_path = _require_string_field(job, "output_path")
     family = _require_string_field(job, "family")
     node_id = _require_string_field(job, "node_id")
+    extension_id = job.get("extension_id") if isinstance(job.get("extension_id"), str) else ""
     loader = _resolve_loader(job)
+    torch_module = _load_torch()
     execution_device = _resolve_execution_device()
     _emit_stage_event("loading-pipeline", stdout=stdout)
     pipeline = _place_pipeline_on_device(
-        _instantiate_pipeline(loader, model_dir=model_dir),
+        _instantiate_pipeline(loader, job=job, torch_module=torch_module),
         execution_device=execution_device,
+    )
+    apply_post_load_memory_optimizations(pipeline=pipeline, extension_id=extension_id)
+    _emit_memory_event_for_stage(
+        "loading-pipeline",
+        extension_id=extension_id,
+        torch_module=torch_module,
+        stdout=stdout,
     )
     _emit_stage_event("running-inference", stdout=stdout)
     result = _run_pipeline_with_liveness(
         pipeline,
         pipeline_kwargs=_build_pipeline_kwargs(job, execution_device=execution_device),
+        stdout=stdout,
+    )
+    _emit_memory_event_for_stage(
+        "running-inference",
+        extension_id=extension_id,
+        torch_module=torch_module,
         stdout=stdout,
     )
 
@@ -254,6 +310,12 @@ def run_child_job(job: dict[str, Any], *, stdout: TextIO | None = None) -> dict[
     output_file.parent.mkdir(parents=True, exist_ok=True)
     _emit_stage_event("saving-output", stdout=stdout)
     images[0].save(str(output_file))
+    _emit_memory_event_for_stage(
+        "saving-output",
+        extension_id=extension_id,
+        torch_module=torch_module,
+        stdout=stdout,
+    )
 
     params = job.get("params") if isinstance(job.get("params"), dict) else {}
     return {

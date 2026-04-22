@@ -2417,6 +2417,71 @@ class RuntimeHarnessTests(unittest.TestCase):
                     expected_device,
                 )
 
+    def test_diffusers_load_attempts_target_sd_families_with_ordered_fallbacks(self) -> None:
+        import local_image_runtime.diffusers_memory as diffusers_memory
+
+        fake_torch = SimpleNamespace(float16="float16")
+        cases = (
+            ("sd15", "stable-diffusion"),
+            ("sdxl-base", "sdxl"),
+            ("flux-schnell", "flux"),
+        )
+
+        for extension_id, family in cases:
+            with self.subTest(extension_id=extension_id):
+                attempts = diffusers_memory.build_diffusers_load_attempts(
+                    extension_id=extension_id,
+                    family=family,
+                    node_id="text-to-image",
+                    torch_module=fake_torch,
+                )
+
+                if extension_id == "flux-schnell":
+                    self.assertEqual(attempts, (("baseline", {}),))
+                    continue
+
+                self.assertEqual(
+                    [attempt_name for attempt_name, _ in attempts],
+                    [
+                        "optimized-fp16",
+                        "optimized-no-variant",
+                        "optimized-no-safetensors",
+                        "optimized-no-low-cpu-mem",
+                        "baseline",
+                    ],
+                )
+                self.assertEqual(
+                    attempts[0][1],
+                    {
+                        "torch_dtype": "float16",
+                        "variant": "fp16",
+                        "use_safetensors": True,
+                        "low_cpu_mem_usage": True,
+                    },
+                )
+                self.assertEqual(attempts[-1], ("baseline", {}))
+
+    def test_diffusers_load_retry_classifier_limits_fallback_to_known_loader_failures(self) -> None:
+        import local_image_runtime.diffusers_memory as diffusers_memory
+
+        retryable_errors = (
+            TypeError("unexpected keyword argument 'variant'"),
+            OSError("no file named diffusion_pytorch_model.fp16.safetensors found"),
+            ValueError("variant fp16 is not available for this checkpoint"),
+        )
+        terminal_errors = (
+            RuntimeError("weights checksum mismatch"),
+            OSError("permission denied while reading model directory"),
+        )
+
+        for error in retryable_errors:
+            with self.subTest(error=str(error)):
+                self.assertTrue(diffusers_memory.is_retryable_diffusers_load_error(error))
+
+        for error in terminal_errors:
+            with self.subTest(error=str(error)):
+                self.assertFalse(diffusers_memory.is_retryable_diffusers_load_error(error))
+
     def test_inference_runner_moves_pipeline_to_resolved_device_before_execution(self) -> None:
         import local_image_runtime.inference_runner as inference_runner
 
@@ -2464,6 +2529,118 @@ class RuntimeHarnessTests(unittest.TestCase):
         self.assertEqual(fake_pipeline.to_calls, ["cuda"])
         self.assertEqual(len(fake_pipeline.invocations), 1)
 
+    def test_inference_runner_uses_optimized_loader_args_for_sd15_and_sdxl_base(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="runner-loader-optimized-"))
+
+        class FakeImage:
+            def save(self, target_path: str) -> None:
+                Path(target_path).write_text("generated", encoding="utf-8")
+
+        for extension_id, family in (("sd15", "stable-diffusion"), ("sdxl-base", "sdxl")):
+            loader_calls: list[dict[str, object]] = []
+
+            class FakePipeline:
+                def to(self, device: str) -> "FakePipeline":
+                    return self
+
+                def __call__(self, **kwargs):
+                    return SimpleNamespace(images=[FakeImage()])
+
+            class FakeLoader:
+                @staticmethod
+                def from_pretrained(model_dir: str, **kwargs):
+                    loader_calls.append({"model_dir": model_dir, "kwargs": kwargs})
+                    return FakePipeline()
+
+            job = {
+                "extension_id": extension_id,
+                "family": family,
+                "node_id": "text-to-image",
+                "model_dir": str(workspace_dir / extension_id / "model"),
+                "workspace_dir": str(workspace_dir),
+                "output_path": str(workspace_dir / f"{extension_id}.png"),
+                "prompt": f"optimized {extension_id}",
+                "params": {"steps": 4},
+            }
+
+            stdout = StringIO()
+            with self.subTest(extension_id=extension_id), patch.dict(
+                inference_runner._PIPELINE_LOADERS,
+                {(family, "text-to-image"): FakeLoader()},
+                clear=True,
+            ), patch.object(inference_runner, "_resolve_execution_device", return_value="cpu"), patch.object(
+                inference_runner,
+                "_load_torch",
+                return_value=SimpleNamespace(float16="float16"),
+            ):
+                exit_code = inference_runner.run_child_main(stdin=StringIO(json.dumps(job) + "\n"), stdout=stdout)
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(loader_calls), 1)
+            self.assertEqual(
+                loader_calls[0]["kwargs"],
+                {
+                    "torch_dtype": "float16",
+                    "variant": "fp16",
+                    "use_safetensors": True,
+                    "low_cpu_mem_usage": True,
+                },
+            )
+
+    def test_inference_runner_falls_back_to_baseline_loader_when_optimized_kwargs_fail(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="runner-loader-fallback-"))
+        loader_calls: list[dict[str, object]] = []
+
+        class FakeImage:
+            def save(self, target_path: str) -> None:
+                Path(target_path).write_text("generated", encoding="utf-8")
+
+        class FakePipeline:
+            def to(self, device: str) -> "FakePipeline":
+                return self
+
+            def __call__(self, **kwargs):
+                return SimpleNamespace(images=[FakeImage()])
+
+        class FakeLoader:
+            @staticmethod
+            def from_pretrained(model_dir: str, **kwargs):
+                loader_calls.append({"model_dir": model_dir, "kwargs": kwargs})
+                if kwargs:
+                    raise TypeError("unexpected keyword argument 'variant'")
+                return FakePipeline()
+
+        job = {
+            "extension_id": "sd15",
+            "family": "stable-diffusion",
+            "node_id": "text-to-image",
+            "model_dir": str(workspace_dir / "model"),
+            "workspace_dir": str(workspace_dir),
+            "output_path": str(workspace_dir / "sd15.png"),
+            "prompt": "fallback sd15",
+            "params": {"steps": 4},
+        }
+
+        stdout = StringIO()
+        with patch.dict(
+            inference_runner._PIPELINE_LOADERS,
+            {("stable-diffusion", "text-to-image"): FakeLoader()},
+            clear=True,
+        ), patch.object(inference_runner, "_resolve_execution_device", return_value="cpu"), patch.object(
+            inference_runner,
+            "_load_torch",
+            return_value=SimpleNamespace(float16="float16"),
+        ):
+            exit_code = inference_runner.run_child_main(stdin=StringIO(json.dumps(job) + "\n"), stdout=stdout)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual([call["kwargs"] for call in loader_calls][-1], {})
+        self.assertGreaterEqual(len(loader_calls), 2)
+
     def test_seeded_generator_uses_resolved_execution_device(self) -> None:
         import local_image_runtime.inference_runner as inference_runner
 
@@ -2487,6 +2664,97 @@ class RuntimeHarnessTests(unittest.TestCase):
 
         self.assertEqual(generator, "generator:cuda:1234")
         self.assertEqual(generator_calls, [("cuda", 1234)])
+
+    def test_inference_runner_applies_guarded_post_load_memory_optimizations_for_sd_families(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="runner-post-load-optimizations-"))
+
+        class FakeImage:
+            def save(self, target_path: str) -> None:
+                Path(target_path).write_text("generated", encoding="utf-8")
+
+        for extension_id, family, expect_calls in (
+            ("sd15", "stable-diffusion", True),
+            ("flux-schnell", "flux", False),
+        ):
+            optimization_calls: list[str] = []
+
+            class FakePipeline:
+                def to(self, device: str) -> "FakePipeline":
+                    return self
+
+                def enable_attention_slicing(self, mode: str) -> None:
+                    optimization_calls.append(f"attention:{mode}")
+
+                def enable_vae_slicing(self) -> None:
+                    optimization_calls.append("vae")
+
+                def __call__(self, **kwargs):
+                    return SimpleNamespace(images=[FakeImage()])
+
+            job = {
+                "extension_id": extension_id,
+                "family": family,
+                "node_id": "text-to-image",
+                "model_dir": str(workspace_dir / extension_id / "model"),
+                "workspace_dir": str(workspace_dir),
+                "output_path": str(workspace_dir / f"{extension_id}.png"),
+                "prompt": f"optimize {extension_id}",
+                "params": {"steps": 4},
+            }
+
+            stdout = StringIO()
+            with self.subTest(extension_id=extension_id), patch.dict(
+                inference_runner._PIPELINE_LOADERS,
+                {(family, "text-to-image"): SimpleNamespace(from_pretrained=lambda model_dir, **kwargs: FakePipeline())},
+                clear=True,
+            ), patch.object(inference_runner, "_resolve_execution_device", return_value="cpu"):
+                exit_code = inference_runner.run_child_main(stdin=StringIO(json.dumps(job) + "\n"), stdout=stdout)
+
+            self.assertEqual(exit_code, 0)
+            if expect_calls:
+                self.assertEqual(optimization_calls, ["attention:auto", "vae"])
+            else:
+                self.assertEqual(optimization_calls, [])
+
+    def test_inference_runner_skips_missing_post_load_memory_optimization_hooks(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="runner-post-load-guards-"))
+
+        class FakeImage:
+            def save(self, target_path: str) -> None:
+                Path(target_path).write_text("generated", encoding="utf-8")
+
+        class FakePipeline:
+            def to(self, device: str) -> "FakePipeline":
+                return self
+
+            def __call__(self, **kwargs):
+                return SimpleNamespace(images=[FakeImage()])
+
+        job = {
+            "extension_id": "sdxl-base",
+            "family": "sdxl",
+            "node_id": "text-to-image",
+            "model_dir": str(workspace_dir / "model"),
+            "workspace_dir": str(workspace_dir),
+            "output_path": str(workspace_dir / "sdxl.png"),
+            "prompt": "guard missing hooks",
+            "params": {"steps": 4},
+        }
+
+        stdout = StringIO()
+        with patch.dict(
+            inference_runner._PIPELINE_LOADERS,
+            {("sdxl", "text-to-image"): SimpleNamespace(from_pretrained=lambda model_dir, **kwargs: FakePipeline())},
+            clear=True,
+        ), patch.object(inference_runner, "_resolve_execution_device", return_value="cpu"):
+            exit_code = inference_runner.run_child_main(stdin=StringIO(json.dumps(job) + "\n"), stdout=stdout)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(self._parse_ndjson_events(stdout.getvalue())[-1]["type"], "done")
 
     def test_inference_runner_emits_running_inference_heartbeat_logs_while_pipeline_is_busy(self) -> None:
         import local_image_runtime.inference_runner as inference_runner
@@ -2721,6 +2989,54 @@ class RuntimeHarnessTests(unittest.TestCase):
         )
         self.assertEqual(events[-1]["type"], "done")
 
+    def test_inference_runner_emits_stage_memory_events_for_sd_families_without_breaking_done(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="runner-memory-events-"))
+        output_path = workspace_dir / "result.png"
+
+        class FakeImage:
+            def save(self, target_path: str) -> None:
+                Path(target_path).write_text("generated", encoding="utf-8")
+
+        class FakePipeline:
+            def to(self, device: str) -> "FakePipeline":
+                return self
+
+            def __call__(self, **kwargs):
+                return SimpleNamespace(images=[FakeImage()])
+
+        job = {
+            "extension_id": "sd15",
+            "family": "stable-diffusion",
+            "node_id": "text-to-image",
+            "model_dir": str(workspace_dir / "model"),
+            "workspace_dir": str(workspace_dir),
+            "output_path": str(output_path),
+            "prompt": "memory stages",
+            "params": {"steps": 4},
+        }
+
+        stdout = StringIO()
+        with patch.dict(
+            inference_runner._PIPELINE_LOADERS,
+            {("stable-diffusion", "text-to-image"): SimpleNamespace(from_pretrained=lambda model_dir, **kwargs: FakePipeline())},
+            clear=True,
+        ), patch.object(inference_runner, "_resolve_execution_device", return_value="cpu"), patch.object(
+            inference_runner,
+            "collect_stage_memory_snapshot",
+            side_effect=lambda **kwargs: {"stage": kwargs["stage"], "rss_mib": 12.5},
+        ):
+            exit_code = inference_runner.run_child_main(stdin=StringIO(json.dumps(job) + "\n"), stdout=stdout)
+
+        self.assertEqual(exit_code, 0)
+        events = self._parse_ndjson_events(stdout.getvalue())
+        self.assertEqual(
+            [event["stage"] for event in events if event["type"] == "memory"],
+            ["loading-pipeline", "running-inference", "saving-output"],
+        )
+        self.assertEqual(events[-1]["type"], "done")
+
     def test_inference_runner_keeps_done_terminal_contract_with_intermediate_events(self) -> None:
         import local_image_runtime.inference_runner as inference_runner
 
@@ -2772,6 +3088,70 @@ class RuntimeHarnessTests(unittest.TestCase):
                 },
             },
         )
+
+    def test_run_backend_job_accepts_memory_events_and_resets_idle_watchdog(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-streaming-memory-reset-"))
+        job = self._make_backend_job(workspace_dir=workspace_dir)
+        fake_process = self._FakePopen(stdout_lines=[], stderr_lines=[])
+        clock = self._ScriptedClock()
+        scripted_queue = self._ScriptedQueue(
+            clock=clock,
+            items=[
+                (
+                    0.5,
+                    (
+                        "line",
+                        "stdout",
+                        json.dumps({"type": "progress", "percent": 90, "label": "running-inference"}) + "\n",
+                    ),
+                ),
+                (
+                    2.49,
+                    (
+                        "line",
+                        "stdout",
+                        json.dumps({"type": "memory", "stage": "running-inference", "rss_mib": 12.5}) + "\n",
+                    ),
+                ),
+                (
+                    4.35,
+                    (
+                        "line",
+                        "stdout",
+                        json.dumps({"type": "done", "result": {"output_path": job.payload["output_path"]}}) + "\n",
+                    ),
+                ),
+                (4.36, ("eof", "stdout", None)),
+                (4.36, ("eof", "stderr", None)),
+            ],
+        )
+        progress_events: list[tuple[int, str]] = []
+        logs: list[str] = []
+
+        with patch("local_image_runtime.pipeline._read_stream", side_effect=lambda *args, **kwargs: None), patch(
+            "local_image_runtime.pipeline.queue.Queue",
+            return_value=scripted_queue,
+        ), patch(
+            "local_image_runtime.pipeline.subprocess.Popen",
+            return_value=fake_process,
+        ):
+            result = pipeline._run_backend_job(
+                job,
+                emit_progress=lambda percent, label: progress_events.append((percent, label)),
+                emit_log=logs.append,
+                timeout_config=pipeline.BackendTimeoutConfig(
+                    total_seconds=10.0,
+                    idle_seconds=2.0,
+                    terminate_grace_seconds=0.25,
+                    poll_seconds=0.1,
+                ),
+                monotonic=clock.monotonic,
+            )
+
+        self.assertEqual(progress_events, [(90, "running-inference")])
+        self.assertEqual(logs, [])
+        self.assertEqual(result, {"output_path": str(Path(job.payload["output_path"]).resolve())})
+        self.assertFalse(fake_process.terminate_called)
 
     def test_inference_runner_emits_error_ndjson_for_invalid_job_or_unsupported_loader(self) -> None:
         import local_image_runtime.inference_runner as inference_runner
@@ -2840,6 +3220,7 @@ class RuntimeHarnessTests(unittest.TestCase):
     def test_vendored_runtime_matches_canonical_runtime_sources(self) -> None:
         for relative_name in (
             "dependencies.py",
+            "diffusers_memory.py",
             "install_contract.py",
             "pipeline.py",
             "runtime_adapter.py",
