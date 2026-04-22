@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -53,6 +56,24 @@ class BackendJob:
     workspace_dir: Path
     cwd: Path
     env: dict[str, str]
+
+
+BACKEND_TOTAL_TIMEOUT_SECONDS = 1800.0
+BACKEND_STAGE_IDLE_TIMEOUT_SECONDS = 300.0
+BACKEND_TERMINATE_GRACE_SECONDS = 5.0
+BACKEND_EVENT_POLL_SECONDS = 0.1
+
+
+@dataclass(frozen=True)
+class BackendTimeoutConfig:
+    total_seconds: float = BACKEND_TOTAL_TIMEOUT_SECONDS
+    idle_seconds: float = BACKEND_STAGE_IDLE_TIMEOUT_SECONDS
+    terminate_grace_seconds: float = BACKEND_TERMINATE_GRACE_SECONDS
+    poll_seconds: float = BACKEND_EVENT_POLL_SECONDS
+
+
+def _default_backend_timeout_config() -> BackendTimeoutConfig:
+    return BackendTimeoutConfig()
 
 
 def _request_path_candidates(request: ExecutionRequest, raw_path: str) -> tuple[Path, ...]:
@@ -401,6 +422,180 @@ def _parse_backend_events(
     return done_result
 
 
+def _read_stream(
+    name: str,
+    stream: Any,
+    sink: "queue.Queue[tuple[str, str, str | None]]",
+) -> None:
+    try:
+        while True:
+            line = stream.readline()
+            if line == "":
+                sink.put(("eof", name, None))
+                return
+            sink.put(("line", name, line))
+    except Exception as exc:  # pragma: no cover - defensive bridge for reader threads
+        sink.put(("reader-error", name, str(exc)))
+
+
+def _parse_backend_event_line(
+    raw_line: str,
+    *,
+    emit_progress: Callable[[int, str], None],
+    emit_log: Callable[[str], None],
+) -> tuple[str, dict[str, Any] | str] | None:
+    line = raw_line.strip()
+    if not line:
+        return None
+
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise DomainError(f"Backend subprocess emitted invalid NDJSON: {exc}") from exc
+    if not isinstance(event, dict):
+        raise DomainError("Backend subprocess events must be JSON objects.")
+
+    event_type = event.get("type")
+    if event_type == "progress":
+        percent = event.get("percent")
+        label = event.get("label")
+        if isinstance(percent, int) and isinstance(label, str) and label.strip():
+            normalized_label = label.strip()
+            emit_progress(percent, normalized_label)
+            return ("progress", normalized_label)
+        return None
+    if event_type == "log":
+        message = event.get("message")
+        if isinstance(message, str) and message.strip():
+            normalized_message = message.strip()
+            emit_log(normalized_message)
+            return ("log", normalized_message)
+        return None
+    if event_type == "error":
+        message = event.get("message")
+        return (
+            "error",
+            message if isinstance(message, str) and message.strip() else "Backend subprocess reported an error.",
+        )
+    if event_type == "done":
+        result = event.get("result")
+        if not isinstance(result, dict):
+            raise DomainError("Backend subprocess done event must include a result object.")
+        return ("done", result)
+
+    raise DomainError(f"Backend subprocess emitted unsupported event type: {event_type!r}")
+
+
+def _stream_backend_events(
+    process: subprocess.Popen[str],
+    *,
+    emit_progress: Callable[[int, str], None],
+    emit_log: Callable[[str], None],
+    timeout_config: BackendTimeoutConfig,
+    monotonic: Callable[[], float],
+) -> tuple[dict[str, Any] | None, str | None, str]:
+    if process.stdout is None or process.stderr is None:
+        raise DomainError("Backend subprocess did not expose stdout/stderr pipes.")
+
+    event_queue: "queue.Queue[tuple[str, str, str | None]]" = queue.Queue()
+    readers = [
+        threading.Thread(target=_read_stream, args=("stdout", process.stdout, event_queue), daemon=True),
+        threading.Thread(target=_read_stream, args=("stderr", process.stderr, event_queue), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+
+    open_streams = {"stdout", "stderr"}
+    done_result: dict[str, Any] | None = None
+    child_error: str | None = None
+    stderr_chunks: list[str] = []
+    started_at = monotonic()
+    last_activity_at = started_at
+    current_stage: str | None = None
+
+    while open_streams:
+        now = monotonic()
+        total_elapsed = now - started_at
+        if total_elapsed >= timeout_config.total_seconds:
+            raise DomainError(
+                f"Backend subprocess hit total backend timeout after {timeout_config.total_seconds:.1f}s."
+            )
+
+        idle_elapsed = now - last_activity_at
+        if idle_elapsed >= timeout_config.idle_seconds:
+            stalled_stage = current_stage or "unknown-stage"
+            raise DomainError(
+                f"Backend subprocess hit idle backend timeout after {timeout_config.idle_seconds:.1f}s in stage '{stalled_stage}'."
+            )
+
+        wait_timeout = max(
+            0.0,
+            min(
+                timeout_config.poll_seconds,
+                timeout_config.total_seconds - total_elapsed,
+                timeout_config.idle_seconds - idle_elapsed,
+            ),
+        )
+        try:
+            event_kind, stream_name, payload = event_queue.get(timeout=wait_timeout)
+        except queue.Empty:
+            continue
+        if event_kind == "eof":
+            open_streams.discard(stream_name)
+            continue
+        if event_kind == "reader-error":
+            raise DomainError(
+                f"Backend subprocess {stream_name} reader failed: {payload or 'unknown error'}"
+            )
+        if payload is None:
+            continue
+
+        if stream_name == "stderr":
+            stderr_chunks.append(payload)
+            continue
+
+        parsed_event = _parse_backend_event_line(
+            payload,
+            emit_progress=emit_progress,
+            emit_log=emit_log,
+        )
+        if parsed_event is None:
+            continue
+
+        event_type, event_payload = parsed_event
+        if event_type == "progress":
+            last_activity_at = monotonic()
+            current_stage = str(event_payload)
+            continue
+        if event_type == "log":
+            last_activity_at = monotonic()
+            continue
+        if event_type == "done":
+            done_result = event_payload if isinstance(event_payload, dict) else None
+            continue
+        child_error = str(event_payload)
+
+    for reader in readers:
+        reader.join(timeout=1)
+
+    return done_result, child_error, "".join(stderr_chunks)
+
+
+def _stop_backend_process(
+    process: subprocess.Popen[str],
+    *,
+    terminate_grace_seconds: float = BACKEND_TERMINATE_GRACE_SECONDS,
+) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=terminate_grace_seconds)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=terminate_grace_seconds)
+
+
 def _resolve_output_path_within_workspace(result: dict[str, Any], *, workspace_dir: Path) -> Path:
     output_path = result.get("output_path")
     if not isinstance(output_path, str) or not output_path.strip():
@@ -424,34 +619,56 @@ def _run_backend_job(
     *,
     emit_progress: Callable[[int, str], None],
     emit_log: Callable[[str], None],
+    timeout_config: BackendTimeoutConfig | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     payload_json = json.dumps(job.payload)
+    resolved_timeout_config = timeout_config or _default_backend_timeout_config()
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             list(job.command),
-            input=payload_json,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            capture_output=True,
-            check=True,
+            bufsize=1,
             cwd=str(job.cwd),
             env=job.env,
         )
-    except (subprocess.CalledProcessError, OSError) as exc:
-        child_error_message = (
-            _extract_error_message_from_output(exc.stdout)
-            if isinstance(exc, subprocess.CalledProcessError)
-            else None
-        )
-        detail = _command_failure_detail(exc)
-        if child_error_message is not None:
-            raise DomainError(detail) from exc
-        raise DomainError(f"Backend subprocess failed: {detail}") from exc
+    except OSError as exc:
+        raise DomainError(f"Backend subprocess failed: {exc}") from exc
 
-    result = _parse_backend_events(
-        completed.stdout,
-        emit_progress=emit_progress,
-        emit_log=emit_log,
-    )
+    if process.stdin is None:
+        raise DomainError("Backend subprocess did not expose a stdin pipe.")
+
+    try:
+        process.stdin.write(payload_json + "\n")
+        process.stdin.flush()
+        process.stdin.close()
+
+        result, child_error, stderr_output = _stream_backend_events(
+            process,
+            emit_progress=emit_progress,
+            emit_log=emit_log,
+            timeout_config=resolved_timeout_config,
+            monotonic=monotonic,
+        )
+        returncode = process.wait()
+    except Exception:
+        _stop_backend_process(
+            process,
+            terminate_grace_seconds=resolved_timeout_config.terminate_grace_seconds,
+        )
+        raise
+
+    if child_error is not None:
+        raise DomainError(child_error)
+    if returncode != 0:
+        detail = stderr_output.strip() or f"exit code {returncode}"
+        raise DomainError(f"Backend subprocess failed: {detail}")
+    if result is None:
+        raise DomainError("Backend subprocess did not emit a done event.")
+
     resolved_output_path = _resolve_output_path_within_workspace(result, workspace_dir=job.workspace_dir)
     resolved_result = dict(result)
     resolved_result["output_path"] = str(resolved_output_path)

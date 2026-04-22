@@ -36,6 +36,12 @@ _PIPELINE_LOADERS: dict[tuple[str, str], Any] = {
     ("flux", "text-to-image"): _load_flux_pipeline,
 }
 
+_STAGE_PROGRESS = (
+    (80, "loading-pipeline", "Loading inference pipeline."),
+    (90, "running-inference", "Running inference."),
+    (95, "saving-output", "Saving output image."),
+)
+
 
 def emit_event(event_type: str, *, stdout: TextIO | None = None, **payload: Any) -> None:
     stream = stdout or sys.stdout
@@ -46,6 +52,16 @@ def emit_event(event_type: str, *, stdout: TextIO | None = None, **payload: Any)
 def emit_error(message: str, *, stdout: TextIO | None = None) -> int:
     emit_event("error", stdout=stdout, message=message)
     return 1
+
+
+def _emit_stage_event(label: str, *, stdout: TextIO | None = None) -> None:
+    for percent, stage_label, message in _STAGE_PROGRESS:
+        if stage_label != label:
+            continue
+        emit_event("progress", stdout=stdout, percent=percent, label=stage_label)
+        emit_event("log", stdout=stdout, message=message)
+        return
+    raise InferenceRunnerError(f"Unsupported stage label '{label}'")
 
 
 def _read_job(*, stdin: TextIO | None = None) -> dict[str, Any]:
@@ -148,13 +164,15 @@ def _build_pipeline_kwargs(job: dict[str, Any]) -> dict[str, Any]:
     return kwargs
 
 
-def run_child_job(job: dict[str, Any]) -> dict[str, Any]:
+def run_child_job(job: dict[str, Any], *, stdout: TextIO | None = None) -> dict[str, Any]:
     model_dir = _require_string_field(job, "model_dir")
     output_path = _require_string_field(job, "output_path")
     family = _require_string_field(job, "family")
     node_id = _require_string_field(job, "node_id")
     loader = _resolve_loader(job)
+    _emit_stage_event("loading-pipeline", stdout=stdout)
     pipeline = _instantiate_pipeline(loader, model_dir=model_dir)
+    _emit_stage_event("running-inference", stdout=stdout)
     result = pipeline(**_build_pipeline_kwargs(job))
 
     images = getattr(result, "images", None)
@@ -163,6 +181,7 @@ def run_child_job(job: dict[str, Any]) -> dict[str, Any]:
 
     output_file = Path(output_path)
     output_file.parent.mkdir(parents=True, exist_ok=True)
+    _emit_stage_event("saving-output", stdout=stdout)
     images[0].save(str(output_file))
 
     params = job.get("params") if isinstance(job.get("params"), dict) else {}
@@ -180,7 +199,7 @@ def run_child_job(job: dict[str, Any]) -> dict[str, Any]:
 
 def run_child_main(*, stdin: TextIO | None = None, stdout: TextIO | None = None) -> int:
     try:
-        result = run_child_job(_read_job(stdin=stdin))
+        result = run_child_job(_read_job(stdin=stdin), stdout=stdout)
     except InferenceRunnerError as exc:
         return emit_error(str(exc), stdout=stdout)
     except Exception as exc:  # pragma: no cover - defensive boundary

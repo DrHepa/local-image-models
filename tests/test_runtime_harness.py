@@ -12,6 +12,7 @@ from importlib.util import module_from_spec, spec_from_file_location
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Callable
 from unittest.mock import patch
 
 
@@ -119,6 +120,202 @@ class RuntimeHarnessTests(unittest.TestCase):
 
     def _completed_process(self, *, stdout: str, returncode: int = 0) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(args=["fake-child"], returncode=returncode, stdout=stdout, stderr="")
+
+    def _make_backend_job(self, *, workspace_dir: Path) -> pipeline.BackendJob:
+        return pipeline.BackendJob(
+            command=(sys.executable, "-m", "local_image_runtime.inference_runner"),
+            payload={
+                "extension_id": "sd15",
+                "family": "stable-diffusion",
+                "node_id": "text-to-image",
+                "workspace_dir": str(workspace_dir),
+                "output_path": str(workspace_dir / "streamed-output.png"),
+                "prompt": "stream me",
+                "params": {"steps": 4},
+            },
+            workspace_dir=workspace_dir,
+            cwd=workspace_dir,
+            env={"PYTHONPATH": str(workspace_dir)},
+        )
+
+    class _FakePipeStream:
+        def __init__(self, owner: "RuntimeHarnessTests._FakePopen", name: str, lines: list[str]) -> None:
+            self._owner = owner
+            self._name = name
+            self._lines = list(lines)
+            self.read_count = 0
+
+        def set_lines(self, lines: list[str]) -> None:
+            self._lines = list(lines)
+
+        def readline(self) -> str:
+            self.read_count += 1
+            if self._lines:
+                return self._lines.pop(0)
+            self._owner.mark_stream_eof(self._name)
+            return ""
+
+        def __iter__(self):
+            while True:
+                line = self.readline()
+                if line == "":
+                    break
+                yield line
+
+    class _FakePipeStdin:
+        def __init__(self, on_close: Callable[[str], None] | None = None) -> None:
+            self.chunks: list[str] = []
+            self.closed = False
+            self._on_close = on_close
+
+        def write(self, text: str) -> int:
+            self.chunks.append(text)
+            return len(text)
+
+        def flush(self) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+            if self._on_close is not None:
+                self._on_close(self.value)
+
+        @property
+        def value(self) -> str:
+            return "".join(self.chunks)
+
+    class _FakePopen:
+        def __init__(
+            self,
+            *,
+            stdout_lines: list[str],
+            stderr_lines: list[str],
+            returncode: int = 0,
+            on_stdin_close: Callable[[str], tuple[list[str], list[str], int]] | None = None,
+            wait_timeout_after_terminate: bool = False,
+        ) -> None:
+            def handle_stdin_close(payload: str) -> None:
+                if on_stdin_close is None:
+                    return
+                next_stdout, next_stderr, next_returncode = on_stdin_close(payload)
+                self.stdout.set_lines(next_stdout)
+                self.stderr.set_lines(next_stderr)
+                self._expected_returncode = next_returncode
+
+            self.stdin = RuntimeHarnessTests._FakePipeStdin(on_close=handle_stdin_close)
+            self.stdout = RuntimeHarnessTests._FakePipeStream(self, "stdout", stdout_lines)
+            self.stderr = RuntimeHarnessTests._FakePipeStream(self, "stderr", stderr_lines)
+            self._expected_returncode = returncode
+            self.returncode: int | None = None
+            self.wait_called = False
+            self.terminate_called = False
+            self.kill_called = False
+            self._eof = {"stdout": False, "stderr": False}
+            self._wait_timeout_after_terminate = wait_timeout_after_terminate
+            self._terminate_wait_timed_out = False
+
+        def mark_stream_eof(self, name: str) -> None:
+            self._eof[name] = True
+
+        def poll(self) -> int | None:
+            if all(self._eof.values()) and self.stdin.closed:
+                return self._expected_returncode
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_called = True
+            if (
+                timeout is not None
+                and self.terminate_called
+                and self._wait_timeout_after_terminate
+                and not self._terminate_wait_timed_out
+            ):
+                self._terminate_wait_timed_out = True
+                raise subprocess.TimeoutExpired(cmd=["fake-child"], timeout=timeout)
+            self.returncode = self._expected_returncode
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminate_called = True
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.kill_called = True
+            self.returncode = -9
+
+    class _ScriptedClock:
+        def __init__(self, *, start: float = 0.0) -> None:
+            self.now = start
+
+        def monotonic(self) -> float:
+            return self.now
+
+    class _ScriptedQueue:
+        EMPTY = object()
+
+        def __init__(
+            self,
+            *,
+            clock: "RuntimeHarnessTests._ScriptedClock",
+            items: list[tuple[float, tuple[str, str, str | None] | object]],
+        ) -> None:
+            self._clock = clock
+            self._items = list(items)
+
+        def put(self, item: tuple[str, str, str | None]) -> None:
+            return None
+
+        def get(self, timeout: float | None = None) -> tuple[str, str, str | None]:
+            if not self._items:
+                raise AssertionError("Scripted queue exhausted before runtime finished.")
+            next_time, item = self._items.pop(0)
+            self._clock.now = next_time
+            if item is self.EMPTY:
+                raise pipeline.queue.Empty
+            assert isinstance(item, tuple)
+            return item
+
+    def _run_real_runner_popen(
+        self,
+        *,
+        loader_map: dict[tuple[str, str], object],
+        source_image_token: object | None = None,
+    ):
+        import local_image_runtime.inference_runner as inference_runner
+
+        def on_stdin_close(input_text: str) -> tuple[list[str], list[str], int]:
+            stdout = StringIO()
+            with patch.dict(inference_runner._PIPELINE_LOADERS, loader_map, clear=True), patch.object(
+                inference_runner, "_seeded_generator", return_value="generator-token"
+            ):
+                if source_image_token is None:
+                    exit_code = inference_runner.run_child_main(stdin=StringIO(input_text), stdout=stdout)
+                else:
+                    with patch.object(
+                        inference_runner,
+                        "_open_source_image",
+                        return_value=source_image_token,
+                    ):
+                        exit_code = inference_runner.run_child_main(stdin=StringIO(input_text), stdout=stdout)
+            return stdout.getvalue().splitlines(keepends=True), [], exit_code
+
+        def popen_side_effect(command, *, stdin, stdout, stderr, text, bufsize, cwd, env):
+            self.assertEqual(command[1:], ["-m", "local_image_runtime.inference_runner"])
+            self.assertIs(stdin, subprocess.PIPE)
+            self.assertIs(stdout, subprocess.PIPE)
+            self.assertIs(stderr, subprocess.PIPE)
+            self.assertTrue(text)
+            self.assertEqual(bufsize, 1)
+            self.assertIsInstance(cwd, str)
+            self.assertIsInstance(env, dict)
+            self.assertIn("PYTHONPATH", env)
+            return self._FakePopen(
+                stdout_lines=[],
+                stderr_lines=[],
+                on_stdin_close=on_stdin_close,
+            )
+
+        return popen_side_effect
 
     def _parse_ndjson_events(self, payload: str) -> list[dict[str, object]]:
         return [json.loads(line) for line in payload.splitlines() if line.strip()]
@@ -709,8 +906,8 @@ class RuntimeHarnessTests(unittest.TestCase):
                     "local_image_runtime.bootstrap._smoke_test_runtime_imports",
                     return_value=(True, "stubbed imports"),
                 ), patch(
-                    "local_image_runtime.pipeline.subprocess.run",
-                    side_effect=self._run_real_runner_subprocess(
+                    "local_image_runtime.pipeline.subprocess.Popen",
+                    side_effect=self._run_real_runner_popen(
                         loader_map={(expected_family, "text-to-image"): self._make_real_runner_loader(
                             marker=expected_marker,
                             invocations=invocations,
@@ -766,8 +963,8 @@ class RuntimeHarnessTests(unittest.TestCase):
             "local_image_runtime.bootstrap._smoke_test_runtime_imports",
             return_value=(True, "stubbed imports"),
         ), patch(
-            "local_image_runtime.pipeline.subprocess.run",
-            side_effect=self._run_real_runner_subprocess(loader_map={}, source_image_token=object()),
+            "local_image_runtime.pipeline.subprocess.Popen",
+            side_effect=self._run_real_runner_popen(loader_map={}, source_image_token=object()),
         ):
             exit_code = runtime_adapter.run_generator_main(
                 extension_id="sd15",
@@ -820,8 +1017,8 @@ class RuntimeHarnessTests(unittest.TestCase):
                     "local_image_runtime.bootstrap._smoke_test_runtime_imports",
                     return_value=(True, "stubbed imports"),
                 ), patch(
-                    "local_image_runtime.pipeline.subprocess.run",
-                    side_effect=self._run_real_runner_subprocess(
+                    "local_image_runtime.pipeline.subprocess.Popen",
+                    side_effect=self._run_real_runner_popen(
                         loader_map={(expected_family, "text-to-image"): self._make_real_runner_loader(
                             marker=expected_marker,
                             invocations=invocations,
@@ -869,8 +1066,8 @@ class RuntimeHarnessTests(unittest.TestCase):
             "local_image_runtime.bootstrap._smoke_test_runtime_imports",
             return_value=(True, "stubbed imports"),
         ), patch(
-            "local_image_runtime.pipeline.subprocess.run",
-            side_effect=self._run_real_runner_subprocess(loader_map={}),
+            "local_image_runtime.pipeline.subprocess.Popen",
+            side_effect=self._run_real_runner_popen(loader_map={}),
         ):
             with self.assertRaisesRegex(
                 runtime_adapter.DomainError,
@@ -997,8 +1194,8 @@ class RuntimeHarnessTests(unittest.TestCase):
                         "local_image_runtime.bootstrap._smoke_test_runtime_imports",
                         return_value=(True, "stubbed imports"),
                     ), patch(
-                        "local_image_runtime.pipeline.subprocess.run",
-                        side_effect=self._run_real_runner_subprocess(
+                        "local_image_runtime.pipeline.subprocess.Popen",
+                        side_effect=self._run_real_runner_popen(
                             loader_map={(expected_family, "text-to-image"): self._make_real_runner_loader(
                                 marker=expected_marker,
                                 invocations=invocations,
@@ -1069,7 +1266,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                 serialized_payloads: list[dict[str, object]] = []
                 invocations: list[dict[str, object]] = []
 
-                real_runner_side_effect = self._run_real_runner_subprocess(
+                real_runner_side_effect = self._run_real_runner_popen(
                     loader_map={
                         (expected_family, node_id): self._make_real_runner_loader(
                             marker=expected_marker,
@@ -1079,24 +1276,41 @@ class RuntimeHarnessTests(unittest.TestCase):
                     source_image_token=source_image_token,
                 )
 
-                def capture_serialized_payload(command, *, input, text, capture_output, check, cwd, env):
-                    serialized_payloads.append(json.loads(input))
-                    return real_runner_side_effect(
-                        command,
-                        input=input,
-                        text=text,
-                        capture_output=capture_output,
-                        check=check,
-                        cwd=cwd,
-                        env=env,
-                    )
+                def capture_serialized_payload(command, *, stdin, stdout, stderr, text, bufsize, cwd, env):
+                    self.assertIs(stdin, subprocess.PIPE)
+                    self.assertIs(stdout, subprocess.PIPE)
+                    self.assertIs(stderr, subprocess.PIPE)
+                    self.assertTrue(text)
+                    self.assertEqual(bufsize, 1)
+
+                    def on_stdin_close(payload_text: str) -> tuple[list[str], list[str], int]:
+                        serialized_payloads.append(json.loads(payload_text))
+                        fake_process = real_runner_side_effect(
+                            command,
+                            stdin=stdin,
+                            stdout=stdout,
+                            stderr=stderr,
+                            text=text,
+                            bufsize=bufsize,
+                            cwd=cwd,
+                            env=env,
+                        )
+                        fake_process.stdin.write(payload_text)
+                        fake_process.stdin.close()
+                        return (
+                            fake_process.stdout._lines,
+                            fake_process.stderr._lines,
+                            fake_process._expected_returncode,
+                        )
+
+                    return self._FakePopen(stdout_lines=[], stderr_lines=[], on_stdin_close=on_stdin_close)
 
                 try:
                     with patch(
                         "local_image_runtime.bootstrap._smoke_test_runtime_imports",
                         return_value=(True, "stubbed imports"),
                     ), patch(
-                        "local_image_runtime.pipeline.subprocess.run",
+                        "local_image_runtime.pipeline.subprocess.Popen",
                         side_effect=capture_serialized_payload,
                     ):
                         generator = generator_class(model_dir, outputs_dir)
@@ -1301,6 +1515,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                 "stable-diffusion",
                 None,
                 "/models/modly/sd15",
+                "stable-text",
             ),
             (
                 "sdxl-base",
@@ -1317,10 +1532,11 @@ class RuntimeHarnessTests(unittest.TestCase):
                 "sdxl",
                 "source.png",
                 None,
+                "sdxl-image",
             ),
         )
 
-        for extension_id, request, expected_family, source_name, expected_model_dir in cases:
+        for extension_id, request, expected_family, source_name, expected_model_dir, expected_marker in cases:
             with self.subTest(extension_id=extension_id, node_id=request.node_id):
                 workspace_dir = Path(tempfile.mkdtemp(prefix=f"workspace-{extension_id}-"))
                 runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
@@ -1333,10 +1549,13 @@ class RuntimeHarnessTests(unittest.TestCase):
                 }
                 progress_events: list[tuple[int, str]] = []
                 logs: list[str] = []
+                serialized_payloads: list[dict[str, object]] = []
+                invocations: list[dict[str, object]] = []
 
                 if source_name is not None:
                     source_path = workspace_dir / source_name
                     source_path.write_bytes(b"fake-image")
+                    source_image_token = object()
                     request = pipeline.ExecutionRequest(
                         node_id=request.node_id,
                         input={"filePath": source_name},
@@ -1346,6 +1565,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                     )
                 else:
                     source_path = None
+                    source_image_token = None
                     request = pipeline.ExecutionRequest(
                         node_id=request.node_id,
                         input=request.input,
@@ -1354,45 +1574,41 @@ class RuntimeHarnessTests(unittest.TestCase):
                         model_dir_override=request.model_dir_override,
                     )
 
-                expected_output_path = workspace_dir / f"{extension_id}-{request.node_id}.png"
-
-                def run_side_effect(command, *, input, text, capture_output, check, cwd, env):
-                    self.assertEqual(command, [str(venv_python), "-m", "local_image_runtime.inference_runner"])
-                    self.assertTrue(text)
-                    self.assertTrue(capture_output)
-                    self.assertTrue(check)
-                    self.assertEqual(cwd, str(runtime_root / "src"))
-                    self.assertIsInstance(env, dict)
-                    self.assertEqual(env["PYTHONPATH"], str(runtime_root / "src"))
-
-                    payload = json.loads(input)
-                    self.assertEqual(payload["extension_id"], extension_id)
-                    self.assertEqual(payload["family"], expected_family)
-                    self.assertEqual(payload["node_id"], request.node_id)
-                    self.assertEqual(payload["workspace_dir"], str(workspace_dir))
-                    self.assertEqual(
-                        payload["model_dir"],
-                        expected_model_dir or extension_record["model_dir"],
-                    )
-                    self.assertEqual(payload["prompt"], request.params.get("prompt"))
-                    self.assertEqual(payload["negative_prompt"], request.params.get("negative_prompt"))
-                    self.assertEqual(payload["params"], {
-                        key: value for key, value in request.params.items() if key != "negative_prompt"
-                    })
-                    if source_path is None:
-                        self.assertIsNone(payload["source_image_path"])
-                    else:
-                        self.assertEqual(payload["source_image_path"], str(source_path.resolve()))
-
-                    return self._completed_process(
-                        stdout="\n".join(
-                            (
-                                json.dumps({"type": "progress", "percent": 88, "label": "child-running"}),
-                                json.dumps({"type": "log", "message": "child-log"}),
-                                json.dumps({"type": "done", "result": {"output_path": str(expected_output_path)}}),
-                            )
+                real_runner_side_effect = self._run_real_runner_popen(
+                    loader_map={
+                        (expected_family, request.node_id): self._make_real_runner_loader(
+                            marker=expected_marker,
+                            invocations=invocations,
                         )
-                        + "\n"
+                    },
+                    source_image_token=source_image_token,
+                )
+
+                def capture_serialized_payload(command, *, stdin, stdout, stderr, text, bufsize, cwd, env):
+                    def on_stdin_close(payload_text: str) -> tuple[list[str], list[str], int]:
+                        serialized_payloads.append(json.loads(payload_text))
+                        fake_process = real_runner_side_effect(
+                            command,
+                            stdin=stdin,
+                            stdout=stdout,
+                            stderr=stderr,
+                            text=text,
+                            bufsize=bufsize,
+                            cwd=cwd,
+                            env=env,
+                        )
+                        fake_process.stdin.write(payload_text)
+                        fake_process.stdin.close()
+                        return (
+                            list(fake_process.stdout._lines),
+                            list(fake_process.stderr._lines),
+                            fake_process._expected_returncode,
+                        )
+
+                    return self._FakePopen(
+                        stdout_lines=[],
+                        stderr_lines=[],
+                        on_stdin_close=on_stdin_close,
                     )
 
                 with patch(
@@ -1402,8 +1618,8 @@ class RuntimeHarnessTests(unittest.TestCase):
                     "local_image_runtime.pipeline.get_extension_record",
                     return_value=extension_record,
                 ), patch(
-                    "local_image_runtime.pipeline.subprocess.run",
-                    side_effect=run_side_effect,
+                    "local_image_runtime.pipeline.subprocess.Popen",
+                    side_effect=capture_serialized_payload,
                 ):
                     result = pipeline.execute(
                         request,
@@ -1413,9 +1629,72 @@ class RuntimeHarnessTests(unittest.TestCase):
                         emit_log=logs.append,
                     )
 
-                self.assertEqual(result, {"output_path": str(expected_output_path.resolve())})
-                self.assertIn((88, "child-running"), progress_events)
-                self.assertIn("child-log", logs)
+                self.assertEqual(len(serialized_payloads), 1)
+                serialized_payload = serialized_payloads[0]
+                self.assertEqual(serialized_payload["extension_id"], extension_id)
+                self.assertEqual(serialized_payload["family"], expected_family)
+                self.assertEqual(serialized_payload["node_id"], request.node_id)
+                self.assertEqual(serialized_payload["workspace_dir"], str(workspace_dir))
+                self.assertEqual(
+                    serialized_payload["model_dir"],
+                    expected_model_dir or extension_record["model_dir"],
+                )
+                self.assertEqual(serialized_payload["prompt"], request.params.get("prompt"))
+                self.assertEqual(serialized_payload["negative_prompt"], request.params.get("negative_prompt"))
+                self.assertEqual(
+                    serialized_payload["params"],
+                    {key: value for key, value in request.params.items() if key != "negative_prompt"},
+                )
+                if source_path is None:
+                    self.assertIsNone(serialized_payload["source_image_path"])
+                else:
+                    self.assertEqual(serialized_payload["source_image_path"], str(source_path.resolve()))
+
+                expected_output_path = Path(str(serialized_payload["output_path"])).resolve()
+                self.assertEqual(
+                    result,
+                    {
+                        "output_path": str(expected_output_path),
+                        "metadata": {
+                            "family": expected_family,
+                            "node_id": request.node_id,
+                            "seed": request.params.get("seed"),
+                            "negative_prompt_used": bool(request.params.get("negative_prompt")),
+                            "source_image_used": source_path is not None,
+                        },
+                    },
+                )
+                self.assertEqual(
+                    progress_events,
+                    [
+                        (35, "validating-request"),
+                        (55, "checking-extension"),
+                        (75, "backend-dispatch"),
+                        (80, "loading-pipeline"),
+                        (90, "running-inference"),
+                        (95, "saving-output"),
+                    ],
+                )
+                self.assertEqual(len(invocations), 1)
+                self.assertEqual(invocations[0]["marker"], expected_marker)
+                if source_image_token is None:
+                    self.assertNotIn("image", invocations[0]["kwargs"])
+                else:
+                    self.assertIs(invocations[0]["kwargs"]["image"], source_image_token)
+                self.assertIn(f"Validated node '{request.node_id}' for extension '{extension_id}'", logs[0])
+                self.assertIn(f"Workspace: {workspace_dir}.", logs[0])
+                self.assertEqual(
+                    logs[1],
+                    f"Dispatching backend family '{expected_family}' for node '{request.node_id}' using venv '{venv_python}'.",
+                )
+                self.assertEqual(
+                    logs[2:],
+                    [
+                        "Loading inference pipeline.",
+                        "Running inference.",
+                        "Saving output image.",
+                    ],
+                )
 
     def test_build_backend_job_prefers_model_dir_override_over_extension_record(self) -> None:
         workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-job-override-"))
@@ -1499,11 +1778,13 @@ class RuntimeHarnessTests(unittest.TestCase):
         )
         expected_output_path = workspace_dir / "pythonpath-output.png"
 
-        def run_side_effect(command, *, input, text, capture_output, check, cwd, env):
+        def popen_side_effect(command, *, stdin, stdout, stderr, text, bufsize, cwd, env):
             self.assertEqual(command, [str(venv_python), "-m", "local_image_runtime.inference_runner"])
+            self.assertIs(stdin, subprocess.PIPE)
+            self.assertIs(stdout, subprocess.PIPE)
+            self.assertIs(stderr, subprocess.PIPE)
             self.assertTrue(text)
-            self.assertTrue(capture_output)
-            self.assertTrue(check)
+            self.assertEqual(bufsize, 1)
             self.assertEqual(cwd, str(runtime_src))
             self.assertEqual(
                 env["PYTHONPATH"],
@@ -1511,11 +1792,19 @@ class RuntimeHarnessTests(unittest.TestCase):
             )
             self.assertEqual(env["KEEP_ME"], "1")
 
-            payload = json.loads(input)
-            self.assertEqual(payload["workspace_dir"], str(workspace_dir))
-            return self._completed_process(
-                stdout=json.dumps({"type": "done", "result": {"output_path": str(expected_output_path)}})
-                + "\n"
+            def on_stdin_close(payload_text: str) -> tuple[list[str], list[str], int]:
+                payload = json.loads(payload_text)
+                self.assertEqual(payload["workspace_dir"], str(workspace_dir))
+                return (
+                    [json.dumps({"type": "done", "result": {"output_path": str(expected_output_path)}}) + "\n"],
+                    [],
+                    0,
+                )
+
+            return self._FakePopen(
+                stdout_lines=[],
+                stderr_lines=[],
+                on_stdin_close=on_stdin_close,
             )
 
         with patch.dict(os.environ, {"PYTHONPATH": "/host/a:/host/b", "KEEP_ME": "1"}, clear=True), patch(
@@ -1528,8 +1817,8 @@ class RuntimeHarnessTests(unittest.TestCase):
                 "model_dir": str(runtime.paths.models_dir / "sd15"),
             },
         ), patch(
-            "local_image_runtime.pipeline.subprocess.run",
-            side_effect=run_side_effect,
+            "local_image_runtime.pipeline.subprocess.Popen",
+            side_effect=popen_side_effect,
         ):
             result = pipeline.execute(
                 request,
@@ -1563,8 +1852,8 @@ class RuntimeHarnessTests(unittest.TestCase):
                 "model_dir": str(runtime.paths.models_dir / "sd15"),
             },
         ), patch(
-            "local_image_runtime.pipeline.subprocess.run",
-        ) as subprocess_run:
+            "local_image_runtime.pipeline.subprocess.Popen",
+        ) as subprocess_popen:
             with self.assertRaisesRegex(
                 pipeline.DomainError,
                 "Missing vendored runtime src for extension 'sd15'",
@@ -1577,7 +1866,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                     emit_log=lambda message: None,
                 )
 
-        subprocess_run.assert_not_called()
+        subprocess_popen.assert_not_called()
 
     def test_build_backend_job_derives_runtime_src_from_posix_venv_without_ext_dir(self) -> None:
         workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-job-posix-"))
@@ -1690,8 +1979,8 @@ class RuntimeHarnessTests(unittest.TestCase):
                     "local_image_runtime.pipeline.get_extension_record",
                     return_value=extension_record,
                 ), patch(
-                    "local_image_runtime.pipeline.subprocess.run",
-                ) as subprocess_run:
+                    "local_image_runtime.pipeline.subprocess.Popen",
+                ) as subprocess_popen:
                     with self.assertRaisesRegex(pipeline.DomainError, expected_detail):
                         pipeline.execute(
                             request,
@@ -1701,7 +1990,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                             emit_log=lambda message: None,
                         )
 
-                subprocess_run.assert_not_called()
+                subprocess_popen.assert_not_called()
 
     def test_pipeline_execute_rejects_flux_image_to_image_before_spawn(self) -> None:
         workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-flux-img2img-"))
@@ -1725,8 +2014,8 @@ class RuntimeHarnessTests(unittest.TestCase):
                 "model_dir": str(runtime.paths.models_dir / "flux-schnell"),
             },
         ), patch(
-            "local_image_runtime.pipeline.subprocess.run",
-        ) as subprocess_run:
+            "local_image_runtime.pipeline.subprocess.Popen",
+        ) as subprocess_popen:
             with self.assertRaisesRegex(
                 pipeline.RequestValidationError,
                 "Extension 'flux-schnell' does not support node 'image-to-image'",
@@ -1739,7 +2028,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                     emit_log=lambda message: None,
                 )
 
-        subprocess_run.assert_not_called()
+        subprocess_popen.assert_not_called()
 
     def test_pipeline_execute_rejects_child_output_path_outside_workspace_dir(self) -> None:
         workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-output-"))
@@ -1765,9 +2054,10 @@ class RuntimeHarnessTests(unittest.TestCase):
                 "model_dir": str(runtime.paths.models_dir / "sd15"),
             },
         ), patch(
-            "local_image_runtime.pipeline.subprocess.run",
-            return_value=self._completed_process(
-                stdout=json.dumps({"type": "done", "result": {"output_path": str(outside_path)}}) + "\n"
+            "local_image_runtime.pipeline.subprocess.Popen",
+            return_value=self._FakePopen(
+                stdout_lines=[json.dumps({"type": "done", "result": {"output_path": str(outside_path)}}) + "\n"],
+                stderr_lines=[],
             ),
         ):
             with self.assertRaisesRegex(pipeline.DomainError, "outside workspace_dir"):
@@ -1797,6 +2087,16 @@ class RuntimeHarnessTests(unittest.TestCase):
         )
         progress_events: list[tuple[int, str]] = []
         logs: list[str] = []
+        invocations: list[dict[str, object]] = []
+
+        real_runner_side_effect = self._run_real_runner_popen(
+            loader_map={
+                ("stable-diffusion", "text-to-image"): self._make_real_runner_loader(
+                    marker="workspace-override",
+                    invocations=invocations,
+                )
+            }
+        )
 
         with patch(
             "local_image_runtime.pipeline.extension_is_installed",
@@ -1808,16 +2108,8 @@ class RuntimeHarnessTests(unittest.TestCase):
                 "model_dir": str(runtime_models_dir / "sd15"),
             },
         ), patch(
-            "local_image_runtime.pipeline.subprocess.run",
-            side_effect=lambda command, *, input, text, capture_output, check, cwd, env: self._completed_process(
-                stdout=json.dumps(
-                    {
-                        "type": "done",
-                        "result": {"output_path": json.loads(input)["output_path"]},
-                    }
-                )
-                + "\n"
-            ),
+            "local_image_runtime.pipeline.subprocess.Popen",
+            side_effect=real_runner_side_effect,
         ):
             result = pipeline.execute(
                 request,
@@ -1829,7 +2121,268 @@ class RuntimeHarnessTests(unittest.TestCase):
 
         self.assertIn(f"Workspace: {workspace_dir}.", logs[0])
         self.assertTrue(result["output_path"].startswith(str(workspace_dir)))
-        self.assertEqual(progress_events[-1], (75, "backend-dispatch"))
+        self.assertEqual(
+            progress_events,
+            [
+                (35, "validating-request"),
+                (55, "checking-extension"),
+                (75, "backend-dispatch"),
+                (80, "loading-pipeline"),
+                (90, "running-inference"),
+                (95, "saving-output"),
+            ],
+        )
+        self.assertEqual(len(invocations), 1)
+        self.assertEqual(invocations[0]["marker"], "workspace-override")
+        self.assertEqual(
+            logs[2:],
+            [
+                "Loading inference pipeline.",
+                "Running inference.",
+                "Saving output image.",
+            ],
+        )
+
+    def test_run_backend_job_streams_progress_and_logs_before_child_exit(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-streaming-progress-"))
+        job = self._make_backend_job(workspace_dir=workspace_dir)
+        fake_process = self._FakePopen(
+            stdout_lines=[
+                json.dumps({"type": "progress", "percent": 80, "label": "loading-pipeline"}) + "\n",
+                json.dumps({"type": "log", "message": "warming backend"}) + "\n",
+                json.dumps({"type": "done", "result": {"output_path": job.payload["output_path"]}}) + "\n",
+            ],
+            stderr_lines=[],
+        )
+        progress_events: list[tuple[int, str]] = []
+        logs: list[str] = []
+
+        def emit_progress(percent: int, label: str) -> None:
+            self.assertFalse(fake_process.wait_called)
+            progress_events.append((percent, label))
+
+        def emit_log(message: str) -> None:
+            self.assertFalse(fake_process.wait_called)
+            logs.append(message)
+
+        with patch("local_image_runtime.pipeline.subprocess.run") as subprocess_run, patch(
+            "local_image_runtime.pipeline.subprocess.Popen",
+            return_value=fake_process,
+        ):
+            result = pipeline._run_backend_job(
+                job,
+                emit_progress=emit_progress,
+                emit_log=emit_log,
+            )
+
+        subprocess_run.assert_not_called()
+        self.assertEqual(fake_process.stdin.value, json.dumps(job.payload) + "\n")
+        self.assertEqual(progress_events, [(80, "loading-pipeline")])
+        self.assertEqual(logs, ["warming backend"])
+        self.assertEqual(result, {"output_path": str(Path(job.payload["output_path"]).resolve())})
+
+    def test_run_backend_job_drains_stderr_separately_from_stdout_ndjson(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-streaming-stderr-"))
+        job = self._make_backend_job(workspace_dir=workspace_dir)
+        fake_process = self._FakePopen(
+            stdout_lines=[
+                json.dumps({"type": "progress", "percent": 90, "label": "running-inference"}) + "\n",
+                json.dumps({"type": "done", "result": {"output_path": job.payload["output_path"]}}) + "\n",
+            ],
+            stderr_lines=["{not-json}\n", '{"type":"error","message":"stderr-only"}\n', "gpu warning\n"],
+        )
+        progress_events: list[tuple[int, str]] = []
+
+        with patch("local_image_runtime.pipeline.subprocess.run") as subprocess_run, patch(
+            "local_image_runtime.pipeline.subprocess.Popen",
+            return_value=fake_process,
+        ):
+            result = pipeline._run_backend_job(
+                job,
+                emit_progress=lambda percent, label: progress_events.append((percent, label)),
+                emit_log=lambda message: self.fail(f"Unexpected log forwarded: {message}"),
+            )
+
+        subprocess_run.assert_not_called()
+        self.assertGreater(fake_process.stderr.read_count, 0)
+        self.assertEqual(progress_events, [(90, "running-inference")])
+        self.assertEqual(result, {"output_path": str(Path(job.payload["output_path"]).resolve())})
+
+    def test_run_backend_job_raises_protocol_error_for_invalid_stdout_line(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-streaming-invalid-"))
+        job = self._make_backend_job(workspace_dir=workspace_dir)
+        fake_process = self._FakePopen(
+            stdout_lines=[
+                json.dumps({"type": "progress", "percent": 95, "label": "saving-output"}) + "\n",
+                "{not-json}\n",
+            ],
+            stderr_lines=["child warning\n"],
+        )
+        progress_events: list[tuple[int, str]] = []
+
+        with patch("local_image_runtime.pipeline.subprocess.run") as subprocess_run, patch(
+            "local_image_runtime.pipeline.subprocess.Popen",
+            return_value=fake_process,
+        ):
+            with self.assertRaisesRegex(pipeline.DomainError, "invalid NDJSON"):
+                pipeline._run_backend_job(
+                    job,
+                    emit_progress=lambda percent, label: progress_events.append((percent, label)),
+                    emit_log=lambda message: None,
+                )
+
+        subprocess_run.assert_not_called()
+        self.assertEqual(progress_events, [(95, "saving-output")])
+        self.assertGreater(fake_process.stderr.read_count, 0)
+
+    def test_run_backend_job_aborts_hung_child_on_total_timeout(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-streaming-timeout-total-"))
+        job = self._make_backend_job(workspace_dir=workspace_dir)
+        fake_process = self._FakePopen(
+            stdout_lines=[],
+            stderr_lines=[],
+            wait_timeout_after_terminate=True,
+        )
+        clock = self._ScriptedClock()
+        scripted_queue = self._ScriptedQueue(
+            clock=clock,
+            items=[
+                (1.0, self._ScriptedQueue.EMPTY),
+                (6.2, self._ScriptedQueue.EMPTY),
+            ],
+        )
+
+        with patch("local_image_runtime.pipeline._read_stream", side_effect=lambda *args, **kwargs: None), patch(
+            "local_image_runtime.pipeline.queue.Queue",
+            return_value=scripted_queue,
+        ), patch(
+            "local_image_runtime.pipeline.subprocess.Popen",
+            return_value=fake_process,
+        ):
+            with self.assertRaisesRegex(pipeline.DomainError, "total backend timeout"):
+                pipeline._run_backend_job(
+                    job,
+                    emit_progress=lambda percent, label: None,
+                    emit_log=lambda message: None,
+                    timeout_config=pipeline.BackendTimeoutConfig(
+                        total_seconds=5.0,
+                        idle_seconds=30.0,
+                        terminate_grace_seconds=0.25,
+                        poll_seconds=0.1,
+                    ),
+                    monotonic=clock.monotonic,
+                )
+
+        self.assertTrue(fake_process.terminate_called)
+        self.assertTrue(fake_process.kill_called)
+
+    def test_run_backend_job_reports_idle_timeout_with_last_stage(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-streaming-timeout-idle-"))
+        job = self._make_backend_job(workspace_dir=workspace_dir)
+        fake_process = self._FakePopen(stdout_lines=[], stderr_lines=[])
+        clock = self._ScriptedClock()
+        scripted_queue = self._ScriptedQueue(
+            clock=clock,
+            items=[
+                (
+                    0.5,
+                    (
+                        "line",
+                        "stdout",
+                        json.dumps({"type": "progress", "percent": 90, "label": "running-inference"}) + "\n",
+                    ),
+                ),
+                (1.9, self._ScriptedQueue.EMPTY),
+                (3.0, self._ScriptedQueue.EMPTY),
+            ],
+        )
+        progress_events: list[tuple[int, str]] = []
+
+        with patch("local_image_runtime.pipeline._read_stream", side_effect=lambda *args, **kwargs: None), patch(
+            "local_image_runtime.pipeline.queue.Queue",
+            return_value=scripted_queue,
+        ), patch(
+            "local_image_runtime.pipeline.subprocess.Popen",
+            return_value=fake_process,
+        ):
+            with self.assertRaisesRegex(pipeline.DomainError, "running-inference"):
+                pipeline._run_backend_job(
+                    job,
+                    emit_progress=lambda percent, label: progress_events.append((percent, label)),
+                    emit_log=lambda message: None,
+                    timeout_config=pipeline.BackendTimeoutConfig(
+                        total_seconds=10.0,
+                        idle_seconds=2.0,
+                        terminate_grace_seconds=0.25,
+                        poll_seconds=0.1,
+                    ),
+                    monotonic=clock.monotonic,
+                )
+
+        self.assertEqual(progress_events, [(90, "running-inference")])
+        self.assertTrue(fake_process.terminate_called)
+
+    def test_run_backend_job_resets_idle_watchdog_on_progress_or_log_activity(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-streaming-timeout-reset-"))
+        job = self._make_backend_job(workspace_dir=workspace_dir)
+        fake_process = self._FakePopen(stdout_lines=[], stderr_lines=[])
+        clock = self._ScriptedClock()
+        scripted_queue = self._ScriptedQueue(
+            clock=clock,
+            items=[
+                (
+                    0.5,
+                    (
+                        "line",
+                        "stdout",
+                        json.dumps({"type": "progress", "percent": 90, "label": "running-inference"}) + "\n",
+                    ),
+                ),
+                (2.4, self._ScriptedQueue.EMPTY),
+                (
+                    2.49,
+                    ("line", "stdout", json.dumps({"type": "log", "message": "still alive"}) + "\n"),
+                ),
+                (4.3, self._ScriptedQueue.EMPTY),
+                (
+                    4.35,
+                    (
+                        "line",
+                        "stdout",
+                        json.dumps({"type": "done", "result": {"output_path": job.payload["output_path"]}}) + "\n",
+                    ),
+                ),
+                (4.36, ("eof", "stdout", None)),
+                (4.36, ("eof", "stderr", None)),
+            ],
+        )
+        progress_events: list[tuple[int, str]] = []
+        logs: list[str] = []
+
+        with patch("local_image_runtime.pipeline._read_stream", side_effect=lambda *args, **kwargs: None), patch(
+            "local_image_runtime.pipeline.queue.Queue",
+            return_value=scripted_queue,
+        ), patch(
+            "local_image_runtime.pipeline.subprocess.Popen",
+            return_value=fake_process,
+        ):
+            result = pipeline._run_backend_job(
+                job,
+                emit_progress=lambda percent, label: progress_events.append((percent, label)),
+                emit_log=logs.append,
+                timeout_config=pipeline.BackendTimeoutConfig(
+                    total_seconds=10.0,
+                    idle_seconds=2.0,
+                    terminate_grace_seconds=0.25,
+                    poll_seconds=0.1,
+                ),
+                monotonic=clock.monotonic,
+            )
+
+        self.assertEqual(progress_events, [(90, "running-inference")])
+        self.assertEqual(logs, ["still alive"])
+        self.assertEqual(result, {"output_path": str(Path(job.payload["output_path"]).resolve())})
+        self.assertFalse(fake_process.terminate_called)
 
     def test_inference_runner_reads_json_job_selects_loader_and_emits_done(self) -> None:
         import local_image_runtime.inference_runner as inference_runner
@@ -1957,6 +2510,99 @@ class RuntimeHarnessTests(unittest.TestCase):
                         },
                     },
                 )
+
+    def test_inference_runner_emits_stage_progress_events_before_done(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="runner-progress-"))
+        output_path = workspace_dir / "result.png"
+
+        class FakeImage:
+            def save(self, target_path: str) -> None:
+                Path(target_path).write_text("generated", encoding="utf-8")
+
+        class FakePipeline:
+            def __call__(self, **kwargs):
+                return SimpleNamespace(images=[FakeImage()])
+
+        job = {
+            "extension_id": "test-extension",
+            "family": "stable-diffusion",
+            "node_id": "text-to-image",
+            "model_dir": str(workspace_dir / "model"),
+            "workspace_dir": str(workspace_dir),
+            "output_path": str(output_path),
+            "prompt": "test prompt",
+            "params": {"steps": 4, "seed": 42},
+        }
+
+        stdout = StringIO()
+        with patch.dict(
+            inference_runner._PIPELINE_LOADERS,
+            {("stable-diffusion", "text-to-image"): SimpleNamespace(from_pretrained=lambda model_dir: FakePipeline())},
+            clear=True,
+        ), patch.object(inference_runner, "_seeded_generator", return_value="generator-token"):
+            exit_code = inference_runner.run_child_main(stdin=StringIO(json.dumps(job) + "\n"), stdout=stdout)
+
+        self.assertEqual(exit_code, 0)
+        events = self._parse_ndjson_events(stdout.getvalue())
+        self.assertEqual(
+            [event["label"] for event in events[:-1] if event["type"] == "progress"],
+            ["loading-pipeline", "running-inference", "saving-output"],
+        )
+        self.assertEqual(events[-1]["type"], "done")
+
+    def test_inference_runner_keeps_done_terminal_contract_with_intermediate_events(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="runner-terminal-compat-"))
+        output_path = workspace_dir / "result.png"
+
+        class FakeImage:
+            def save(self, target_path: str) -> None:
+                Path(target_path).write_text("generated", encoding="utf-8")
+
+        class FakePipeline:
+            def __call__(self, **kwargs):
+                return SimpleNamespace(images=[FakeImage()])
+
+        job = {
+            "extension_id": "test-extension",
+            "family": "flux",
+            "node_id": "text-to-image",
+            "model_dir": str(workspace_dir / "model"),
+            "workspace_dir": str(workspace_dir),
+            "output_path": str(output_path),
+            "prompt": "terminal compatibility",
+            "negative_prompt": "avoid blur",
+            "params": {"steps": 8, "seed": 7},
+        }
+
+        stdout = StringIO()
+        with patch.dict(
+            inference_runner._PIPELINE_LOADERS,
+            {("flux", "text-to-image"): SimpleNamespace(from_pretrained=lambda model_dir: FakePipeline())},
+            clear=True,
+        ), patch.object(inference_runner, "_seeded_generator", return_value="generator-token"):
+            exit_code = inference_runner.run_child_main(stdin=StringIO(json.dumps(job) + "\n"), stdout=stdout)
+
+        self.assertEqual(exit_code, 0)
+        events = self._parse_ndjson_events(stdout.getvalue())
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertNotIn(events[-1]["type"], {"progress", "log", "error"})
+        self.assertEqual(
+            events[-1]["result"],
+            {
+                "output_path": str(output_path),
+                "metadata": {
+                    "family": "flux",
+                    "node_id": "text-to-image",
+                    "seed": 7,
+                    "negative_prompt_used": True,
+                    "source_image_used": False,
+                },
+            },
+        )
 
     def test_inference_runner_emits_error_ndjson_for_invalid_job_or_unsupported_loader(self) -> None:
         import local_image_runtime.inference_runner as inference_runner
