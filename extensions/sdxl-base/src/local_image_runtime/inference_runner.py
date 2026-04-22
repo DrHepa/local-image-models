@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -41,6 +42,8 @@ _STAGE_PROGRESS = (
     (90, "running-inference", "Running inference."),
     (95, "saving-output", "Saving output image."),
 )
+
+_RUNNING_INFERENCE_HEARTBEAT_SECONDS = 15.0
 
 
 def emit_event(event_type: str, *, stdout: TextIO | None = None, **payload: Any) -> None:
@@ -109,17 +112,54 @@ def _instantiate_pipeline(loader: Any, *, model_dir: str) -> Any:
     raise InferenceRunnerError("Inference loader must expose from_pretrained(model_dir) or be callable.")
 
 
-def _seeded_generator(params: dict[str, Any]) -> Any:
-    seed = params.get("seed")
-    if seed is None:
-        return None
-
+def _load_torch() -> Any | None:
     try:
         import torch
     except ImportError:
         return None
+    return torch
 
-    return torch.Generator(device="cpu").manual_seed(int(seed))
+
+def _resolve_execution_device(*, torch_module: Any | None = None) -> str:
+    resolved_torch = torch_module if torch_module is not None else _load_torch()
+    if resolved_torch is None:
+        return "cpu"
+
+    cuda = getattr(resolved_torch, "cuda", None)
+    if cuda is not None and callable(getattr(cuda, "is_available", None)) and cuda.is_available():
+        return "cuda"
+
+    backends = getattr(resolved_torch, "backends", None)
+    mps = getattr(backends, "mps", None)
+    if mps is not None and callable(getattr(mps, "is_available", None)) and mps.is_available():
+        return "mps"
+
+    return "cpu"
+
+
+def _place_pipeline_on_device(pipeline: Any, *, execution_device: str) -> Any:
+    move_to_device = getattr(pipeline, "to", None)
+    if callable(move_to_device):
+        placed_pipeline = move_to_device(execution_device)
+        return placed_pipeline if placed_pipeline is not None else pipeline
+    return pipeline
+
+
+def _seeded_generator(
+    params: dict[str, Any],
+    *,
+    execution_device: str,
+    torch_module: Any | None = None,
+) -> Any:
+    seed = params.get("seed")
+    if seed is None:
+        return None
+
+    resolved_torch = torch_module if torch_module is not None else _load_torch()
+    if resolved_torch is None:
+        return None
+
+    return resolved_torch.Generator(device=execution_device).manual_seed(int(seed))
 
 
 def _open_source_image(source_image_path: str):
@@ -128,7 +168,7 @@ def _open_source_image(source_image_path: str):
     return Image.open(source_image_path)
 
 
-def _build_pipeline_kwargs(job: dict[str, Any]) -> dict[str, Any]:
+def _build_pipeline_kwargs(job: dict[str, Any], *, execution_device: str) -> dict[str, Any]:
     params = job.get("params")
     if not isinstance(params, dict):
         raise InferenceRunnerError("Inference runner job field 'params' must be an object.")
@@ -147,7 +187,7 @@ def _build_pipeline_kwargs(job: dict[str, Any]) -> dict[str, Any]:
         if source_name in params:
             kwargs[target_name] = params[source_name]
 
-    generator = _seeded_generator(params)
+    generator = _seeded_generator(params, execution_device=execution_device)
     if generator is not None:
         kwargs["generator"] = generator
 
@@ -164,16 +204,47 @@ def _build_pipeline_kwargs(job: dict[str, Any]) -> dict[str, Any]:
     return kwargs
 
 
+def _run_pipeline_with_liveness(
+    pipeline: Any,
+    *,
+    pipeline_kwargs: dict[str, Any],
+    stdout: TextIO | None = None,
+    heartbeat_interval_seconds: float | None = None,
+) -> Any:
+    resolved_heartbeat_interval = heartbeat_interval_seconds or _RUNNING_INFERENCE_HEARTBEAT_SECONDS
+    stop_heartbeats = threading.Event()
+
+    def emit_heartbeats() -> None:
+        while not stop_heartbeats.wait(resolved_heartbeat_interval):
+            emit_event("log", stdout=stdout, message="Running inference heartbeat.")
+
+    heartbeat_thread = threading.Thread(target=emit_heartbeats, daemon=True)
+    heartbeat_thread.start()
+    try:
+        return pipeline(**pipeline_kwargs)
+    finally:
+        stop_heartbeats.set()
+        heartbeat_thread.join(timeout=max(resolved_heartbeat_interval, 1.0))
+
+
 def run_child_job(job: dict[str, Any], *, stdout: TextIO | None = None) -> dict[str, Any]:
     model_dir = _require_string_field(job, "model_dir")
     output_path = _require_string_field(job, "output_path")
     family = _require_string_field(job, "family")
     node_id = _require_string_field(job, "node_id")
     loader = _resolve_loader(job)
+    execution_device = _resolve_execution_device()
     _emit_stage_event("loading-pipeline", stdout=stdout)
-    pipeline = _instantiate_pipeline(loader, model_dir=model_dir)
+    pipeline = _place_pipeline_on_device(
+        _instantiate_pipeline(loader, model_dir=model_dir),
+        execution_device=execution_device,
+    )
     _emit_stage_event("running-inference", stdout=stdout)
-    result = pipeline(**_build_pipeline_kwargs(job))
+    result = _run_pipeline_with_liveness(
+        pipeline,
+        pipeline_kwargs=_build_pipeline_kwargs(job, execution_device=execution_device),
+        stdout=stdout,
+    )
 
     images = getattr(result, "images", None)
     if not isinstance(images, list) or not images:

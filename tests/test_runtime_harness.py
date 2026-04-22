@@ -6,6 +6,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import ExitStack
 from importlib.util import module_from_spec, spec_from_file_location
@@ -2383,6 +2385,173 @@ class RuntimeHarnessTests(unittest.TestCase):
         self.assertEqual(logs, ["still alive"])
         self.assertEqual(result, {"output_path": str(Path(job.payload["output_path"]).resolve())})
         self.assertFalse(fake_process.terminate_called)
+
+    def test_inference_runner_resolves_execution_device_by_available_accelerator(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        class FakeCuda:
+            def __init__(self, *, available: bool) -> None:
+                self._available = available
+
+            def is_available(self) -> bool:
+                return self._available
+
+        class FakeMps:
+            def __init__(self, *, available: bool) -> None:
+                self._available = available
+
+            def is_available(self) -> bool:
+                return self._available
+
+        cases = (
+            (SimpleNamespace(cuda=FakeCuda(available=True), backends=SimpleNamespace(mps=FakeMps(available=True))), "cuda"),
+            (SimpleNamespace(cuda=FakeCuda(available=False), backends=SimpleNamespace(mps=FakeMps(available=True))), "mps"),
+            (SimpleNamespace(cuda=FakeCuda(available=False), backends=SimpleNamespace(mps=FakeMps(available=False))), "cpu"),
+            (None, "cpu"),
+        )
+
+        for torch_module, expected_device in cases:
+            with self.subTest(expected_device=expected_device):
+                self.assertEqual(
+                    inference_runner._resolve_execution_device(torch_module=torch_module),
+                    expected_device,
+                )
+
+    def test_inference_runner_moves_pipeline_to_resolved_device_before_execution(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="runner-device-placement-"))
+        output_path = workspace_dir / "result.png"
+
+        class FakeImage:
+            def save(self, target_path: str) -> None:
+                Path(target_path).write_text("generated", encoding="utf-8")
+
+        class FakePipeline:
+            def __init__(self) -> None:
+                self.to_calls: list[str] = []
+                self.invocations: list[dict[str, object]] = []
+
+            def to(self, device: str) -> "FakePipeline":
+                self.to_calls.append(device)
+                return self
+
+            def __call__(self, **kwargs):
+                self.invocations.append(kwargs)
+                return SimpleNamespace(images=[FakeImage()])
+
+        fake_pipeline = FakePipeline()
+        job = {
+            "extension_id": "sd15",
+            "family": "stable-diffusion",
+            "node_id": "text-to-image",
+            "model_dir": str(workspace_dir / "model"),
+            "workspace_dir": str(workspace_dir),
+            "output_path": str(output_path),
+            "prompt": "device placement",
+            "params": {"steps": 4, "seed": 42},
+        }
+
+        stdout = StringIO()
+        with patch.dict(
+            inference_runner._PIPELINE_LOADERS,
+            {("stable-diffusion", "text-to-image"): SimpleNamespace(from_pretrained=lambda model_dir: fake_pipeline)},
+            clear=True,
+        ), patch.object(inference_runner, "_resolve_execution_device", return_value="cuda"):
+            exit_code = inference_runner.run_child_main(stdin=StringIO(json.dumps(job) + "\n"), stdout=stdout)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(fake_pipeline.to_calls, ["cuda"])
+        self.assertEqual(len(fake_pipeline.invocations), 1)
+
+    def test_seeded_generator_uses_resolved_execution_device(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        generator_calls: list[tuple[str, int]] = []
+
+        class FakeGenerator:
+            def __init__(self, *, device: str) -> None:
+                self.device = device
+
+            def manual_seed(self, seed: int) -> str:
+                generator_calls.append((self.device, seed))
+                return f"generator:{self.device}:{seed}"
+
+        fake_torch = SimpleNamespace(Generator=lambda *, device: FakeGenerator(device=device))
+
+        generator = inference_runner._seeded_generator(
+            {"seed": 1234},
+            execution_device="cuda",
+            torch_module=fake_torch,
+        )
+
+        self.assertEqual(generator, "generator:cuda:1234")
+        self.assertEqual(generator_calls, [("cuda", 1234)])
+
+    def test_inference_runner_emits_running_inference_heartbeat_logs_while_pipeline_is_busy(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="runner-heartbeat-"))
+        output_path = workspace_dir / "result.png"
+        started = threading.Event()
+        release = threading.Event()
+
+        class FakeImage:
+            def save(self, target_path: str) -> None:
+                Path(target_path).write_text("generated", encoding="utf-8")
+
+        class BlockingPipeline:
+            def to(self, device: str) -> "BlockingPipeline":
+                return self
+
+            def __call__(self, **kwargs):
+                started.set()
+                if not release.wait(timeout=1.0):
+                    raise AssertionError("Timed out waiting to release blocking pipeline.")
+                return SimpleNamespace(images=[FakeImage()])
+
+        job = {
+            "extension_id": "sd15",
+            "family": "stable-diffusion",
+            "node_id": "text-to-image",
+            "model_dir": str(workspace_dir / "model"),
+            "workspace_dir": str(workspace_dir),
+            "output_path": str(output_path),
+            "prompt": "heartbeat",
+            "params": {"steps": 4},
+        }
+
+        stdout = StringIO()
+        result: dict[str, int] = {}
+
+        def run_child() -> None:
+            result["exit_code"] = inference_runner.run_child_main(
+                stdin=StringIO(json.dumps(job) + "\n"),
+                stdout=stdout,
+            )
+
+        with patch.dict(
+            inference_runner._PIPELINE_LOADERS,
+            {("stable-diffusion", "text-to-image"): SimpleNamespace(from_pretrained=lambda model_dir: BlockingPipeline())},
+            clear=True,
+        ), patch.object(inference_runner, "_resolve_execution_device", return_value="cpu"), patch.object(
+            inference_runner,
+            "_RUNNING_INFERENCE_HEARTBEAT_SECONDS",
+            0.01,
+        ):
+            worker = threading.Thread(target=run_child)
+            worker.start()
+            self.assertTrue(started.wait(timeout=1.0))
+            time.sleep(0.05)
+            release.set()
+            worker.join(timeout=1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, {"exit_code": 0})
+        events = self._parse_ndjson_events(stdout.getvalue())
+        heartbeat_logs = [event for event in events if event["type"] == "log" and "heartbeat" in event["message"]]
+        self.assertGreaterEqual(len(heartbeat_logs), 1)
+        self.assertEqual(events[-1]["type"], "done")
 
     def test_inference_runner_reads_json_job_selects_loader_and_emits_done(self) -> None:
         import local_image_runtime.inference_runner as inference_runner
