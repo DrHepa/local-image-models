@@ -26,6 +26,7 @@ from .install_contract import (
     parse_setup_payload,
     run_install_setup_contract,
 )
+from . import lifecycle
 from .descriptors import (
     ExtensionDescriptor,
     get_extension_descriptor,
@@ -111,6 +112,7 @@ __all__ = [
     "get_node_weight_specs",
     "get_extension_record",
     "install_extension_from_local_dir",
+    "lifecycle",
     "missing_required_paths",
     "parse_setup_payload",
     "pip_install_command",

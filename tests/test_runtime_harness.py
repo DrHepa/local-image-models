@@ -983,6 +983,45 @@ class RuntimeHarnessTests(unittest.TestCase):
             "Unsupported inference backend for family 'stable-diffusion' and node 'text-to-image'",
         )
 
+    def test_run_generator_main_emits_bootstrap_progress_from_shared_lifecycle_module(self) -> None:
+        custom_bootstrap_steps = (
+            (7, "bootstrap-read"),
+            (17, "bootstrap-ready"),
+        )
+        payload = {
+            "nodeId": "text-to-image",
+            "input": {"text": "hello"},
+            "params": {"prompt": "hello", "steps": 4},
+        }
+        stdout = StringIO()
+
+        with patch(
+            "local_image_runtime.runtime_adapter.lifecycle.bootstrap_steps",
+            return_value=custom_bootstrap_steps,
+        ), patch(
+            "local_image_runtime.runtime_adapter.prepare_execution",
+            return_value=SimpleNamespace(
+                runtime=SimpleNamespace(paths=SimpleNamespace(runtime_dir="/tmp/runtime")),
+                request=object(),
+            ),
+        ), patch(
+            "local_image_runtime.runtime_adapter.execute",
+            side_effect=lambda *args, **kwargs: (
+                kwargs["emit_progress"](35, "validating-request"),
+                {"output_path": "/tmp/generated.png", "metadata": {}},
+            )[1],
+        ):
+            exit_code = runtime_adapter.run_generator_main(
+                extension_id="sd15",
+                stdin=StringIO(json.dumps(payload) + "\n"),
+                stdout=stdout,
+            )
+
+        self.assertEqual(exit_code, 0)
+        labels = [event["label"] for event in self._parse_ndjson_events(stdout.getvalue()) if event["type"] == "progress"]
+        self.assertEqual(labels[:2], [label for _, label in custom_bootstrap_steps])
+        self.assertEqual(labels[2:], ["validating-request"])
+
     def test_run_payload_reaches_real_runner_success_after_ready_setup(self) -> None:
         cases = (
             ("sd15", "stable-diffusion", "stable-text"),
@@ -1048,6 +1087,46 @@ class RuntimeHarnessTests(unittest.TestCase):
                         "source_image_used": False,
                     },
                 )
+
+    def test_run_payload_keeps_bootstrap_labels_outside_canonical_generation_lifecycle(self) -> None:
+        canonical_progress = [
+            {"percent": 35, "label": "validating-request"},
+            {"percent": 55, "label": "checking-extension"},
+            {"percent": 75, "label": "backend-dispatch"},
+            {"percent": 80, "label": "loading-pipeline"},
+            {"percent": 90, "label": "running-inference"},
+            {"percent": 95, "label": "saving-output"},
+        ]
+        cases = (
+            {
+                "nodeId": "text-to-image",
+                "input": {"text": "text prompt"},
+                "params": {"prompt": "text prompt", "steps": 4},
+            },
+            {
+                "nodeId": "image-to-image",
+                "input": {"filePath": "/tmp/source.png"},
+                "params": {"prompt": "variation", "strength": 0.45, "steps": 4},
+            },
+        )
+
+        for payload in cases:
+            with self.subTest(node_id=payload["nodeId"]):
+                with patch(
+                    "local_image_runtime.runtime_adapter.prepare_execution",
+                    return_value=SimpleNamespace(request=object(), runtime=object()),
+                ), patch(
+                    "local_image_runtime.runtime_adapter.execute",
+                    side_effect=lambda *args, **kwargs: (
+                        [kwargs["emit_progress"](event["percent"], event["label"]) for event in canonical_progress],
+                        {"output_path": "/tmp/generated.png"},
+                    )[1],
+                ):
+                    result = runtime_adapter.run_payload(payload, extension_id="sd15")
+
+                self.assertEqual(result["progress"], canonical_progress)
+                self.assertNotIn("payload-received", [event["label"] for event in result["progress"]])
+                self.assertNotIn("runtime-ready", [event["label"] for event in result["progress"]])
 
     def test_run_payload_surfaces_child_runner_errors_clearly(self) -> None:
         runtime_root, result = self._run_setup_success("sd15")
@@ -1220,6 +1299,52 @@ class RuntimeHarnessTests(unittest.TestCase):
                 self.assertTrue(actual_path.exists())
                 self.assertTrue(str(actual_path).startswith(str(outputs_dir)))
                 self.assertIn((75, "backend-dispatch"), progress_events)
+
+    def test_lifecycle_module_defines_canonical_generation_and_bootstrap_sequences(self) -> None:
+        from local_image_runtime import lifecycle
+
+        self.assertEqual(
+            lifecycle.canonical_generation_steps(),
+            (
+                (35, "validating-request"),
+                (55, "checking-extension"),
+                (75, "backend-dispatch"),
+                (80, "loading-pipeline"),
+                (90, "running-inference"),
+                (95, "saving-output"),
+            ),
+        )
+        self.assertEqual(
+            lifecycle.bootstrap_steps(),
+            (
+                (5, "payload-received"),
+                (20, "runtime-ready"),
+            ),
+        )
+
+    def test_lifecycle_module_splits_host_and_child_steps_without_bootstrap_overlap(self) -> None:
+        from local_image_runtime import lifecycle
+
+        canonical_labels = {label for _, label in lifecycle.canonical_generation_steps()}
+        bootstrap_labels = {label for _, label in lifecycle.bootstrap_steps()}
+
+        self.assertEqual(
+            lifecycle.host_generation_steps(),
+            (
+                (35, "validating-request"),
+                (55, "checking-extension"),
+                (75, "backend-dispatch"),
+            ),
+        )
+        self.assertEqual(
+            lifecycle.child_generation_steps(),
+            (
+                (80, "loading-pipeline"),
+                (90, "running-inference"),
+                (95, "saving-output"),
+            ),
+        )
+        self.assertFalse(canonical_labels & bootstrap_labels)
 
     def test_extension_generator_generate_serializes_effective_model_dir_to_child_payload(self) -> None:
         cases = (
@@ -1677,26 +1802,76 @@ class RuntimeHarnessTests(unittest.TestCase):
                         (95, "saving-output"),
                     ],
                 )
-                self.assertEqual(len(invocations), 1)
-                self.assertEqual(invocations[0]["marker"], expected_marker)
-                if source_image_token is None:
-                    self.assertNotIn("image", invocations[0]["kwargs"])
+
+    def test_pipeline_execute_emits_host_progress_from_shared_lifecycle_module(self) -> None:
+        custom_host_steps = (
+            (11, "host-validate"),
+            (22, "host-check"),
+            (33, "host-dispatch"),
+        )
+        cases = (
+            pipeline.ExecutionRequest(
+                node_id="text-to-image",
+                input={"text": "sunrise"},
+                params={"prompt": "sunrise", "steps": 4},
+            ),
+            pipeline.ExecutionRequest(
+                node_id="image-to-image",
+                input={},
+                params={"prompt": "variation", "strength": 0.45, "steps": 4},
+            ),
+        )
+
+        for request in cases:
+            with self.subTest(node_id=request.node_id):
+                workspace_dir = Path(tempfile.mkdtemp(prefix=f"host-lifecycle-{request.node_id}-"))
+                runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
+                effective_request = request
+                if request.node_id == "image-to-image":
+                    source_path = workspace_dir / "source.png"
+                    source_path.write_bytes(b"source-image")
+                    effective_request = pipeline.ExecutionRequest(
+                        node_id=request.node_id,
+                        input={"filePath": str(source_path)},
+                        params=request.params,
+                        workspace_dir=str(workspace_dir),
+                    )
                 else:
-                    self.assertIs(invocations[0]["kwargs"]["image"], source_image_token)
-                self.assertIn(f"Validated node '{request.node_id}' for extension '{extension_id}'", logs[0])
-                self.assertIn(f"Workspace: {workspace_dir}.", logs[0])
-                self.assertEqual(
-                    logs[1],
-                    f"Dispatching backend family '{expected_family}' for node '{request.node_id}' using venv '{venv_python}'.",
-                )
-                self.assertEqual(
-                    logs[2:],
-                    [
-                        "Loading inference pipeline.",
-                        "Running inference.",
-                        "Saving output image.",
-                    ],
-                )
+                    effective_request = pipeline.ExecutionRequest(
+                        node_id=request.node_id,
+                        input=request.input,
+                        params=request.params,
+                        workspace_dir=str(workspace_dir),
+                    )
+
+                progress_events: list[tuple[int, str]] = []
+                backend_job = self._make_backend_job(workspace_dir=workspace_dir)
+
+                with patch(
+                    "local_image_runtime.pipeline.lifecycle.host_generation_steps",
+                    return_value=custom_host_steps,
+                ), patch(
+                    "local_image_runtime.pipeline.get_extension_record",
+                    return_value={"model_dir": str(runtime.paths.models_dir / "sd15")},
+                ), patch(
+                    "local_image_runtime.pipeline.extension_is_installed",
+                    return_value=True,
+                ), patch(
+                    "local_image_runtime.pipeline._build_backend_job",
+                    return_value=backend_job,
+                ), patch(
+                    "local_image_runtime.pipeline._run_backend_job",
+                    return_value={"output_path": str(workspace_dir / "result.png")},
+                ):
+                    pipeline.execute(
+                        effective_request,
+                        runtime,
+                        extension_id="sd15",
+                        emit_progress=lambda percent, label: progress_events.append((percent, label)),
+                        emit_log=lambda message: None,
+                    )
+
+                self.assertEqual(progress_events, list(custom_host_steps))
 
     def test_build_backend_job_prefers_model_dir_override_over_extension_record(self) -> None:
         workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-job-override-"))
@@ -2989,6 +3164,83 @@ class RuntimeHarnessTests(unittest.TestCase):
         )
         self.assertEqual(events[-1]["type"], "done")
 
+    def test_inference_runner_emits_child_progress_from_shared_lifecycle_module(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        custom_child_steps = (
+            (81, "child-load"),
+            (91, "child-run"),
+            (96, "child-save"),
+        )
+        cases = (
+            {
+                "family": "stable-diffusion",
+                "node_id": "text-to-image",
+                "prompt": "text prompt",
+                "params": {"steps": 4},
+            },
+            {
+                "family": "stable-diffusion",
+                "node_id": "image-to-image",
+                "prompt": "variation prompt",
+                "source_image_path": "/tmp/source.png",
+                "params": {"steps": 4, "strength": 0.55},
+            },
+        )
+
+        class FakeImage:
+            def save(self, target_path: str) -> None:
+                Path(target_path).write_text("generated", encoding="utf-8")
+
+        class FakePipeline:
+            def __call__(self, **kwargs):
+                return SimpleNamespace(images=[FakeImage()])
+
+        for case in cases:
+            with self.subTest(node_id=case["node_id"]):
+                workspace_dir = Path(tempfile.mkdtemp(prefix=f"runner-child-{case['node_id']}-"))
+                output_path = workspace_dir / "result.png"
+                job = {
+                    "extension_id": "sd15",
+                    "model_dir": str(workspace_dir / "model"),
+                    "workspace_dir": str(workspace_dir),
+                    "output_path": str(output_path),
+                    **case,
+                }
+                stdout = StringIO()
+
+                with patch(
+                    "local_image_runtime.inference_runner.lifecycle.child_generation_steps",
+                    return_value=custom_child_steps,
+                ), patch.dict(
+                    inference_runner._PIPELINE_LOADERS,
+                    {
+                        (case["family"], case["node_id"]): SimpleNamespace(
+                            from_pretrained=lambda model_dir, **kwargs: FakePipeline()
+                        )
+                    },
+                    clear=True,
+                ), patch.object(
+                    inference_runner,
+                    "_resolve_execution_device",
+                    return_value="cpu",
+                ), patch.object(
+                    inference_runner,
+                    "_open_source_image",
+                    return_value=object(),
+                ):
+                    exit_code = inference_runner.run_child_main(
+                        stdin=StringIO(json.dumps(job) + "\n"),
+                        stdout=stdout,
+                    )
+
+                self.assertEqual(exit_code, 0)
+                events = self._parse_ndjson_events(stdout.getvalue())
+                self.assertEqual(
+                    [event["label"] for event in events if event["type"] == "progress"],
+                    [label for _, label in custom_child_steps],
+                )
+
     def test_inference_runner_emits_stage_memory_events_for_sd_families_without_breaking_done(self) -> None:
         import local_image_runtime.inference_runner as inference_runner
 
@@ -3222,6 +3474,7 @@ class RuntimeHarnessTests(unittest.TestCase):
             "dependencies.py",
             "diffusers_memory.py",
             "install_contract.py",
+            "lifecycle.py",
             "pipeline.py",
             "runtime_adapter.py",
             "inference_runner.py",

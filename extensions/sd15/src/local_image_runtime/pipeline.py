@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from .bootstrap import RuntimeSnapshot, extension_is_installed, get_extension_record
 from .descriptors import get_extension_descriptor, registered_extension_ids
+from . import lifecycle
 
 
 class DomainError(RuntimeError):
@@ -698,7 +699,9 @@ def execute(
 ) -> dict[str, Any]:
     _require_supported_node(extension_id, request.node_id)
     effective_workspace_dir = request.workspace_dir or str(runtime.paths.outputs_dir)
-    emit_progress(35, "validating-request")
+    host_generation_steps = lifecycle.host_generation_steps()
+    for percent, label in host_generation_steps[:1]:
+        emit_progress(percent, label)
 
     legacy_model_id = _resolve_legacy_model_id(request.params, extension_id)
     payload_details = _validate_node_payload(request, legacy_model_id)
@@ -711,7 +714,8 @@ def execute(
         )
         + f". Workspace: {effective_workspace_dir}."
     )
-    emit_progress(55, "checking-extension")
+    for percent, label in host_generation_steps[1:2]:
+        emit_progress(percent, label)
 
     extension_record = get_extension_record(runtime, extension_id)
     if not extension_is_installed(runtime, extension_id):
@@ -722,7 +726,8 @@ def execute(
             f"executing '{request.node_id}'."
         )
 
-    emit_progress(75, "backend-dispatch")
+    for percent, label in host_generation_steps[2:]:
+        emit_progress(percent, label)
     job = _build_backend_job(
         request=request,
         extension_id=extension_id,

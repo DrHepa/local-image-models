@@ -13,6 +13,7 @@ from .diffusers_memory import (
     is_retryable_diffusers_load_error,
     should_emit_memory_events,
 )
+from . import lifecycle
 
 
 class InferenceRunnerError(RuntimeError):
@@ -45,12 +46,6 @@ _PIPELINE_LOADERS: dict[tuple[str, str], Any] = {
     ("flux", "text-to-image"): _load_flux_pipeline,
 }
 
-_STAGE_PROGRESS = (
-    (80, "loading-pipeline", "Loading inference pipeline."),
-    (90, "running-inference", "Running inference."),
-    (95, "saving-output", "Saving output image."),
-)
-
 _RUNNING_INFERENCE_HEARTBEAT_SECONDS = 15.0
 
 
@@ -66,11 +61,11 @@ def emit_error(message: str, *, stdout: TextIO | None = None) -> int:
 
 
 def _emit_stage_event(label: str, *, stdout: TextIO | None = None) -> None:
-    for percent, stage_label, message in _STAGE_PROGRESS:
+    for percent, stage_label in lifecycle.child_generation_steps():
         if stage_label != label:
             continue
         emit_event("progress", stdout=stdout, percent=percent, label=stage_label)
-        emit_event("log", stdout=stdout, message=message)
+        emit_event("log", stdout=stdout, message=lifecycle.step_log_message(stage_label))
         return
     raise InferenceRunnerError(f"Unsupported stage label '{label}'")
 
@@ -277,26 +272,31 @@ def run_child_job(job: dict[str, Any], *, stdout: TextIO | None = None) -> dict[
     loader = _resolve_loader(job)
     torch_module = _load_torch()
     execution_device = _resolve_execution_device()
-    _emit_stage_event("loading-pipeline", stdout=stdout)
+    child_generation_steps = lifecycle.child_generation_steps()
+    loading_label = child_generation_steps[0][1]
+    running_label = child_generation_steps[1][1]
+    saving_label = child_generation_steps[2][1]
+
+    _emit_stage_event(loading_label, stdout=stdout)
     pipeline = _place_pipeline_on_device(
         _instantiate_pipeline(loader, job=job, torch_module=torch_module),
         execution_device=execution_device,
     )
     apply_post_load_memory_optimizations(pipeline=pipeline, extension_id=extension_id)
     _emit_memory_event_for_stage(
-        "loading-pipeline",
+        loading_label,
         extension_id=extension_id,
         torch_module=torch_module,
         stdout=stdout,
     )
-    _emit_stage_event("running-inference", stdout=stdout)
+    _emit_stage_event(running_label, stdout=stdout)
     result = _run_pipeline_with_liveness(
         pipeline,
         pipeline_kwargs=_build_pipeline_kwargs(job, execution_device=execution_device),
         stdout=stdout,
     )
     _emit_memory_event_for_stage(
-        "running-inference",
+        running_label,
         extension_id=extension_id,
         torch_module=torch_module,
         stdout=stdout,
@@ -308,10 +308,10 @@ def run_child_job(job: dict[str, Any], *, stdout: TextIO | None = None) -> dict[
 
     output_file = Path(output_path)
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    _emit_stage_event("saving-output", stdout=stdout)
+    _emit_stage_event(saving_label, stdout=stdout)
     images[0].save(str(output_file))
     _emit_memory_event_for_stage(
-        "saving-output",
+        saving_label,
         extension_id=extension_id,
         torch_module=torch_module,
         stdout=stdout,

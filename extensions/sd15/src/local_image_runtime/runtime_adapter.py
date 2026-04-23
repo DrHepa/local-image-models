@@ -15,6 +15,7 @@ from .bootstrap import (
     bootstrap_runtime,
 )
 from .descriptors import get_extension_descriptor
+from . import lifecycle
 from .pipeline import DomainError, ExecutionRequest, execute
 
 try:  # pragma: no cover - exercised only when Modly is importable in-process
@@ -172,12 +173,13 @@ def run_generator_main(
 ) -> int:
     try:
         payload = read_payload(stream=stdin)
+        payload_received_step, runtime_ready_step = lifecycle.bootstrap_steps()
         emit_event(
             "progress",
             stream=stdout,
             extension_id=extension_id,
-            percent=5,
-            label="payload-received",
+            percent=payload_received_step[0],
+            label=payload_received_step[1],
         )
         execution = prepare_execution(
             extension_id=extension_id,
@@ -194,8 +196,8 @@ def run_generator_main(
             "progress",
             stream=stdout,
             extension_id=extension_id,
-            percent=20,
-            label="runtime-ready",
+            percent=runtime_ready_step[0],
+            label=runtime_ready_step[1],
         )
         result = execute(
             execution.request,
