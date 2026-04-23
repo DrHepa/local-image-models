@@ -32,8 +32,8 @@
           "id": "negative_prompt",
           "label": "Negative Prompt",
           "type": "string",
-          "default": "",
-          "tooltip": "Optional prompt describing what to avoid."
+          "default": "blurry, low quality, distorted, artifacts",
+          "tooltip": "Quality preset applied by default; set an empty string to disable it explicitly."
         },
         {
           "id": "width",
@@ -97,8 +97,8 @@
           "id": "negative_prompt",
           "label": "Negative Prompt",
           "type": "string",
-          "default": "",
-          "tooltip": "Optional prompt describing what to avoid during the edit."
+          "default": "blurry, low quality, distorted, artifacts",
+          "tooltip": "Quality preset applied by default; set an empty string to disable it explicitly."
         },
         {
           "id": "width",

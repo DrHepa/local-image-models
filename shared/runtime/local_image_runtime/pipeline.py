@@ -14,6 +14,7 @@ from uuid import uuid4
 from .bootstrap import RuntimeSnapshot, extension_is_installed, get_extension_record
 from .descriptors import get_extension_descriptor, registered_extension_ids
 from . import lifecycle
+from .quality_policy import resolve_effective_params
 
 
 class DomainError(RuntimeError):
@@ -225,6 +226,8 @@ def _validate_node_payload(
 def _validate_optional_text_param(value: Any, *, field_name: str) -> str | None:
     if value is None:
         return None
+    if isinstance(value, str) and not value.strip():
+        return ""
     return _validate_text_prompt(value, field_name=field_name)
 
 
@@ -704,7 +707,19 @@ def execute(
         emit_progress(percent, label)
 
     legacy_model_id = _resolve_legacy_model_id(request.params, extension_id)
-    payload_details = _validate_node_payload(request, legacy_model_id)
+    effective_request = ExecutionRequest(
+        node_id=request.node_id,
+        input=dict(request.input),
+        params=resolve_effective_params(
+            extension_id=extension_id,
+            node_id=request.node_id,
+            params=request.params,
+        ),
+        workspace_dir=request.workspace_dir,
+        temp_dir=request.temp_dir,
+        model_dir_override=request.model_dir_override,
+    )
+    payload_details = _validate_node_payload(effective_request, legacy_model_id)
     emit_log(
         f"Validated node '{request.node_id}' for extension '{extension_id}'"
         + (
@@ -729,7 +744,7 @@ def execute(
     for percent, label in host_generation_steps[2:]:
         emit_progress(percent, label)
     job = _build_backend_job(
-        request=request,
+        request=effective_request,
         extension_id=extension_id,
         extension_record=extension_record,
         payload_details=payload_details,

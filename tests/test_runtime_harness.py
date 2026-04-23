@@ -1621,7 +1621,384 @@ class RuntimeHarnessTests(unittest.TestCase):
             ):
                 generator.generate(b"", {"prompt": "escaped output"})
 
+    def test_quality_policy_resolve_effective_params_applies_family_defaults_only_when_missing(self) -> None:
+        import local_image_runtime.quality_policy as quality_policy
+
+        cases = (
+            (
+                "sd15",
+                "text-to-image",
+                {},
+                {
+                    "width": 512,
+                    "height": 512,
+                    "steps": 30,
+                    "guidance_scale": 7.5,
+                    "negative_prompt": "blurry, low quality, bad anatomy, deformed, extra digits",
+                },
+            ),
+            (
+                "sdxl-base",
+                "image-to-image",
+                {},
+                {
+                    "width": 1024,
+                    "height": 1024,
+                    "steps": 30,
+                    "guidance_scale": 5.0,
+                    "strength": 0.7,
+                    "negative_prompt": "blurry, low quality, distorted, artifacts",
+                },
+            ),
+        )
+
+        for extension_id, node_id, params, expected_defaults in cases:
+            with self.subTest(extension_id=extension_id, node_id=node_id):
+                resolved = quality_policy.resolve_effective_params(
+                    extension_id=extension_id,
+                    node_id=node_id,
+                    params=params,
+                )
+                for key, expected_value in expected_defaults.items():
+                    self.assertEqual(resolved[key], expected_value)
+
+        overridden = quality_policy.resolve_effective_params(
+            extension_id="sd15",
+            node_id="text-to-image",
+            params={"steps": 12, "negative_prompt": "custom override"},
+        )
+        self.assertEqual(overridden["steps"], 12)
+        self.assertEqual(overridden["negative_prompt"], "custom override")
+
+    def test_quality_policy_resolve_effective_params_preserves_explicit_empty_negative_prompt(self) -> None:
+        import local_image_runtime.quality_policy as quality_policy
+
+        resolved = quality_policy.resolve_effective_params(
+            extension_id="sd15",
+            node_id="text-to-image",
+            params={"negative_prompt": "", "steps": 12},
+        )
+
+        self.assertEqual(resolved["negative_prompt"], "")
+        self.assertEqual(resolved["steps"], 12)
+
+        flux_passthrough = quality_policy.resolve_effective_params(
+            extension_id="flux-schnell",
+            node_id="text-to-image",
+            params={"steps": 4},
+        )
+        self.assertEqual(flux_passthrough, {"steps": 4})
+
+    def test_pipeline_execute_applies_quality_policy_defaults_to_backend_payload(self) -> None:
+        cases = (
+            (
+                "sd15",
+                pipeline.ExecutionRequest(
+                    node_id="text-to-image",
+                    input={"text": "legacy lighthouse prompt"},
+                    params={"prompt": "lighthouse at dusk"},
+                ),
+                {
+                    "width": 512,
+                    "height": 512,
+                    "steps": 30,
+                    "guidance_scale": 7.5,
+                    "negative_prompt": "blurry, low quality, bad anatomy, deformed, extra digits",
+                },
+            ),
+            (
+                "sdxl-base",
+                pipeline.ExecutionRequest(
+                    node_id="image-to-image",
+                    input={},
+                    params={"prompt": "cinematic variation"},
+                ),
+                {
+                    "width": 1024,
+                    "height": 1024,
+                    "steps": 30,
+                    "guidance_scale": 5.0,
+                    "strength": 0.7,
+                    "negative_prompt": "blurry, low quality, distorted, artifacts",
+                },
+            ),
+        )
+
+        for extension_id, request, expected_defaults in cases:
+            with self.subTest(extension_id=extension_id, node_id=request.node_id):
+                workspace_dir = Path(tempfile.mkdtemp(prefix=f"quality-policy-{extension_id}-"))
+                runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
+                runtime_root = Path(tempfile.mkdtemp(prefix=f"ext-root-{extension_id}-"))
+                (runtime_root / "src").mkdir(parents=True, exist_ok=True)
+                venv_python = self._make_executable_python(runtime_root)
+                extension_record = {
+                    "venv_python": str(venv_python),
+                    "model_dir": str(runtime.paths.models_dir / extension_id),
+                }
+                serialized_payloads: list[dict[str, object]] = []
+
+                effective_request = pipeline.ExecutionRequest(
+                    node_id=request.node_id,
+                    input=request.input,
+                    params=request.params,
+                    workspace_dir=str(workspace_dir),
+                )
+                if request.node_id == "image-to-image":
+                    source_path = workspace_dir / "source.png"
+                    source_path.write_bytes(b"fake-image")
+                    effective_request = pipeline.ExecutionRequest(
+                        node_id=request.node_id,
+                        input={"filePath": str(source_path)},
+                        params=request.params,
+                        workspace_dir=str(workspace_dir),
+                    )
+
+                def capture_serialized_payload(command, *, stdin, stdout, stderr, text, bufsize, cwd, env):
+                    def on_stdin_close(payload_text: str) -> tuple[list[str], list[str], int]:
+                        serialized_payloads.append(json.loads(payload_text))
+                        return (
+                            [json.dumps({"type": "done", "result": {"output_path": str(workspace_dir / "result.png")}}) + "\n"],
+                            [],
+                            0,
+                        )
+
+                    return self._FakePopen(
+                        stdout_lines=[],
+                        stderr_lines=[],
+                        on_stdin_close=on_stdin_close,
+                    )
+
+                with patch(
+                    "local_image_runtime.pipeline.extension_is_installed",
+                    return_value=True,
+                ), patch(
+                    "local_image_runtime.pipeline.get_extension_record",
+                    return_value=extension_record,
+                ), patch(
+                    "local_image_runtime.pipeline.subprocess.Popen",
+                    side_effect=capture_serialized_payload,
+                ):
+                    pipeline.execute(
+                        effective_request,
+                        runtime,
+                        extension_id=extension_id,
+                        emit_progress=lambda percent, label: None,
+                        emit_log=lambda message: None,
+                    )
+
+                self.assertEqual(len(serialized_payloads), 1)
+                serialized_payload = serialized_payloads[0]
+                self.assertEqual(serialized_payload["negative_prompt"], expected_defaults["negative_prompt"])
+                for key, expected_value in expected_defaults.items():
+                    if key == "negative_prompt":
+                        continue
+                    self.assertEqual(serialized_payload["params"][key], expected_value)
+
+    def test_pipeline_execute_preserves_explicit_empty_negative_prompt_override(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="quality-policy-empty-negative-"))
+        runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
+        runtime_root = Path(tempfile.mkdtemp(prefix="ext-root-sd15-"))
+        (runtime_root / "src").mkdir(parents=True, exist_ok=True)
+        venv_python = self._make_executable_python(runtime_root)
+        extension_record = {
+            "venv_python": str(venv_python),
+            "model_dir": str(runtime.paths.models_dir / "sd15"),
+        }
+        serialized_payloads: list[dict[str, object]] = []
+
+        request = pipeline.ExecutionRequest(
+            node_id="text-to-image",
+            input={"text": "legacy lighthouse prompt"},
+            params={"prompt": "lighthouse at dusk", "negative_prompt": ""},
+            workspace_dir=str(workspace_dir),
+        )
+
+        def capture_serialized_payload(command, *, stdin, stdout, stderr, text, bufsize, cwd, env):
+            def on_stdin_close(payload_text: str) -> tuple[list[str], list[str], int]:
+                serialized_payloads.append(json.loads(payload_text))
+                return (
+                    [json.dumps({"type": "done", "result": {"output_path": str(workspace_dir / "result.png")}}) + "\n"],
+                    [],
+                    0,
+                )
+
+            return self._FakePopen(
+                stdout_lines=[],
+                stderr_lines=[],
+                on_stdin_close=on_stdin_close,
+            )
+
+        with patch(
+            "local_image_runtime.pipeline.extension_is_installed",
+            return_value=True,
+        ), patch(
+            "local_image_runtime.pipeline.get_extension_record",
+            return_value=extension_record,
+        ), patch(
+            "local_image_runtime.pipeline.subprocess.Popen",
+            side_effect=capture_serialized_payload,
+        ):
+            pipeline.execute(
+                request,
+                runtime,
+                extension_id="sd15",
+                emit_progress=lambda percent, label: None,
+                emit_log=lambda message: None,
+            )
+
+        self.assertEqual(len(serialized_payloads), 1)
+        self.assertEqual(serialized_payloads[0]["negative_prompt"], "")
+
+    def test_pipeline_execute_applies_quality_policy_defaults_for_sd15_image_to_image(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="quality-policy-sd15-image-to-image-"))
+        runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
+        runtime_root = Path(tempfile.mkdtemp(prefix="ext-root-sd15-"))
+        (runtime_root / "src").mkdir(parents=True, exist_ok=True)
+        venv_python = self._make_executable_python(runtime_root)
+        extension_record = {
+            "venv_python": str(venv_python),
+            "model_dir": str(runtime.paths.models_dir / "sd15"),
+        }
+        serialized_payloads: list[dict[str, object]] = []
+        source_path = workspace_dir / "source.png"
+        source_path.write_bytes(b"fake-image")
+
+        request = pipeline.ExecutionRequest(
+            node_id="image-to-image",
+            input={"filePath": str(source_path)},
+            params={"prompt": "portrait remix"},
+            workspace_dir=str(workspace_dir),
+        )
+
+        def capture_serialized_payload(command, *, stdin, stdout, stderr, text, bufsize, cwd, env):
+            def on_stdin_close(payload_text: str) -> tuple[list[str], list[str], int]:
+                serialized_payloads.append(json.loads(payload_text))
+                return (
+                    [json.dumps({"type": "done", "result": {"output_path": str(workspace_dir / "result.png")}}) + "\n"],
+                    [],
+                    0,
+                )
+
+            return self._FakePopen(
+                stdout_lines=[],
+                stderr_lines=[],
+                on_stdin_close=on_stdin_close,
+            )
+
+        with patch(
+            "local_image_runtime.pipeline.extension_is_installed",
+            return_value=True,
+        ), patch(
+            "local_image_runtime.pipeline.get_extension_record",
+            return_value=extension_record,
+        ), patch(
+            "local_image_runtime.pipeline.subprocess.Popen",
+            side_effect=capture_serialized_payload,
+        ):
+            pipeline.execute(
+                request,
+                runtime,
+                extension_id="sd15",
+                emit_progress=lambda percent, label: None,
+                emit_log=lambda message: None,
+            )
+
+        self.assertEqual(len(serialized_payloads), 1)
+        self.assertEqual(
+            serialized_payloads[0]["negative_prompt"],
+            "blurry, low quality, bad anatomy, deformed, extra digits",
+        )
+        self.assertEqual(serialized_payloads[0]["params"]["width"], 512)
+        self.assertEqual(serialized_payloads[0]["params"]["height"], 512)
+        self.assertEqual(serialized_payloads[0]["params"]["steps"], 30)
+        self.assertEqual(serialized_payloads[0]["params"]["guidance_scale"], 7.5)
+        self.assertEqual(serialized_payloads[0]["params"]["strength"], 0.75)
+
+    def test_pipeline_execute_applies_quality_policy_defaults_for_sdxl_text_to_image(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="quality-policy-sdxl-text-to-image-"))
+        runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
+        runtime_root = Path(tempfile.mkdtemp(prefix="ext-root-sdxl-base-"))
+        (runtime_root / "src").mkdir(parents=True, exist_ok=True)
+        venv_python = self._make_executable_python(runtime_root)
+        extension_record = {
+            "venv_python": str(venv_python),
+            "model_dir": str(runtime.paths.models_dir / "sdxl-base"),
+        }
+        serialized_payloads: list[dict[str, object]] = []
+
+        request = pipeline.ExecutionRequest(
+            node_id="text-to-image",
+            input={"text": "legacy mountain prompt"},
+            params={"prompt": "mountain vista at sunrise"},
+            workspace_dir=str(workspace_dir),
+        )
+
+        def capture_serialized_payload(command, *, stdin, stdout, stderr, text, bufsize, cwd, env):
+            def on_stdin_close(payload_text: str) -> tuple[list[str], list[str], int]:
+                serialized_payloads.append(json.loads(payload_text))
+                return (
+                    [json.dumps({"type": "done", "result": {"output_path": str(workspace_dir / "result.png")}}) + "\n"],
+                    [],
+                    0,
+                )
+
+            return self._FakePopen(
+                stdout_lines=[],
+                stderr_lines=[],
+                on_stdin_close=on_stdin_close,
+            )
+
+        with patch(
+            "local_image_runtime.pipeline.extension_is_installed",
+            return_value=True,
+        ), patch(
+            "local_image_runtime.pipeline.get_extension_record",
+            return_value=extension_record,
+        ), patch(
+            "local_image_runtime.pipeline.subprocess.Popen",
+            side_effect=capture_serialized_payload,
+        ):
+            pipeline.execute(
+                request,
+                runtime,
+                extension_id="sdxl-base",
+                emit_progress=lambda percent, label: None,
+                emit_log=lambda message: None,
+            )
+
+        self.assertEqual(len(serialized_payloads), 1)
+        self.assertEqual(
+            serialized_payloads[0]["negative_prompt"],
+            "blurry, low quality, distorted, artifacts",
+        )
+        self.assertEqual(serialized_payloads[0]["params"]["width"], 1024)
+        self.assertEqual(serialized_payloads[0]["params"]["height"], 1024)
+        self.assertEqual(serialized_payloads[0]["params"]["steps"], 30)
+        self.assertEqual(serialized_payloads[0]["params"]["guidance_scale"], 5.0)
+
+    def test_sd_family_manifests_align_quality_defaults_and_help_with_shared_policy(self) -> None:
+        import local_image_runtime.quality_policy as quality_policy
+
+        for extension_id in ("sd15", "sdxl-base"):
+            manifest = self._extension_manifest_data(extension_id)
+            nodes = {node["id"]: node for node in manifest["nodes"]}
+            for node_id in ("text-to-image", "image-to-image"):
+                with self.subTest(extension_id=extension_id, node_id=node_id):
+                    params_schema = {
+                        schema["id"]: schema
+                        for schema in nodes[node_id]["params_schema"]
+                    }
+                    expected_defaults = quality_policy.get_node_defaults(extension_id, node_id)
+                    expected_help = quality_policy.get_node_help(extension_id, node_id)
+
+                    for param_id, expected_value in expected_defaults.items():
+                        self.assertEqual(params_schema[param_id]["default"], expected_value)
+                    for param_id, expected_tooltip in expected_help.items():
+                        self.assertEqual(params_schema[param_id]["tooltip"], expected_tooltip)
+
     def test_pipeline_execute_serializes_subprocess_payload_by_family_and_node(self) -> None:
+        import local_image_runtime.quality_policy as quality_policy
+
         cases = (
             (
                 "sd15",
@@ -1770,7 +2147,15 @@ class RuntimeHarnessTests(unittest.TestCase):
                 self.assertEqual(serialized_payload["negative_prompt"], request.params.get("negative_prompt"))
                 self.assertEqual(
                     serialized_payload["params"],
-                    {key: value for key, value in request.params.items() if key != "negative_prompt"},
+                    {
+                        key: value
+                        for key, value in quality_policy.resolve_effective_params(
+                            extension_id=extension_id,
+                            node_id=request.node_id,
+                            params=request.params,
+                        ).items()
+                        if key != "negative_prompt"
+                    },
                 )
                 if source_path is None:
                     self.assertIsNone(serialized_payload["source_image_path"])
@@ -3471,8 +3856,10 @@ class RuntimeHarnessTests(unittest.TestCase):
 
     def test_vendored_runtime_matches_canonical_runtime_sources(self) -> None:
         for relative_name in (
+            "descriptors.py",
             "dependencies.py",
             "diffusers_memory.py",
+            "quality_policy.py",
             "install_contract.py",
             "lifecycle.py",
             "pipeline.py",

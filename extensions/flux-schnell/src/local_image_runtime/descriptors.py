@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .quality_policy import get_node_defaults, get_node_help
+
 
 @dataclass(frozen=True)
 class ExtensionDescriptor:
@@ -57,29 +59,12 @@ EXTENSION_DESCRIPTORS = (
             "vae",
         ),
         node_defaults={
-            "text-to-image": {
-                "width": 512,
-                "height": 512,
-                "steps": 30,
-                "guidance_scale": 7.5,
-            },
-            "image-to-image": {
-                "width": 512,
-                "height": 512,
-                "steps": 30,
-                "guidance_scale": 7.5,
-                "strength": 0.75,
-            },
+            "text-to-image": get_node_defaults("sd15", "text-to-image"),
+            "image-to-image": get_node_defaults("sd15", "image-to-image"),
         },
         node_help={
-            "text-to-image": {
-                "prompt": "Prompt text to generate from.",
-                "guidance_scale": "How strongly generation follows the prompt.",
-            },
-            "image-to-image": {
-                "prompt": "Optional prompt describing the desired edit target.",
-                "strength": "How strongly the source image should be transformed.",
-            },
+            "text-to-image": get_node_help("sd15", "text-to-image"),
+            "image-to-image": get_node_help("sd15", "image-to-image"),
         },
         node_weight_specs={
             "text-to-image": {
@@ -127,29 +112,12 @@ EXTENSION_DESCRIPTORS = (
             "vae",
         ),
         node_defaults={
-            "text-to-image": {
-                "width": 1024,
-                "height": 1024,
-                "steps": 30,
-                "guidance_scale": 5.0,
-            },
-            "image-to-image": {
-                "width": 1024,
-                "height": 1024,
-                "steps": 30,
-                "guidance_scale": 5.0,
-                "strength": 0.7,
-            },
+            "text-to-image": get_node_defaults("sdxl-base", "text-to-image"),
+            "image-to-image": get_node_defaults("sdxl-base", "image-to-image"),
         },
         node_help={
-            "text-to-image": {
-                "prompt": "Prompt text for SDXL base generation.",
-                "guidance_scale": "Lower values are often enough for SDXL base.",
-            },
-            "image-to-image": {
-                "prompt": "Optional text guidance for the edit pass.",
-                "strength": "Controls how much the source image is changed.",
-            },
+            "text-to-image": get_node_help("sdxl-base", "text-to-image"),
+            "image-to-image": get_node_help("sdxl-base", "image-to-image"),
         },
         node_weight_specs={
             "text-to-image": {
