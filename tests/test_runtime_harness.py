@@ -574,6 +574,29 @@ class RuntimeHarnessTests(unittest.TestCase):
                 self.assertEqual(record["readiness"], bootstrap.SETUP_STATUS_READY)
                 self.assertEqual(record["venv_python"], str(runtime_root / "venv" / "bin" / "python"))
 
+    def test_flux_setup_readiness_stays_ready_when_weights_are_missing(self) -> None:
+        extension_id = "flux-schnell"
+        runtime_root, result = self._run_setup_success(extension_id)
+        self.assertEqual(result.status, bootstrap.SETUP_STATUS_READY)
+
+        with patch.dict(
+            os.environ,
+            {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)},
+            clear=False,
+        ), patch(
+            "local_image_runtime.bootstrap._smoke_test_runtime_imports",
+            return_value=(True, "stubbed imports"),
+        ):
+            snapshot = bootstrap.bootstrap_runtime(extension_id=extension_id)
+
+        record = bootstrap.get_extension_record(snapshot, extension_id)
+        expected_model_dir = runtime_root / ".local-image-runtime" / "models" / "flux-schnell" / "text-to-image"
+        self.assertEqual(record["setup"]["status"], bootstrap.SETUP_STATUS_READY)
+        self.assertEqual(record["readiness"], bootstrap.SETUP_STATUS_READY)
+        self.assertEqual(record["status"], bootstrap.EXTENSION_STATUS_INSTALLED)
+        self.assertEqual(record["weights_readiness"], "missing")
+        self.assertEqual(record["weights"]["nodes"]["text-to-image"]["model_dir"], str(expected_model_dir))
+
     def test_unsupported_target_persists_clear_diagnostics(self) -> None:
         for extension_id in EXTENSION_IDS:
             with self.subTest(extension_id=extension_id):
@@ -3854,8 +3877,129 @@ class RuntimeHarnessTests(unittest.TestCase):
         )
         self.assertIn(expected_missing, "\n".join(image_node["diagnostics"]))
 
+    def test_flux_weight_readiness_policy_is_text_to_image_only(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="flux-models-") as temp_dir:
+            models_dir = Path(temp_dir)
+            readiness = weights.evaluate_extension_weights("flux-schnell", models_dir=models_dir)
+
+        expected_target = models_dir / "flux-schnell" / "text-to-image"
+        self.assertEqual(readiness["status"], "missing")
+        self.assertEqual(tuple(readiness["nodes"].keys()), ("text-to-image",))
+        self.assertEqual(readiness["nodes"]["text-to-image"]["model_dir"], str(expected_target))
+        self.assertEqual(
+            readiness["nodes"]["text-to-image"]["check_path"],
+            str(expected_target / "model_index.json"),
+        )
+
+    def test_flux_weight_acquisition_skips_downloader_when_check_file_already_exists(self) -> None:
+        class UnexpectedDownloader:
+            def snapshot_download(self, *, repo_id: str, local_dir: Path) -> Path:
+                raise AssertionError("downloader should not run for ready Flux weights")
+
+        with tempfile.TemporaryDirectory(prefix="flux-models-") as temp_dir:
+            models_dir = Path(temp_dir)
+            target_dir = models_dir / "flux-schnell" / "text-to-image"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            (target_dir / "model_index.json").write_text("{}\n", encoding="utf-8")
+
+            result = weights.acquire_flux_schnell_weights(
+                models_dir=models_dir,
+                downloader=UnexpectedDownloader(),
+            )
+
+        self.assertEqual(result["status"], "ready")
+        self.assertFalse(result["downloaded"])
+        self.assertEqual(result["model_dir"], str(target_dir))
+
+    def test_flux_weight_acquisition_api_is_exported_from_runtime_package(self) -> None:
+        import local_image_runtime
+
+        self.assertIs(
+            local_image_runtime.acquire_flux_schnell_weights,
+            weights.acquire_flux_schnell_weights,
+        )
+
+    def test_flux_weight_acquisition_uses_injected_downloader_and_text_to_image_target(self) -> None:
+        class FakeDownloader:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def snapshot_download(self, *, repo_id: str, local_dir: Path) -> Path:
+                self.calls.append({"repo_id": repo_id, "local_dir": local_dir})
+                local_dir.mkdir(parents=True, exist_ok=True)
+                (local_dir / "model_index.json").write_text("{}\n", encoding="utf-8")
+                return local_dir
+
+        with tempfile.TemporaryDirectory(prefix="flux-models-") as temp_dir:
+            models_dir = Path(temp_dir)
+            downloader = FakeDownloader()
+
+            result = weights.acquire_flux_schnell_weights(
+                models_dir=models_dir,
+                downloader=downloader,
+            )
+            expected_target = models_dir / "flux-schnell" / "text-to-image"
+            self.assertEqual(
+                downloader.calls,
+                [
+                    {
+                        "repo_id": "black-forest-labs/FLUX.1-schnell",
+                        "local_dir": expected_target,
+                    }
+                ],
+            )
+            self.assertEqual(result["status"], "ready")
+            self.assertEqual(result["node_id"], "text-to-image")
+            self.assertEqual(result["model_dir"], str(expected_target))
+            self.assertTrue((expected_target / "model_index.json").exists())
+
+    def test_flux_weight_acquisition_maps_downloader_failures_to_domain_errors(self) -> None:
+        class FailingDownloader:
+            def __init__(self, exc: Exception) -> None:
+                self.exc = exc
+
+            def snapshot_download(self, *, repo_id: str, local_dir: Path) -> Path:
+                raise self.exc
+
+        cases = (
+            (PermissionError("token required"), weights.FluxWeightAuthError, "authentication"),
+            (TimeoutError("request timed out"), weights.FluxWeightNetworkError, "network"),
+            (OSError(28, "No space left on device"), weights.FluxWeightDiskError, "disk"),
+        )
+        for exc, expected_error, expected_message in cases:
+            with self.subTest(exc=type(exc).__name__), tempfile.TemporaryDirectory(
+                prefix="flux-models-"
+            ) as temp_dir:
+                with self.assertRaises(expected_error) as raised:
+                    weights.acquire_flux_schnell_weights(
+                        models_dir=Path(temp_dir),
+                        downloader=FailingDownloader(exc),
+                    )
+
+                self.assertIn(expected_message, str(raised.exception).lower())
+
+    def test_flux_weight_acquisition_rejects_partial_download_without_check_file(self) -> None:
+        class PartialDownloader:
+            def snapshot_download(self, *, repo_id: str, local_dir: Path) -> Path:
+                local_dir.mkdir(parents=True, exist_ok=True)
+                (local_dir / "README.md").write_text("partial\n", encoding="utf-8")
+                return local_dir
+
+        with tempfile.TemporaryDirectory(prefix="flux-models-") as temp_dir:
+            expected_target = Path(temp_dir) / "flux-schnell" / "text-to-image"
+            with self.assertRaises(weights.FluxWeightPartialDownloadError) as raised:
+                weights.acquire_flux_schnell_weights(
+                    models_dir=Path(temp_dir),
+                    downloader=PartialDownloader(),
+                )
+
+        message = str(raised.exception)
+        self.assertIn("partial", message.lower())
+        self.assertIn(str(expected_target / "model_index.json"), message)
+
     def test_vendored_runtime_matches_canonical_runtime_sources(self) -> None:
         for relative_name in (
+            "__init__.py",
             "descriptors.py",
             "dependencies.py",
             "diffusers_memory.py",
@@ -3865,6 +4009,7 @@ class RuntimeHarnessTests(unittest.TestCase):
             "pipeline.py",
             "runtime_adapter.py",
             "inference_runner.py",
+            "weights.py",
         ):
             canonical_text = self._canonical_runtime_file(relative_name).read_text(encoding="utf-8")
             for extension_id in EXTENSION_IDS:

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from .descriptors import get_extension_descriptor, get_node_weight_specs
 
@@ -12,6 +13,41 @@ MODELS_DIR_ENV_VARS = (
     "MODELS_DIR",
     "MODLY_MODELS_DIR",
 )
+
+FLUX_SCHNELL_EXTENSION_ID = "flux-schnell"
+FLUX_SCHNELL_TEXT_TO_IMAGE_NODE_ID = "text-to-image"
+
+
+class SnapshotDownloader(Protocol):
+    def snapshot_download(self, *, repo_id: str, local_dir: Path) -> Path:
+        ...
+
+
+class HuggingFaceSnapshotDownloader:
+    def snapshot_download(self, *, repo_id: str, local_dir: Path) -> Path:
+        from huggingface_hub import snapshot_download
+
+        return Path(snapshot_download(repo_id=repo_id, local_dir=str(local_dir)))
+
+
+class FluxWeightDownloadError(RuntimeError):
+    """Base error for Flux Schnell weight acquisition failures."""
+
+
+class FluxWeightAuthError(FluxWeightDownloadError):
+    """Raised when Hugging Face authentication or gated access blocks download."""
+
+
+class FluxWeightNetworkError(FluxWeightDownloadError):
+    """Raised when a network failure interrupts weight acquisition."""
+
+
+class FluxWeightDiskError(FluxWeightDownloadError):
+    """Raised when local disk access or capacity blocks weight acquisition."""
+
+
+class FluxWeightPartialDownloadError(FluxWeightDownloadError):
+    """Raised when the downloader returns without the required check file."""
 
 
 def _unique_strings(values: list[str]) -> list[str]:
@@ -75,6 +111,108 @@ def download_check_path(
     models_dir: Path, extension_id: str, node_id: str, download_check: str
 ) -> Path:
     return node_models_dir(models_dir, extension_id, node_id) / download_check
+
+
+def _http_status_code(exc: Exception) -> int | None:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+    direct_status = getattr(exc, "status_code", None)
+    return direct_status if isinstance(direct_status, int) else None
+
+
+def _is_network_exception(exc: Exception) -> bool:
+    network_exception_names = {
+        "ConnectionError",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "Timeout",
+        "NetworkError",
+        "OfflineModeIsEnabled",
+    }
+    return isinstance(exc, TimeoutError) or any(
+        cls.__name__ in network_exception_names for cls in type(exc).mro()
+    )
+
+
+def _map_flux_download_exception(exc: Exception, *, target_dir: Path) -> FluxWeightDownloadError:
+    status_code = _http_status_code(exc)
+    if isinstance(exc, PermissionError) or status_code in {401, 403}:
+        return FluxWeightAuthError(
+            "Flux Schnell weight download failed because Hugging Face authentication or gated "
+            "model access was denied. Configure an authorized Hugging Face token and retry."
+        )
+
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) in {
+        errno.ENOSPC,
+        errno.EDQUOT,
+        errno.EACCES,
+        errno.EROFS,
+    }:
+        return FluxWeightDiskError(
+            f"Flux Schnell weight download failed because disk access or capacity blocked writes "
+            f"under '{target_dir}'."
+        )
+
+    if _is_network_exception(exc):
+        return FluxWeightNetworkError(
+            "Flux Schnell weight download failed because the Hugging Face request could not "
+            "complete over the network. Check connectivity and retry."
+        )
+
+    return FluxWeightDownloadError(f"Flux Schnell weight download failed: {exc}")
+
+
+def acquire_flux_schnell_weights(
+    *,
+    models_dir: str | Path,
+    downloader: SnapshotDownloader | None = None,
+) -> dict[str, Any]:
+    node_specs = get_node_weight_specs(FLUX_SCHNELL_EXTENSION_ID)
+    node_spec = node_specs[FLUX_SCHNELL_TEXT_TO_IMAGE_NODE_ID]
+    repo_id = node_spec["hf_repo"]
+    download_check = node_spec["download_check"]
+    root = Path(models_dir).expanduser().resolve()
+    target_dir = node_models_dir(
+        root,
+        FLUX_SCHNELL_EXTENSION_ID,
+        FLUX_SCHNELL_TEXT_TO_IMAGE_NODE_ID,
+    )
+    check_path = target_dir / download_check
+
+    if check_path.exists():
+        return {
+            "status": "ready",
+            "extension_id": FLUX_SCHNELL_EXTENSION_ID,
+            "node_id": FLUX_SCHNELL_TEXT_TO_IMAGE_NODE_ID,
+            "hf_repo": repo_id,
+            "model_dir": str(target_dir),
+            "check_path": str(check_path),
+            "downloaded": False,
+        }
+
+    active_downloader = downloader or HuggingFaceSnapshotDownloader()
+    try:
+        active_downloader.snapshot_download(repo_id=repo_id, local_dir=target_dir)
+    except Exception as exc:
+        raise _map_flux_download_exception(exc, target_dir=target_dir) from exc
+
+    if not check_path.exists():
+        raise FluxWeightPartialDownloadError(
+            f"Flux Schnell weight download appears partial: required download_check "
+            f"'{check_path}' is missing after snapshot download."
+        )
+
+    return {
+        "status": "ready",
+        "extension_id": FLUX_SCHNELL_EXTENSION_ID,
+        "node_id": FLUX_SCHNELL_TEXT_TO_IMAGE_NODE_ID,
+        "hf_repo": repo_id,
+        "model_dir": str(target_dir),
+        "check_path": str(check_path),
+        "downloaded": True,
+    }
 
 
 def evaluate_extension_weights(
@@ -197,7 +335,17 @@ def evaluate_extension_weights(
 
 
 __all__ = [
+    "FLUX_SCHNELL_EXTENSION_ID",
+    "FLUX_SCHNELL_TEXT_TO_IMAGE_NODE_ID",
+    "FluxWeightAuthError",
+    "FluxWeightDiskError",
+    "FluxWeightDownloadError",
+    "FluxWeightNetworkError",
+    "FluxWeightPartialDownloadError",
+    "HuggingFaceSnapshotDownloader",
     "MODELS_DIR_ENV_VARS",
+    "SnapshotDownloader",
+    "acquire_flux_schnell_weights",
     "download_check_path",
     "evaluate_extension_weights",
     "extension_models_dir",

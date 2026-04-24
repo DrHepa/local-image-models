@@ -509,6 +509,7 @@ def _normalize_extension_state(
 
     weight_state = evaluate_extension_weights(
         extension_id,
+        models_dir=paths.models_dir,
         legacy_models_dir=paths.models_dir,
     )
     return {
