@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-import resource
 from typing import Any
+
+try:
+    import resource as _resource
+except ModuleNotFoundError:  # pragma: no cover - exercised via Windows runtime.
+    _resource = None
 
 
 _OPTIMIZED_EXTENSION_IDS = {"sd15", "sdxl-base"}
@@ -79,8 +83,9 @@ def should_emit_memory_events(*, extension_id: str) -> bool:
 def collect_stage_memory_snapshot(*, stage: str, torch_module: Any | None = None) -> dict[str, Any]:
     snapshot: dict[str, Any] = {
         "stage": stage,
-        "rss_mib": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 2),
     }
+    if _resource is not None:
+        snapshot["rss_mib"] = round(_resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss / 1024.0, 2)
 
     cuda = getattr(torch_module, "cuda", None)
     if cuda is not None and callable(getattr(cuda, "is_available", None)) and cuda.is_available():

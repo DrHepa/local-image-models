@@ -3490,6 +3490,14 @@ class RuntimeHarnessTests(unittest.TestCase):
             with self.subTest(error=str(error)):
                 self.assertFalse(diffusers_memory.is_retryable_diffusers_load_error(error))
 
+    def test_diffusers_memory_snapshot_tolerates_missing_posix_resource_module(self) -> None:
+        import local_image_runtime.diffusers_memory as diffusers_memory
+
+        with patch.object(diffusers_memory, "_resource", None):
+            snapshot = diffusers_memory.collect_stage_memory_snapshot(stage="windows-runtime")
+
+        self.assertEqual(snapshot, {"stage": "windows-runtime"})
+
     def test_inference_runner_moves_pipeline_to_resolved_device_before_execution(self) -> None:
         import local_image_runtime.inference_runner as inference_runner
 
