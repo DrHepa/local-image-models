@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from json import JSONDecodeError
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 
 LINUX_ARM64_MACHINES = frozenset({"aarch64", "arm64"})
@@ -14,6 +16,12 @@ PLAN_STATE_SETUP_NEEDED = "setup_needed"
 PLAN_STATE_UNSUPPORTED = "unsupported"
 PLAN_STATE_UNVERIFIED = "unverified"
 WINDOWS_AMD64_MACHINES = frozenset({"amd64", "x86_64"})
+SD15_WINDOWS_PLATFORM_KEY = "windows-amd64"
+SD15_WINDOWS_PYTHON_TAG = "cp312"
+SD15_WINDOWS_CUDA_VARIANT = "cu128"
+SD15_WINDOWS_TORCH_VERSION = "2.7.0"
+SD15_WINDOWS_TORCHVISION_VERSION = "0.22.0"
+SD15_WINDOWS_MODEL_REPO = "runwayml/stable-diffusion-v1-5"
 _WINDOWS_PLAN_STATES = {
     "sd15": PLAN_STATE_SETUP_NEEDED,
     "sdxl-base": PLAN_STATE_UNVERIFIED,
@@ -24,6 +32,37 @@ _TORCH_EXTRA_INDEX_URLS = {
     "cu124": "https://download.pytorch.org/whl/cu124",
     "cu128": "https://download.pytorch.org/whl/cu128",
 }
+
+_SD15_WINDOWS_REQUIRED_EVIDENCE_FIELDS = (
+    "extension_id",
+    "status",
+    "reviewed",
+    "platform_key",
+    "os_name",
+    "os_version",
+    "os_build",
+    "machine",
+    "python_version",
+    "python_abi",
+    "sysconfig_platform",
+    "pip_version",
+    "gpu_name",
+    "nvidia_driver",
+    "torch_cuda_available",
+    "torch_version",
+    "torchvision_version",
+    "torch_cuda_version",
+    "cuda_variant",
+    "import_results",
+    "model_layout",
+    "model_repo",
+    "model_load",
+    "smoke_inference",
+    "timestamp",
+    "operator",
+    "tool_version",
+    "failure_diagnostics",
+)
 
 _TORCH_WHEELS = {
     "cu124": {
@@ -131,8 +170,9 @@ def _unsupported_plan_diagnostic(*, system: str, machine: str) -> str:
 def _windows_diagnostic(*, extension_id: str, plan_state: str) -> str:
     if plan_state == PLAN_STATE_SETUP_NEEDED:
         return (
-            f"Windows dependency setup for '{extension_id}' is setup_needed: no verified Windows GPU "
-            "wheel/runtime matrix is bundled yet, so setup stops before dependency installation."
+            f"Windows dependency setup for '{extension_id}' is setup_needed: a candidate Windows GPU "
+            "wheel/runtime matrix is visible, but setup stops before dependency installation until "
+            "reviewed Windows evidence validates install, imports, model load, and smoke inference."
         )
     if plan_state == PLAN_STATE_UNVERIFIED:
         return (
@@ -142,6 +182,157 @@ def _windows_diagnostic(*, extension_id: str, plan_state: str) -> str:
     return (
         f"Windows dependency setup for '{extension_id}' is unsupported by this bundle version. "
         "No dependency installation was attempted."
+    )
+
+
+def _sd15_windows_torch_step() -> DependencyInstallStep:
+    return DependencyInstallStep(
+        name="install_shared_torch",
+        packages=(
+            f"torch=={SD15_WINDOWS_TORCH_VERSION}",
+            f"torchvision=={SD15_WINDOWS_TORCHVISION_VERSION}",
+        ),
+        extra_args=_torch_step_extra_args(SD15_WINDOWS_CUDA_VARIANT),
+    )
+
+
+def _sd15_windows_candidate_shared_steps() -> tuple[DependencyInstallStep, ...]:
+    return (
+        _sd15_windows_torch_step(),
+        DependencyInstallStep(
+            name="install_shared_runtime",
+            packages=(
+                "Pillow",
+                "numpy",
+                "huggingface_hub",
+                "safetensors",
+                "accelerate",
+            ),
+        ),
+    )
+
+
+def _default_sd15_windows_evidence_path() -> Path | None:
+    candidate = Path(__file__).with_name("sd15-windows-evidence.json")
+    return candidate if candidate.exists() else None
+
+
+def _load_json_evidence(path: str | Path) -> tuple[dict[str, Any] | None, str | None]:
+    evidence_path = Path(path).expanduser()
+    try:
+        payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return None, f"Could not read SD15 Windows evidence '{evidence_path}': {exc}"
+    except JSONDecodeError as exc:
+        return None, f"SD15 Windows evidence is not valid JSON: {exc.msg}"
+    if not isinstance(payload, dict):
+        return None, "SD15 Windows evidence must be a JSON object."
+    return payload, None
+
+
+def _dict_field_status(payload: dict[str, Any], field_name: str) -> str | None:
+    value = payload.get(field_name)
+    if not isinstance(value, dict):
+        return None
+    status = value.get("status")
+    return status if isinstance(status, str) else None
+
+
+def _validate_sd15_windows_evidence_payload(payload: dict[str, Any]) -> tuple[bool, tuple[str, ...]]:
+    diagnostics: list[str] = []
+    for field_name in _SD15_WINDOWS_REQUIRED_EVIDENCE_FIELDS:
+        if field_name not in payload:
+            diagnostics.append(f"SD15 Windows evidence missing required evidence field '{field_name}'.")
+
+    if "pip_freeze" not in payload and "pip_inspect" not in payload:
+        diagnostics.append("SD15 Windows evidence must include pip_freeze or pip_inspect.")
+
+    exact_values: dict[str, object] = {
+        "extension_id": "sd15",
+        "status": PLAN_STATE_VERIFIED,
+        "reviewed": True,
+        "platform_key": SD15_WINDOWS_PLATFORM_KEY,
+        "python_abi": SD15_WINDOWS_PYTHON_TAG,
+        "cuda_variant": SD15_WINDOWS_CUDA_VARIANT,
+        "torch_version": SD15_WINDOWS_TORCH_VERSION,
+        "torchvision_version": SD15_WINDOWS_TORCHVISION_VERSION,
+        "model_repo": SD15_WINDOWS_MODEL_REPO,
+        "torch_cuda_available": True,
+    }
+    for field_name, expected in exact_values.items():
+        if payload.get(field_name) != expected:
+            diagnostics.append(
+                f"SD15 Windows evidence field '{field_name}' must be {expected!r}; got {payload.get(field_name)!r}."
+            )
+
+    if not str(payload.get("torch_cuda_version", "")).startswith("12.8"):
+        diagnostics.append("SD15 Windows evidence field 'torch_cuda_version' must describe CUDA 12.8.")
+
+    import_results = payload.get("import_results")
+    if isinstance(import_results, dict):
+        required_imports = ("torch", "torchvision", "diffusers", "transformers", "sentencepiece", "scipy")
+        for module_name in required_imports:
+            if import_results.get(module_name) != "ok":
+                diagnostics.append(f"SD15 Windows evidence import_results.{module_name} must be 'ok'.")
+    elif "import_results" in payload:
+        diagnostics.append("SD15 Windows evidence field 'import_results' must be an object.")
+
+    for field_name in ("model_load", "smoke_inference"):
+        if field_name in payload and _dict_field_status(payload, field_name) != "ok":
+            diagnostics.append(f"SD15 Windows evidence field '{field_name}.status' must be 'ok'.")
+
+    model_layout = payload.get("model_layout")
+    if isinstance(model_layout, dict):
+        if model_layout.get("model_index.json") != "present":
+            diagnostics.append("SD15 Windows evidence model_layout.model_index.json must be 'present'.")
+    elif "model_layout" in payload:
+        diagnostics.append("SD15 Windows evidence field 'model_layout' must be an object.")
+
+    return not diagnostics, tuple(diagnostics)
+
+
+def _validate_sd15_windows_evidence(evidence_path: str | Path | None) -> tuple[bool, tuple[str, ...]]:
+    resolved_path = Path(evidence_path).expanduser() if evidence_path is not None else _default_sd15_windows_evidence_path()
+    if resolved_path is None:
+        return False, ("No reviewed SD15 Windows evidence artifact is bundled; candidate remains setup_needed.",)
+    payload, load_error = _load_json_evidence(resolved_path)
+    if load_error is not None:
+        return False, (load_error,)
+    assert payload is not None
+    return _validate_sd15_windows_evidence_payload(payload)
+
+
+def _sd15_windows_plan(
+    *,
+    readiness_imports: Iterable[str],
+    machine: str,
+    python_tag: str,
+    evidence_path: str | Path | None,
+) -> DependencyPlan:
+    evidence_ok, evidence_diagnostics = _validate_sd15_windows_evidence(evidence_path)
+    plan_state = PLAN_STATE_VERIFIED if evidence_ok else PLAN_STATE_SETUP_NEEDED
+    diagnostics = (
+        ()
+        if evidence_ok
+        else (
+            _windows_diagnostic(extension_id="sd15", plan_state=plan_state),
+            *evidence_diagnostics,
+        )
+    )
+    return DependencyPlan(
+        extension_id="sd15",
+        dependency_family="sd15",
+        platform_system="windows",
+        platform_machine="amd64" if machine in WINDOWS_AMD64_MACHINES else machine,
+        python_tag=python_tag,
+        cuda_variant=SD15_WINDOWS_CUDA_VARIANT,
+        shared_steps=_sd15_windows_candidate_shared_steps(),
+        family_steps=_family_steps("sd15"),
+        readiness_imports=tuple(module for module in readiness_imports if isinstance(module, str) and module.strip()),
+        plan_state=plan_state,
+        platform_key=SD15_WINDOWS_PLATFORM_KEY,
+        platform_supported=evidence_ok,
+        diagnostics=diagnostics,
     )
 
 
@@ -330,11 +521,19 @@ def resolve_dependency_plan(
     platform_info: dict[str, str],
     python_tag: str,
     cuda_version: str | int | float | None,
+    evidence_path: str | Path | None = None,
 ) -> DependencyPlan:
     system = _normalize_system(platform_info.get("system"))
     machine = _normalize_machine(platform_info.get("machine"))
     platform_key = normalize_platform_key({"system": system, "machine": machine})
     if system == "windows":
+        if extension_id == "sd15" and platform_key == SD15_WINDOWS_PLATFORM_KEY:
+            return _sd15_windows_plan(
+                readiness_imports=readiness_imports,
+                machine=machine,
+                python_tag=python_tag,
+                evidence_path=evidence_path,
+            )
         plan_state = _WINDOWS_PLAN_STATES.get(extension_id, PLAN_STATE_UNVERIFIED)
         return _diagnostic_plan(
             extension_id=extension_id,

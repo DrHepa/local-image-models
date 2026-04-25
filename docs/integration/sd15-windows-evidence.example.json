@@ -1,0 +1,73 @@
+{
+  "extension_id": "sd15",
+  "status": "candidate",
+  "reviewed": false,
+  "platform_key": "windows-amd64",
+  "os_name": "Windows",
+  "os_version": "11 Pro",
+  "os_build": "REPLACE_WITH_WINVER_BUILD",
+  "machine": "AMD64",
+  "python_version": "3.12.x",
+  "python_abi": "cp312",
+  "sysconfig_platform": "win-amd64",
+  "pip_version": "REPLACE_WITH_PIP_VERSION",
+  "gpu_name": "REPLACE_WITH_NVIDIA_GPU_NAME",
+  "nvidia_driver": "REPLACE_WITH_DRIVER_VERSION",
+  "torch_cuda_available": false,
+  "torch_version": "2.7.0",
+  "torchvision_version": "0.22.0",
+  "torch_cuda_version": "12.8",
+  "cuda_variant": "cu128",
+  "pip_freeze": [
+    "REPLACE_WITH_REAL_PIP_FREEZE_OUTPUT"
+  ],
+  "pip_inspect": null,
+  "torch_wheel": "torch-2.7.0+cu128-cp312-cp312-win_amd64.whl",
+  "torchvision_wheel": "torchvision-0.22.0-cp312-cp312-win_amd64.whl",
+  "import_results": {
+    "torch": "pending",
+    "torchvision": "pending",
+    "diffusers": "pending",
+    "transformers": "pending",
+    "sentencepiece": "pending",
+    "scipy": "pending"
+  },
+  "model_layout": {
+    "model_index.json": "pending",
+    "scheduler": "pending",
+    "text_encoder": "pending",
+    "tokenizer": "pending",
+    "unet": "pending",
+    "vae": "pending"
+  },
+  "model_repo": "runwayml/stable-diffusion-v1-5",
+  "model_load": {
+    "status": "pending",
+    "pipeline": "StableDiffusionPipeline"
+  },
+  "smoke_inference": {
+    "status": "pending",
+    "node_id": "text-to-image",
+    "output": "metadata-only-no-image-checked-in"
+  },
+  "image_to_image_smoke_inference": {
+    "status": "optional",
+    "node_id": "image-to-image",
+    "output": "metadata-only-no-image-checked-in"
+  },
+  "timestamp": "REPLACE_WITH_ISO8601_TIMESTAMP",
+  "operator": "REPLACE_WITH_REVIEWER_OR_MACHINE_ALIAS",
+  "tool_version": "REPLACE_WITH_LOCAL_IMAGE_RUNTIME_VERSION_OR_COMMIT",
+  "failure_diagnostics": [],
+  "manual_checklist": [
+    "Create a clean Windows cp312 virtualenv on a real NVIDIA amd64 host.",
+    "Install torch==2.7.0 and torchvision==0.22.0 from https://download.pytorch.org/whl/cu128.",
+    "Install diffusers==0.35.1, transformers>=4.46,<5, sentencepiece, and scipy.",
+    "Record pip freeze or pip inspect plus wheel filenames/hashes when available.",
+    "Verify torch.cuda.is_available() is true and record GPU/driver/CUDA metadata.",
+    "Verify imports for all readiness modules without downloading from Hugging Face in unit tests.",
+    "Use the unchanged SD15 repo identity runwayml/stable-diffusion-v1-5.",
+    "Load the local SD15 model layout and run a text-to-image smoke inference.",
+    "Set status to verified and reviewed to true only after human review accepts the real evidence."
+  ]
+}

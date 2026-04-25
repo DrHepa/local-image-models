@@ -411,6 +411,55 @@ class RuntimeHarnessTests(unittest.TestCase):
             }
         )
 
+    def _sd15_windows_evidence(self, **overrides: object) -> dict[str, object]:
+        evidence: dict[str, object] = {
+            "extension_id": "sd15",
+            "status": "verified",
+            "reviewed": True,
+            "platform_key": "windows-amd64",
+            "os_name": "Windows",
+            "os_version": "11 Pro",
+            "os_build": "22631",
+            "machine": "AMD64",
+            "python_version": "3.12.4",
+            "python_abi": "cp312",
+            "sysconfig_platform": "win-amd64",
+            "pip_version": "24.2",
+            "gpu_name": "NVIDIA GeForce RTX 4090",
+            "nvidia_driver": "555.99",
+            "torch_cuda_available": True,
+            "torch_version": "2.7.0",
+            "torchvision_version": "0.22.0",
+            "torch_cuda_version": "12.8",
+            "cuda_variant": "cu128",
+            "pip_freeze": ["torch==2.7.0+cu128", "torchvision==0.22.0"],
+            "torch_wheel": "torch-2.7.0+cu128-cp312-cp312-win_amd64.whl",
+            "torchvision_wheel": "torchvision-0.22.0-cp312-cp312-win_amd64.whl",
+            "import_results": {
+                "torch": "ok",
+                "torchvision": "ok",
+                "diffusers": "ok",
+                "transformers": "ok",
+                "sentencepiece": "ok",
+                "scipy": "ok",
+            },
+            "model_layout": {"model_index.json": "present", "unet": "present"},
+            "model_repo": "runwayml/stable-diffusion-v1-5",
+            "model_load": {"status": "ok", "pipeline": "StableDiffusionPipeline"},
+            "smoke_inference": {"status": "ok", "node_id": "text-to-image", "output": "metadata-only"},
+            "timestamp": "2026-04-25T20:00:00Z",
+            "operator": "manual-windows-review",
+            "tool_version": "local-image-runtime-test",
+            "failure_diagnostics": [],
+        }
+        evidence.update(overrides)
+        return evidence
+
+    def _write_sd15_windows_evidence(self, payload: dict[str, object]) -> Path:
+        evidence_path = Path(tempfile.mkdtemp(prefix="sd15-windows-evidence-")) / "evidence.json"
+        evidence_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        return evidence_path
+
     def _generator_payload(self) -> StringIO:
         return StringIO(
             json.dumps(
@@ -854,6 +903,134 @@ class RuntimeHarnessTests(unittest.TestCase):
         )
         self.assertEqual(plan.diagnostics, ())
 
+    def test_sd15_windows_candidate_matrix_is_visible_without_verified_evidence(self) -> None:
+        plan = dependencies.resolve_dependency_plan(
+            extension_id="sd15",
+            dependency_family="sd15",
+            readiness_imports=("torch", "diffusers"),
+            platform_info=WINDOWS_PLATFORM,
+            python_tag="cp312",
+            cuda_version="12.8",
+        )
+
+        self.assertEqual(plan.platform_key, "windows-amd64")
+        self.assertEqual(plan.plan_state, dependencies.PLAN_STATE_SETUP_NEEDED)
+        self.assertFalse(plan.platform_supported)
+        self.assertEqual(plan.cuda_variant, "cu128")
+        self.assertEqual(plan.python_tag, "cp312")
+        self.assertEqual(plan.shared_steps[0].name, "install_shared_torch")
+        self.assertEqual(
+            plan.shared_steps[0].packages,
+            ("torch==2.7.0", "torchvision==0.22.0"),
+        )
+        self.assertEqual(
+            plan.shared_steps[0].extra_args,
+            (
+                "--index-url",
+                dependencies._PYPI_INDEX_URL,
+                "--extra-index-url",
+                "https://download.pytorch.org/whl/cu128",
+                "--no-cache-dir",
+            ),
+        )
+        self.assertEqual(
+            plan.family_steps[0].packages,
+            ("diffusers==0.35.1", "transformers>=4.46,<5", "sentencepiece", "scipy"),
+        )
+        diagnostics_text = " ".join(plan.diagnostics)
+        self.assertIn("candidate", diagnostics_text)
+        self.assertIn("reviewed Windows evidence", diagnostics_text)
+
+    def test_sd15_windows_evidence_rejects_missing_malformed_and_unreviewed_artifacts(self) -> None:
+        cases = (
+            (None, "No reviewed SD15 Windows evidence"),
+            (self._write_sd15_windows_evidence({"extension_id": "sd15"}), "missing required evidence field"),
+            (
+                self._write_sd15_windows_evidence(self._sd15_windows_evidence(reviewed=False)),
+                "reviewed",
+            ),
+            (
+                self._write_sd15_windows_evidence(self._sd15_windows_evidence(torch_cuda_available=False)),
+                "torch_cuda_available",
+            ),
+            (
+                self._write_sd15_windows_evidence(self._sd15_windows_evidence(model_repo="stable-diffusion-v1-5/stable-diffusion-v1-5")),
+                "model_repo",
+            ),
+        )
+
+        for evidence_path, expected_diagnostic in cases:
+            with self.subTest(expected_diagnostic=expected_diagnostic):
+                plan = dependencies.resolve_dependency_plan(
+                    extension_id="sd15",
+                    dependency_family="sd15",
+                    readiness_imports=("torch",),
+                    platform_info=WINDOWS_PLATFORM,
+                    python_tag="cp312",
+                    cuda_version="12.8",
+                    evidence_path=evidence_path,
+                )
+
+                self.assertEqual(plan.plan_state, dependencies.PLAN_STATE_SETUP_NEEDED)
+                self.assertFalse(plan.platform_supported)
+                self.assertIn(expected_diagnostic, " ".join(plan.diagnostics))
+
+    def test_sd15_windows_complete_reviewed_evidence_promotes_planner_only_verified_state(self) -> None:
+        evidence_path = self._write_sd15_windows_evidence(self._sd15_windows_evidence())
+
+        with patch("local_image_runtime.weights.HuggingFaceSnapshotDownloader.snapshot_download") as download:
+            plan = dependencies.resolve_dependency_plan(
+                extension_id="sd15",
+                dependency_family="sd15",
+                readiness_imports=("torch", "diffusers"),
+                platform_info=WINDOWS_PLATFORM,
+                python_tag="cp312",
+                cuda_version="12.8",
+                evidence_path=evidence_path,
+            )
+
+        self.assertFalse(download.called)
+        self.assertEqual(plan.plan_state, dependencies.PLAN_STATE_VERIFIED)
+        self.assertTrue(plan.platform_supported)
+        self.assertEqual(plan.platform_key, "windows-amd64")
+        self.assertEqual(plan.cuda_variant, "cu128")
+        self.assertEqual(plan.shared_steps[0].packages, ("torch==2.7.0", "torchvision==0.22.0"))
+        self.assertEqual(plan.family_steps[0].packages[0], "diffusers==0.35.1")
+
+    def test_sd15_hf_repo_identity_and_windows_cpu_only_status_are_not_changed(self) -> None:
+        descriptor = bootstrap.get_extension_descriptor("sd15")
+        self.assertIsNotNone(descriptor)
+        self.assertEqual(descriptor.hf_repo, "runwayml/stable-diffusion-v1-5")
+
+        plan = dependencies.resolve_dependency_plan(
+            extension_id="sd15",
+            dependency_family="sd15",
+            readiness_imports=("torch",),
+            platform_info=WINDOWS_PLATFORM,
+            python_tag="cp312",
+            cuda_version=None,
+        )
+
+        diagnostics_text = " ".join(plan.diagnostics).lower()
+        self.assertEqual(plan.plan_state, dependencies.PLAN_STATE_SETUP_NEEDED)
+        self.assertNotIn("cpu-only", diagnostics_text)
+        self.assertNotIn("cpu verified", diagnostics_text)
+
+    def test_sd15_windows_evidence_example_is_a_non_verified_manual_checklist(self) -> None:
+        example_path = REPO_ROOT / "docs" / "integration" / "sd15-windows-evidence.example.json"
+        payload = json.loads(example_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["extension_id"], "sd15")
+        self.assertEqual(payload["platform_key"], "windows-amd64")
+        self.assertEqual(payload["python_abi"], "cp312")
+        self.assertEqual(payload["cuda_variant"], "cu128")
+        self.assertEqual(payload["torch_version"], "2.7.0")
+        self.assertEqual(payload["torchvision_version"], "0.22.0")
+        self.assertEqual(payload["model_repo"], "runwayml/stable-diffusion-v1-5")
+        self.assertNotEqual(payload["status"], dependencies.PLAN_STATE_VERIFIED)
+        self.assertFalse(payload["reviewed"])
+        self.assertIn("manual_checklist", payload)
+
     def test_windows_dependency_plans_are_explicit_per_extension_without_install_steps(self) -> None:
         observed_states: dict[str, str] = {}
         for extension_id in EXTENSION_IDS:
@@ -871,10 +1048,14 @@ class RuntimeHarnessTests(unittest.TestCase):
 
             observed_states[extension_id] = plan.plan_state
             self.assertEqual(plan.platform_key, "windows-amd64")
-            self.assertFalse(plan.platform_supported)
             self.assertEqual(plan.plan_state, WINDOWS_PLAN_STATES[extension_id])
-            self.assertEqual(plan.shared_steps, ())
-            self.assertEqual(plan.family_steps, ())
+            self.assertFalse(plan.platform_supported)
+            if extension_id == "sd15":
+                self.assertEqual(plan.shared_steps[0].packages, ("torch==2.7.0", "torchvision==0.22.0"))
+                self.assertEqual(plan.family_steps[0].packages[0], "diffusers==0.35.1")
+            else:
+                self.assertEqual(plan.shared_steps, ())
+                self.assertEqual(plan.family_steps, ())
             self.assertIn("Windows", " ".join(plan.diagnostics))
 
         self.assertEqual(observed_states, WINDOWS_PLAN_STATES)
