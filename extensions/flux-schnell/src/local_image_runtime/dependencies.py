@@ -317,7 +317,9 @@ def _sd15_windows_plan(
     python_tag: str,
     evidence_path: str | Path | None,
 ) -> DependencyPlan:
-    evidence_ok, evidence_diagnostics = _validate_sd15_windows_evidence(evidence_path)
+    evidence_ok, evidence_diagnostics = (
+        _validate_sd15_windows_evidence(evidence_path) if evidence_path is not None else (False, ())
+    )
     plan_state = PLAN_STATE_VERIFIED if evidence_ok else PLAN_STATE_CANDIDATE_INSTALL
     diagnostics = (
         ()

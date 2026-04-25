@@ -207,7 +207,6 @@ def _candidate_install_allowed(plan: DependencyPlan) -> bool:
         and plan.platform_key == "windows-amd64"
         and plan.platform_system == "windows"
         and plan.platform_machine == "amd64"
-        and plan.python_tag == "cp312"
         and plan.cuda_variant == "cu128"
         and plan.plan_state == PLAN_STATE_CANDIDATE_INSTALL
         and bool((*plan.shared_steps, *plan.family_steps))

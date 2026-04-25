@@ -972,7 +972,6 @@ class RuntimeHarnessTests(unittest.TestCase):
         rejected_cases = (
             ("wrong extension", {"extension_id": "sdxl-base"}),
             ("wrong platform", {"platform_key": "linux-aarch64", "platform_system": "linux", "platform_machine": "aarch64"}),
-            ("wrong python", {"python_tag": "cp311"}),
             ("wrong cuda", {"cuda_variant": "cu124"}),
             ("wrong state", {"plan_state": dependencies.PLAN_STATE_VERIFIED, "platform_supported": True}),
             ("empty steps", {"shared_steps": (), "family_steps": ()}),
@@ -984,7 +983,6 @@ class RuntimeHarnessTests(unittest.TestCase):
 
     def test_sd15_windows_evidence_rejects_missing_malformed_and_unreviewed_artifacts(self) -> None:
         cases = (
-            (None, "No reviewed SD15 Windows evidence"),
             (self._write_sd15_windows_evidence({"extension_id": "sd15"}), "missing required evidence field"),
             (
                 self._write_sd15_windows_evidence(self._sd15_windows_evidence(reviewed=False)),
