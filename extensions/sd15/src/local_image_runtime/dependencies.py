@@ -12,6 +12,7 @@ from typing import Any, Iterable
 LINUX_ARM64_MACHINES = frozenset({"aarch64", "arm64"})
 SUPPORTED_SYSTEM = "linux"
 PLAN_STATE_VERIFIED = "verified"
+PLAN_STATE_CANDIDATE_INSTALL = "candidate_install"
 PLAN_STATE_SETUP_NEEDED = "setup_needed"
 PLAN_STATE_UNSUPPORTED = "unsupported"
 PLAN_STATE_UNVERIFIED = "unverified"
@@ -23,7 +24,7 @@ SD15_WINDOWS_TORCH_VERSION = "2.7.0"
 SD15_WINDOWS_TORCHVISION_VERSION = "0.22.0"
 SD15_WINDOWS_MODEL_REPO = "runwayml/stable-diffusion-v1-5"
 _WINDOWS_PLAN_STATES = {
-    "sd15": PLAN_STATE_SETUP_NEEDED,
+    "sd15": PLAN_STATE_CANDIDATE_INSTALL,
     "sdxl-base": PLAN_STATE_UNVERIFIED,
     "flux-schnell": PLAN_STATE_UNSUPPORTED,
 }
@@ -168,6 +169,13 @@ def _unsupported_plan_diagnostic(*, system: str, machine: str) -> str:
 
 
 def _windows_diagnostic(*, extension_id: str, plan_state: str) -> str:
+    if plan_state == PLAN_STATE_CANDIDATE_INSTALL:
+        return (
+            f"Windows dependency setup for '{extension_id}' is candidate_install: first-pass, "
+            "experimental SD15 Windows dependency installation is enabled only to gather real pip, "
+            "import, model-load, and smoke-inference evidence. This is not verified compatibility "
+            "or runtime readiness."
+        )
     if plan_state == PLAN_STATE_SETUP_NEEDED:
         return (
             f"Windows dependency setup for '{extension_id}' is setup_needed: a candidate Windows GPU "
@@ -294,7 +302,7 @@ def _validate_sd15_windows_evidence_payload(payload: dict[str, Any]) -> tuple[bo
 def _validate_sd15_windows_evidence(evidence_path: str | Path | None) -> tuple[bool, tuple[str, ...]]:
     resolved_path = Path(evidence_path).expanduser() if evidence_path is not None else _default_sd15_windows_evidence_path()
     if resolved_path is None:
-        return False, ("No reviewed SD15 Windows evidence artifact is bundled; candidate remains setup_needed.",)
+        return False, ("No reviewed SD15 Windows evidence artifact is bundled; candidate remains candidate_install.",)
     payload, load_error = _load_json_evidence(resolved_path)
     if load_error is not None:
         return False, (load_error,)
@@ -310,7 +318,7 @@ def _sd15_windows_plan(
     evidence_path: str | Path | None,
 ) -> DependencyPlan:
     evidence_ok, evidence_diagnostics = _validate_sd15_windows_evidence(evidence_path)
-    plan_state = PLAN_STATE_VERIFIED if evidence_ok else PLAN_STATE_SETUP_NEEDED
+    plan_state = PLAN_STATE_VERIFIED if evidence_ok else PLAN_STATE_CANDIDATE_INSTALL
     diagnostics = (
         ()
         if evidence_ok

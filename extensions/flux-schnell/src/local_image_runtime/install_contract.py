@@ -25,6 +25,7 @@ from .dependencies import (
     DependencyInstallStep,
     DependencyPlan,
     DependencyPlanError,
+    PLAN_STATE_CANDIDATE_INSTALL,
     PLAN_STATE_VERIFIED,
     _TORCH_EXTRA_INDEX_URLS,
     pip_install_command,
@@ -188,9 +189,28 @@ def _persist_failed_result(
 
 
 def _detail_for_plan(plan: DependencyPlan) -> str:
+    if plan.plan_state == PLAN_STATE_CANDIDATE_INSTALL:
+        return (
+            f"Selected first-pass experimental candidate dependency install for {plan.extension_id} "
+            f"on {plan.platform_key}, Python {plan.python_tag}, {plan.cuda_variant}. "
+            "This permits setup execution for evidence gathering only; it is not verified compatibility."
+        )
     return (
         f"Selected verified dependency plan for {plan.platform_system}/{plan.platform_machine}, "
         f"Python {plan.python_tag}, {plan.cuda_variant}, family '{plan.dependency_family}'."
+    )
+
+
+def _candidate_install_allowed(plan: DependencyPlan) -> bool:
+    return (
+        plan.extension_id == "sd15"
+        and plan.platform_key == "windows-amd64"
+        and plan.platform_system == "windows"
+        and plan.platform_machine == "amd64"
+        and plan.python_tag == "cp312"
+        and plan.cuda_variant == "cu128"
+        and plan.plan_state == PLAN_STATE_CANDIDATE_INSTALL
+        and bool((*plan.shared_steps, *plan.family_steps))
     )
 
 
@@ -348,7 +368,7 @@ def run_install_setup_contract(
             python_tag=python_tag,
             cuda_version=payload.cuda_version,
         )
-        if plan.plan_state != PLAN_STATE_VERIFIED:
+        if plan.plan_state != PLAN_STATE_VERIFIED and not _candidate_install_allowed(plan):
             plan_diagnostics = plan.diagnostics or (f"Dependency plan state is {plan.plan_state}.",)
             raise SetupExecutionError(
                 step_name="validate_target",
@@ -383,7 +403,7 @@ def run_install_setup_contract(
         + (_step("install_dependencies", "installing", "Creating venv and installing runtime dependencies."),),
         diagnostics=(),
         platform_info=platform_info,
-        setup_state=SETUP_STATUS_READY,
+        setup_state=SETUP_STATUS_READY if plan.plan_state == PLAN_STATE_VERIFIED else plan.plan_state,
         dependency_plan_state=plan.plan_state,
         platform_key=plan.platform_key,
         platform_supported=plan.platform_supported,
