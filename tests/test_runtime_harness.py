@@ -36,7 +36,13 @@ from local_image_runtime.dependencies import DependencyInstallStep, DependencyPl
 
 SUPPORTED_PLATFORM = {"system": "linux", "machine": "aarch64"}
 UNSUPPORTED_PLATFORM = {"system": "linux", "machine": "x86_64"}
+WINDOWS_PLATFORM = {"system": "windows", "machine": "AMD64"}
 EXTENSION_IDS = ("sd15", "sdxl-base", "flux-schnell")
+WINDOWS_PLAN_STATES = {
+    "sd15": "setup_needed",
+    "sdxl-base": "unverified",
+    "flux-schnell": "unsupported",
+}
 
 
 class RuntimeHarnessTests(unittest.TestCase):
@@ -831,6 +837,131 @@ class RuntimeHarnessTests(unittest.TestCase):
                 dependencies._TORCH_WHEELS["cu128"]["cp312"]["torchvision"],
             ],
         )
+
+    def test_linux_arm64_dependency_plan_preserves_verified_state_and_steps(self) -> None:
+        plan = self._resolve_plan(python_tag="cp311", cuda_version="12.4")
+
+        self.assertEqual(plan.plan_state, "verified")
+        self.assertTrue(plan.platform_supported)
+        self.assertEqual(plan.platform_key, "linux-aarch64")
+        self.assertEqual(
+            [step.name for step in (*plan.shared_steps, *plan.family_steps)],
+            [
+                "install_shared_torch",
+                "install_shared_runtime",
+                "install_family_dependencies",
+            ],
+        )
+        self.assertEqual(plan.diagnostics, ())
+
+    def test_windows_dependency_plans_are_explicit_per_extension_without_install_steps(self) -> None:
+        observed_states: dict[str, str] = {}
+        for extension_id in EXTENSION_IDS:
+            descriptor = bootstrap.get_extension_descriptor(extension_id)
+            self.assertIsNotNone(descriptor)
+
+            plan = dependencies.resolve_dependency_plan(
+                extension_id=extension_id,
+                dependency_family=descriptor.dependency_family,
+                readiness_imports=descriptor.readiness_imports,
+                platform_info=WINDOWS_PLATFORM,
+                python_tag="cp311",
+                cuda_version="12.8",
+            )
+
+            observed_states[extension_id] = plan.plan_state
+            self.assertEqual(plan.platform_key, "windows-amd64")
+            self.assertFalse(plan.platform_supported)
+            self.assertEqual(plan.plan_state, WINDOWS_PLAN_STATES[extension_id])
+            self.assertEqual(plan.shared_steps, ())
+            self.assertEqual(plan.family_steps, ())
+            self.assertIn("Windows", " ".join(plan.diagnostics))
+
+        self.assertEqual(observed_states, WINDOWS_PLAN_STATES)
+
+    def test_windows_setup_fails_safely_without_dependency_install_attempt(self) -> None:
+        for extension_id in EXTENSION_IDS:
+            with self.subTest(extension_id=extension_id):
+                runtime_root = self._make_runtime_root(extension_id)
+                self._make_windows_executable_python(runtime_root)
+
+                with ExitStack() as stack:
+                    stack.enter_context(
+                        patch.dict(
+                            os.environ,
+                            {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)},
+                            clear=False,
+                        )
+                    )
+                    stack.enter_context(
+                        patch("local_image_runtime.install_contract.detect_platform", return_value=WINDOWS_PLATFORM)
+                    )
+                    stack.enter_context(
+                        patch("local_image_runtime.install_contract.python_tag_from_interpreter", return_value="cp311")
+                    )
+                    run_checked = stack.enter_context(
+                        patch("local_image_runtime.install_contract._run_checked")
+                    )
+                    install_step = stack.enter_context(
+                        patch("local_image_runtime.install_contract._install_dependency_step")
+                    )
+
+                    result = install_contract.run_install_setup_contract(
+                        extension_id=extension_id,
+                        stdin_text=self._payload(runtime_root),
+                    )
+
+                self.assertEqual(result.status, bootstrap.SETUP_STATUS_FAILED)
+                self.assertFalse(run_checked.called)
+                self.assertFalse(install_step.called)
+                diagnostics_text = " ".join(result.diagnostics)
+                self.assertIn(WINDOWS_PLAN_STATES[extension_id], diagnostics_text)
+                self.assertIn("Windows", diagnostics_text)
+
+                with patch.dict(
+                    os.environ,
+                    {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)},
+                    clear=False,
+                ):
+                    snapshot = bootstrap.bootstrap_runtime(extension_id=extension_id)
+                record = bootstrap.get_extension_record(snapshot, extension_id)
+                self.assertEqual(record["setup_state"], WINDOWS_PLAN_STATES[extension_id])
+                self.assertEqual(record["dependency_plan_state"], WINDOWS_PLAN_STATES[extension_id])
+                self.assertEqual(record["platform_key"], "windows-amd64")
+                self.assertFalse(record["platform_supported"])
+
+    def test_windows_readiness_fields_are_additive_and_weights_remain_offline(self) -> None:
+        for extension_id in EXTENSION_IDS:
+            with self.subTest(extension_id=extension_id):
+                runtime_root = self._make_runtime_root(extension_id)
+                with patch.dict(
+                    os.environ,
+                    {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)},
+                    clear=False,
+                ), patch("local_image_runtime.bootstrap.platform.system", return_value="Windows"), patch(
+                    "local_image_runtime.bootstrap.platform.machine", return_value="AMD64"
+                ), patch(
+                    "local_image_runtime.weights.HuggingFaceSnapshotDownloader.snapshot_download",
+                    side_effect=AssertionError("readiness must not download Hugging Face weights"),
+                ):
+                    snapshot = bootstrap.bootstrap_runtime(extension_id=extension_id)
+
+                record = bootstrap.get_extension_record(snapshot, extension_id)
+                self.assertEqual(record["platform_key"], "windows-amd64")
+                self.assertEqual(record["dependency_plan_state"], WINDOWS_PLAN_STATES[extension_id])
+                self.assertEqual(record["setup_state"], WINDOWS_PLAN_STATES[extension_id])
+                self.assertIn(record["model_weight_state"], {"missing", "unknown"})
+                self.assertIsInstance(record["diagnostics"], list)
+                self.assertIn("Windows", " ".join(record["diagnostics"]))
+
+    def test_extension_setup_entrypoints_remain_python_only_without_shell_commands(self) -> None:
+        for extension_id in EXTENSION_IDS:
+            setup_text = (REPO_ROOT / "extensions" / extension_id / "setup.py").read_text(encoding="utf-8")
+            with self.subTest(extension_id=extension_id):
+                self.assertNotIn("shell=True", setup_text)
+                self.assertNotIn("powershell", setup_text.lower())
+                self.assertNotIn("subprocess.run", setup_text)
+                self.assertIn("run_extension_setup_cli", setup_text)
 
     def test_select_cuda_variant_preserves_verified_matrix(self) -> None:
         self.assertEqual(dependencies._select_cuda_variant("12.8"), "cu128")

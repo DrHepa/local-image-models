@@ -12,6 +12,7 @@ from typing import Any, Sequence
 from .bootstrap import (
     SETUP_STATUS_FAILED,
     SETUP_STATUS_INSTALLING,
+    SETUP_STATUS_READY,
     SetupStatus,
     bootstrap_runtime,
     detect_platform,
@@ -24,6 +25,7 @@ from .dependencies import (
     DependencyInstallStep,
     DependencyPlan,
     DependencyPlanError,
+    PLAN_STATE_VERIFIED,
     _TORCH_EXTRA_INDEX_URLS,
     pip_install_command,
     python_tag_from_interpreter,
@@ -162,6 +164,10 @@ def _persist_failed_result(
     steps: Sequence[dict[str, Any]],
     diagnostics: Sequence[str],
     platform_info: dict[str, str],
+    setup_state: str | None = None,
+    dependency_plan_state: str | None = None,
+    platform_key: str | None = None,
+    platform_supported: bool | None = None,
 ) -> SetupResult:
     failed_snapshot = persist_extension_setup(
         snapshot,
@@ -173,6 +179,10 @@ def _persist_failed_result(
         steps=tuple(steps),
         diagnostics=tuple(diagnostics),
         platform_info=platform_info,
+        setup_state=setup_state,
+        dependency_plan_state=dependency_plan_state,
+        platform_key=platform_key,
+        platform_supported=platform_supported,
     )
     return _result_from_snapshot(extension_id, failed_snapshot)
 
@@ -338,6 +348,12 @@ def run_install_setup_contract(
             python_tag=python_tag,
             cuda_version=payload.cuda_version,
         )
+        if plan.plan_state != PLAN_STATE_VERIFIED:
+            plan_diagnostics = plan.diagnostics or (f"Dependency plan state is {plan.plan_state}.",)
+            raise SetupExecutionError(
+                step_name="validate_target",
+                detail=" ".join(plan_diagnostics),
+            )
         prefix_steps.append(_step("validate_target", "ok", _detail_for_plan(plan)))
     except (DependencyPlanError, SetupExecutionError) as exc:
         prefix_steps.append(_step("validate_target", "failed", str(exc)))
@@ -350,6 +366,10 @@ def run_install_setup_contract(
             steps=prefix_steps,
             diagnostics=diagnostics,
             platform_info=platform_info,
+            setup_state=plan.plan_state if plan is not None else None,
+            dependency_plan_state=plan.plan_state if plan is not None else None,
+            platform_key=plan.platform_key if plan is not None else None,
+            platform_supported=plan.platform_supported if plan is not None else None,
         )
 
     installing_snapshot = persist_extension_setup(
@@ -363,6 +383,10 @@ def run_install_setup_contract(
         + (_step("install_dependencies", "installing", "Creating venv and installing runtime dependencies."),),
         diagnostics=(),
         platform_info=platform_info,
+        setup_state=SETUP_STATUS_READY,
+        dependency_plan_state=plan.plan_state,
+        platform_key=plan.platform_key,
+        platform_supported=plan.platform_supported,
     )
 
     execution_steps = list(prefix_steps)

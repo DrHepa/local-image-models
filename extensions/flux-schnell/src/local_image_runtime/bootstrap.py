@@ -19,6 +19,16 @@ from .descriptors import (
     registered_extension_ids,
     resolve_extension_id,
 )
+from .dependencies import (
+    DependencyPlanError,
+    PLAN_STATE_SETUP_NEEDED,
+    PLAN_STATE_UNSUPPORTED,
+    PLAN_STATE_UNVERIFIED,
+    PLAN_STATE_VERIFIED,
+    current_python_tag,
+    normalize_platform_key,
+    resolve_dependency_plan,
+)
 from .weights import evaluate_extension_weights, resolve_models_dir
 
 
@@ -38,6 +48,9 @@ EXTENSION_STATUSES = {
 SETUP_STATUS_READY = "ready"
 SETUP_STATUS_INSTALLING = "installing"
 SETUP_STATUS_FAILED = "failed"
+SETUP_STATE_SETUP_NEEDED = PLAN_STATE_SETUP_NEEDED
+SETUP_STATE_UNSUPPORTED = PLAN_STATE_UNSUPPORTED
+SETUP_STATE_UNVERIFIED = PLAN_STATE_UNVERIFIED
 SETUP_STATUSES = {
     SETUP_STATUS_READY,
     SETUP_STATUS_INSTALLING,
@@ -251,6 +264,52 @@ def _normalize_platform_info(value: Any) -> dict[str, str]:
     return platform_info
 
 
+def _bool_or_none(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _derive_dependency_plan_metadata(
+    *, extension_id: str, platform_info: dict[str, str], setup_payload: dict[str, Any]
+) -> dict[str, Any]:
+    descriptor = get_extension_descriptor(extension_id)
+    platform_key = normalize_platform_key(platform_info)
+    if descriptor is None:
+        return {
+            "platform_key": platform_key,
+            "platform_supported": False,
+            "dependency_plan_state": PLAN_STATE_UNSUPPORTED,
+            "setup_state": SETUP_STATE_UNSUPPORTED,
+            "diagnostics": (f"Unknown extension '{extension_id}'.",),
+        }
+
+    try:
+        plan = resolve_dependency_plan(
+            extension_id=extension_id,
+            dependency_family=descriptor.dependency_family,
+            readiness_imports=descriptor.readiness_imports,
+            platform_info=platform_info,
+            python_tag=current_python_tag(),
+            cuda_version=setup_payload.get("cuda_version"),
+        )
+    except DependencyPlanError as exc:
+        return {
+            "platform_key": platform_key,
+            "platform_supported": False,
+            "dependency_plan_state": PLAN_STATE_UNSUPPORTED,
+            "setup_state": SETUP_STATE_UNSUPPORTED,
+            "diagnostics": (str(exc),),
+        }
+
+    setup_state = SETUP_STATUS_READY if plan.plan_state == PLAN_STATE_VERIFIED else plan.plan_state
+    return {
+        "platform_key": plan.platform_key,
+        "platform_supported": plan.platform_supported,
+        "dependency_plan_state": plan.plan_state,
+        "setup_state": setup_state,
+        "diagnostics": plan.diagnostics,
+    }
+
+
 def _normalize_setup_step(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -436,6 +495,11 @@ def _normalize_setup_state(extension_id: str, current: Any, timestamp: str) -> d
     ext_dir = _normalize_string(payload.get("ext_dir"))
     python_exe = _normalize_string(payload.get("python_exe"))
     platform_info = _normalize_platform_info(payload.get("platform"))
+    plan_metadata = _derive_dependency_plan_metadata(
+        extension_id=extension_id,
+        platform_info=platform_info,
+        setup_payload=payload,
+    )
     evaluated = _evaluate_setup_readiness(
         extension_id=extension_id,
         ext_dir=ext_dir,
@@ -453,8 +517,17 @@ def _normalize_setup_state(extension_id: str, current: Any, timestamp: str) -> d
         diagnostics = evaluated["diagnostics"]
         venv_python = evaluated["venv_python"]
 
+    diagnostics = tuple(dict.fromkeys((*diagnostics, *plan_metadata["diagnostics"])))
+
     return {
         "status": status if status in SETUP_STATUSES else SETUP_STATUS_FAILED,
+        "setup_state": _normalize_string(payload.get("setup_state")) or plan_metadata["setup_state"],
+        "dependency_plan_state": _normalize_string(payload.get("dependency_plan_state"))
+        or plan_metadata["dependency_plan_state"],
+        "platform_key": _normalize_string(payload.get("platform_key")) or plan_metadata["platform_key"],
+        "platform_supported": _bool_or_none(payload.get("platform_supported"))
+        if _bool_or_none(payload.get("platform_supported")) is not None
+        else plan_metadata["platform_supported"],
         "ext_dir": ext_dir,
         "python_exe": python_exe,
         "venv_python": venv_python,
@@ -512,11 +585,20 @@ def _normalize_extension_state(
         models_dir=paths.models_dir,
         legacy_models_dir=paths.models_dir,
     )
+    plan_diagnostics = _normalize_string_list(setup_state.get("diagnostics"))
+    weight_diagnostics = _normalize_string_list(weight_state.get("diagnostics"))
+    diagnostics = list(dict.fromkeys((*plan_diagnostics, *weight_diagnostics)))
     return {
         "id": extension_id,
         "status": reconciled_status,
         "readiness": setup_state["status"],
         "weights_readiness": weight_state["status"],
+        "platform_supported": setup_state["platform_supported"],
+        "platform_key": setup_state["platform_key"],
+        "setup_state": setup_state["setup_state"],
+        "dependency_plan_state": setup_state["dependency_plan_state"],
+        "model_weight_state": weight_state["status"] if weight_state["status"] != "unconfigured" else "unknown",
+        "diagnostics": diagnostics,
         "label": descriptor.label,
         "tier": descriptor.tier,
         "family": descriptor.family,
@@ -726,6 +808,10 @@ def persist_extension_setup(
     steps: tuple[dict[str, Any], ...] | list[dict[str, Any]],
     diagnostics: tuple[str, ...] | list[str],
     platform_info: dict[str, str] | None = None,
+    setup_state: str | None = None,
+    dependency_plan_state: str | None = None,
+    platform_key: str | None = None,
+    platform_supported: bool | None = None,
 ) -> RuntimeSnapshot:
     if get_extension_descriptor(extension_id) is None:
         raise InvalidStateFileError(
@@ -743,6 +829,13 @@ def persist_extension_setup(
     setup_state = {
         **current_setup,
         "status": status,
+        "setup_state": _normalize_string(setup_state) or current_setup.get("setup_state"),
+        "dependency_plan_state": _normalize_string(dependency_plan_state)
+        or current_setup.get("dependency_plan_state"),
+        "platform_key": _normalize_string(platform_key) or current_setup.get("platform_key"),
+        "platform_supported": platform_supported
+        if isinstance(platform_supported, bool)
+        else current_setup.get("platform_supported"),
         "ext_dir": _normalize_string(ext_dir),
         "python_exe": _normalize_string(python_exe),
         "venv_python": _normalize_string(venv_python),
@@ -758,6 +851,10 @@ def persist_extension_setup(
     current["setup"] = setup_state
     current["status"] = reconciled_status
     current["readiness"] = setup_state["status"]
+    current["setup_state"] = setup_state.get("setup_state") or setup_state["status"]
+    current["dependency_plan_state"] = setup_state.get("dependency_plan_state") or "unknown"
+    current["platform_key"] = setup_state.get("platform_key") or normalize_platform_key(setup_state["platform"])
+    current["platform_supported"] = setup_state.get("platform_supported") is True
     current["venv_python"] = setup_state["venv_python"]
     if reconciled_status == EXTENSION_STATUS_INSTALLED:
         current["installed_at"] = _normalize_timestamp(

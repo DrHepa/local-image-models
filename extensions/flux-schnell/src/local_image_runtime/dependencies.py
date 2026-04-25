@@ -9,6 +9,16 @@ from typing import Iterable
 
 LINUX_ARM64_MACHINES = frozenset({"aarch64", "arm64"})
 SUPPORTED_SYSTEM = "linux"
+PLAN_STATE_VERIFIED = "verified"
+PLAN_STATE_SETUP_NEEDED = "setup_needed"
+PLAN_STATE_UNSUPPORTED = "unsupported"
+PLAN_STATE_UNVERIFIED = "unverified"
+WINDOWS_AMD64_MACHINES = frozenset({"amd64", "x86_64"})
+_WINDOWS_PLAN_STATES = {
+    "sd15": PLAN_STATE_SETUP_NEEDED,
+    "sdxl-base": PLAN_STATE_UNVERIFIED,
+    "flux-schnell": PLAN_STATE_UNSUPPORTED,
+}
 _PYPI_INDEX_URL = "https://pypi.org/simple"
 _TORCH_EXTRA_INDEX_URLS = {
     "cu124": "https://download.pytorch.org/whl/cu124",
@@ -77,6 +87,10 @@ class DependencyPlan:
     shared_steps: tuple[DependencyInstallStep, ...]
     family_steps: tuple[DependencyInstallStep, ...]
     readiness_imports: tuple[str, ...] = field(default_factory=tuple)
+    plan_state: str = PLAN_STATE_VERIFIED
+    platform_key: str = "linux-aarch64"
+    platform_supported: bool = True
+    diagnostics: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def summary(self) -> str:
@@ -96,6 +110,68 @@ def _normalize_system(value: str | None) -> str:
 
 def _normalize_machine(value: str | None) -> str:
     return (value or "").strip().lower()
+
+
+def normalize_platform_key(platform_info: dict[str, str]) -> str:
+    system = _normalize_system(platform_info.get("system")) or "unknown"
+    machine = _normalize_machine(platform_info.get("machine")) or "unknown"
+    if system == "windows" and machine in WINDOWS_AMD64_MACHINES:
+        machine = "amd64"
+    return f"{system}-{machine}"
+
+
+def _unsupported_plan_diagnostic(*, system: str, machine: str) -> str:
+    return (
+        "Unsupported/unverified install target detected: "
+        f"system='{system or 'unknown'}', machine='{machine or 'unknown'}'. "
+        "This change currently guarantees installation ONLY on Linux ARM64 (linux + aarch64/arm64)."
+    )
+
+
+def _windows_diagnostic(*, extension_id: str, plan_state: str) -> str:
+    if plan_state == PLAN_STATE_SETUP_NEEDED:
+        return (
+            f"Windows dependency setup for '{extension_id}' is setup_needed: no verified Windows GPU "
+            "wheel/runtime matrix is bundled yet, so setup stops before dependency installation."
+        )
+    if plan_state == PLAN_STATE_UNVERIFIED:
+        return (
+            f"Windows dependency setup for '{extension_id}' is unverified: dependency installation is "
+            "disabled until a Windows runtime matrix is validated."
+        )
+    return (
+        f"Windows dependency setup for '{extension_id}' is unsupported by this bundle version. "
+        "No dependency installation was attempted."
+    )
+
+
+def _diagnostic_plan(
+    *,
+    extension_id: str,
+    dependency_family: str,
+    readiness_imports: Iterable[str],
+    system: str,
+    machine: str,
+    python_tag: str,
+    cuda_version: str | int | float | None,
+    plan_state: str,
+    diagnostics: tuple[str, ...],
+) -> DependencyPlan:
+    return DependencyPlan(
+        extension_id=extension_id,
+        dependency_family=dependency_family,
+        platform_system=system,
+        platform_machine=machine,
+        python_tag=python_tag,
+        cuda_variant=str(cuda_version or "unverified"),
+        shared_steps=(),
+        family_steps=(),
+        readiness_imports=tuple(module for module in readiness_imports if isinstance(module, str) and module.strip()),
+        plan_state=plan_state,
+        platform_key=normalize_platform_key({"system": system, "machine": machine}),
+        platform_supported=False,
+        diagnostics=diagnostics,
+    )
 
 
 def _normalize_cuda_digits(value: str | int | float | None) -> str | None:
@@ -257,11 +333,32 @@ def resolve_dependency_plan(
 ) -> DependencyPlan:
     system = _normalize_system(platform_info.get("system"))
     machine = _normalize_machine(platform_info.get("machine"))
+    platform_key = normalize_platform_key({"system": system, "machine": machine})
+    if system == "windows":
+        plan_state = _WINDOWS_PLAN_STATES.get(extension_id, PLAN_STATE_UNVERIFIED)
+        return _diagnostic_plan(
+            extension_id=extension_id,
+            dependency_family=dependency_family,
+            readiness_imports=readiness_imports,
+            system=system,
+            machine="amd64" if machine in WINDOWS_AMD64_MACHINES else machine,
+            python_tag=python_tag,
+            cuda_version=cuda_version,
+            plan_state=plan_state,
+            diagnostics=(_windows_diagnostic(extension_id=extension_id, plan_state=plan_state),),
+        )
+
     if system != SUPPORTED_SYSTEM or machine not in LINUX_ARM64_MACHINES:
-        raise DependencyPlanError(
-            "Unsupported/unverified install target detected: "
-            f"system='{system or 'unknown'}', machine='{machine or 'unknown'}'. "
-            "This change currently guarantees installation ONLY on Linux ARM64 (linux + aarch64/arm64)."
+        return _diagnostic_plan(
+            extension_id=extension_id,
+            dependency_family=dependency_family,
+            readiness_imports=readiness_imports,
+            system=system,
+            machine=machine,
+            python_tag=python_tag,
+            cuda_version=cuda_version,
+            plan_state=PLAN_STATE_UNSUPPORTED,
+            diagnostics=(_unsupported_plan_diagnostic(system=system, machine=machine),),
         )
 
     cuda_variant = _select_cuda_variant(cuda_version)
@@ -275,6 +372,10 @@ def resolve_dependency_plan(
         shared_steps=_shared_runtime_steps(cuda_variant, python_tag),
         family_steps=_family_steps(dependency_family),
         readiness_imports=tuple(module for module in readiness_imports if isinstance(module, str) and module.strip()),
+        plan_state=PLAN_STATE_VERIFIED,
+        platform_key=platform_key,
+        platform_supported=True,
+        diagnostics=(),
     )
 
 
