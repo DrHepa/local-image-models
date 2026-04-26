@@ -202,11 +202,16 @@ def _detail_for_plan(plan: DependencyPlan) -> str:
 
 
 def _candidate_install_allowed(plan: DependencyPlan) -> bool:
+    allowed_candidate_targets = {
+        ("sd15", "sd15"),
+        ("sdxl-base", "sdxl-base"),
+    }
     return (
-        plan.extension_id == "sd15"
+        (plan.extension_id, plan.dependency_family) in allowed_candidate_targets
         and plan.platform_key == "windows-amd64"
         and plan.platform_system == "windows"
         and plan.platform_machine == "amd64"
+        and plan.python_tag == "cp312"
         and plan.cuda_variant == "cu128"
         and plan.plan_state == PLAN_STATE_CANDIDATE_INSTALL
         and bool((*plan.shared_steps, *plan.family_steps))

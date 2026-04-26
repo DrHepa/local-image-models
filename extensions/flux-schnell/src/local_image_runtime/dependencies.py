@@ -25,7 +25,7 @@ SD15_WINDOWS_TORCHVISION_VERSION = "0.22.0"
 SD15_WINDOWS_MODEL_REPO = "runwayml/stable-diffusion-v1-5"
 _WINDOWS_PLAN_STATES = {
     "sd15": PLAN_STATE_CANDIDATE_INSTALL,
-    "sdxl-base": PLAN_STATE_UNVERIFIED,
+    "sdxl-base": PLAN_STATE_CANDIDATE_INSTALL,
     "flux-schnell": PLAN_STATE_UNSUPPORTED,
 }
 _PYPI_INDEX_URL = "https://pypi.org/simple"
@@ -170,6 +170,13 @@ def _unsupported_plan_diagnostic(*, system: str, machine: str) -> str:
 
 def _windows_diagnostic(*, extension_id: str, plan_state: str) -> str:
     if plan_state == PLAN_STATE_CANDIDATE_INSTALL:
+        if extension_id == "sdxl-base":
+            return (
+                "SDXL Windows dependency setup for 'sdxl-base' is candidate_install: first-pass, "
+                "unverified dependency installation is enabled only for windows-amd64, Python cp312, "
+                "and CUDA cu128 to gather real pip, import, model-load, text-to-image, and Preview Image "
+                "evidence. This is not verified compatibility or runtime readiness."
+            )
         return (
             f"Windows dependency setup for '{extension_id}' is candidate_install: first-pass, "
             "experimental SD15 Windows dependency installation is enabled only to gather real pip, "
@@ -343,6 +350,29 @@ def _sd15_windows_plan(
         platform_key=SD15_WINDOWS_PLATFORM_KEY,
         platform_supported=evidence_ok,
         diagnostics=diagnostics,
+    )
+
+
+def _sdxl_windows_plan(
+    *,
+    readiness_imports: Iterable[str],
+    machine: str,
+    python_tag: str,
+) -> DependencyPlan:
+    return DependencyPlan(
+        extension_id="sdxl-base",
+        dependency_family="sdxl-base",
+        platform_system="windows",
+        platform_machine="amd64" if machine in WINDOWS_AMD64_MACHINES else machine,
+        python_tag=python_tag,
+        cuda_variant=SD15_WINDOWS_CUDA_VARIANT,
+        shared_steps=_sd15_windows_candidate_shared_steps(),
+        family_steps=_family_steps("sdxl-base"),
+        readiness_imports=tuple(module for module in readiness_imports if isinstance(module, str) and module.strip()),
+        plan_state=PLAN_STATE_CANDIDATE_INSTALL,
+        platform_key=SD15_WINDOWS_PLATFORM_KEY,
+        platform_supported=False,
+        diagnostics=(_windows_diagnostic(extension_id="sdxl-base", plan_state=PLAN_STATE_CANDIDATE_INSTALL),),
     )
 
 
@@ -543,6 +573,23 @@ def resolve_dependency_plan(
                 machine=machine,
                 python_tag=python_tag,
                 evidence_path=evidence_path,
+            )
+        windows_cuda_variant: str | None = None
+        try:
+            windows_cuda_variant = _select_cuda_variant(cuda_version)
+        except DependencyPlanError:
+            windows_cuda_variant = None
+        if (
+            extension_id == "sdxl-base"
+            and dependency_family == "sdxl-base"
+            and platform_key == SD15_WINDOWS_PLATFORM_KEY
+            and python_tag == SD15_WINDOWS_PYTHON_TAG
+            and windows_cuda_variant == SD15_WINDOWS_CUDA_VARIANT
+        ):
+            return _sdxl_windows_plan(
+                readiness_imports=readiness_imports,
+                machine=machine,
+                python_tag=python_tag,
             )
         plan_state = _WINDOWS_PLAN_STATES.get(extension_id, PLAN_STATE_UNVERIFIED)
         return _diagnostic_plan(

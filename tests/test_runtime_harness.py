@@ -40,7 +40,7 @@ WINDOWS_PLATFORM = {"system": "windows", "machine": "AMD64"}
 EXTENSION_IDS = ("sd15", "sdxl-base", "flux-schnell")
 WINDOWS_PLAN_STATES = {
     "sd15": "candidate_install",
-    "sdxl-base": "unverified",
+    "sdxl-base": "candidate_install",
     "flux-schnell": "unsupported",
 }
 
@@ -952,6 +952,51 @@ class RuntimeHarnessTests(unittest.TestCase):
         self.assertIn("candidate", diagnostics_text)
         self.assertIn("experimental", diagnostics_text)
 
+    def test_sdxl_windows_candidate_matrix_is_visible_with_executable_steps(self) -> None:
+        with patch("local_image_runtime.weights.HuggingFaceSnapshotDownloader.snapshot_download") as download:
+            plan = dependencies.resolve_dependency_plan(
+                extension_id="sdxl-base",
+                dependency_family="sdxl-base",
+                readiness_imports=("torch", "diffusers"),
+                platform_info=WINDOWS_PLATFORM,
+                python_tag="cp312",
+                cuda_version="12.8",
+            )
+
+        self.assertFalse(download.called)
+        self.assertEqual(plan.extension_id, "sdxl-base")
+        self.assertEqual(plan.dependency_family, "sdxl-base")
+        self.assertEqual(plan.platform_key, "windows-amd64")
+        self.assertEqual(plan.plan_state, dependencies.PLAN_STATE_CANDIDATE_INSTALL)
+        self.assertFalse(plan.platform_supported)
+        self.assertEqual(plan.cuda_variant, "cu128")
+        self.assertEqual(plan.python_tag, "cp312")
+        self.assertEqual(
+            [step.name for step in (*plan.shared_steps, *plan.family_steps)],
+            ["install_shared_torch", "install_shared_runtime", "install_family_dependencies"],
+        )
+        self.assertEqual(plan.shared_steps[0].packages, ("torch==2.7.0", "torchvision==0.22.0"))
+        self.assertEqual(
+            plan.shared_steps[0].extra_args,
+            (
+                "--index-url",
+                dependencies._PYPI_INDEX_URL,
+                "--extra-index-url",
+                "https://download.pytorch.org/whl/cu128",
+                "--no-cache-dir",
+            ),
+        )
+        self.assertEqual(
+            plan.family_steps[0].packages,
+            ("diffusers==0.35.1", "transformers>=4.46,<5", "sentencepiece", "scipy"),
+        )
+        diagnostics_text = " ".join(plan.diagnostics)
+        self.assertIn("SDXL", diagnostics_text)
+        self.assertIn("candidate", diagnostics_text)
+        self.assertIn("first-pass", diagnostics_text)
+        self.assertIn("unverified", diagnostics_text)
+        self.assertIn("not verified compatibility", diagnostics_text)
+
     def test_install_contract_allows_only_exact_sd15_windows_candidate_plan(self) -> None:
         valid_plan = DependencyPlan(
             extension_id="sd15",
@@ -972,6 +1017,37 @@ class RuntimeHarnessTests(unittest.TestCase):
         rejected_cases = (
             ("wrong extension", {"extension_id": "sdxl-base"}),
             ("wrong platform", {"platform_key": "linux-aarch64", "platform_system": "linux", "platform_machine": "aarch64"}),
+            ("wrong cuda", {"cuda_variant": "cu124"}),
+            ("wrong state", {"plan_state": dependencies.PLAN_STATE_VERIFIED, "platform_supported": True}),
+            ("empty steps", {"shared_steps": (), "family_steps": ()}),
+        )
+        for label, overrides in rejected_cases:
+            with self.subTest(label=label):
+                candidate = DependencyPlan(**{**valid_plan.__dict__, **overrides})
+                self.assertFalse(install_contract._candidate_install_allowed(candidate))
+
+    def test_install_contract_allows_only_exact_sdxl_windows_candidate_plan(self) -> None:
+        valid_plan = DependencyPlan(
+            extension_id="sdxl-base",
+            dependency_family="sdxl-base",
+            platform_system="windows",
+            platform_machine="amd64",
+            python_tag="cp312",
+            cuda_variant="cu128",
+            shared_steps=(DependencyInstallStep(name="install_shared_torch", packages=("torch==2.7.0",)),),
+            family_steps=(DependencyInstallStep(name="install_family_dependencies", packages=("diffusers==0.35.1",)),),
+            plan_state=dependencies.PLAN_STATE_CANDIDATE_INSTALL,
+            platform_key="windows-amd64",
+            platform_supported=False,
+        )
+
+        self.assertTrue(install_contract._candidate_install_allowed(valid_plan))
+
+        rejected_cases = (
+            ("wrong extension", {"extension_id": "flux-schnell", "dependency_family": "flux-schnell"}),
+            ("wrong family", {"dependency_family": "sd15"}),
+            ("wrong platform", {"platform_key": "linux-aarch64", "platform_system": "linux", "platform_machine": "aarch64"}),
+            ("wrong python", {"python_tag": "cp311"}),
             ("wrong cuda", {"cuda_variant": "cu124"}),
             ("wrong state", {"plan_state": dependencies.PLAN_STATE_VERIFIED, "platform_supported": True}),
             ("empty steps", {"shared_steps": (), "family_steps": ()}),
@@ -1070,7 +1146,7 @@ class RuntimeHarnessTests(unittest.TestCase):
         self.assertFalse(payload["reviewed"])
         self.assertIn("manual_checklist", payload)
 
-    def test_windows_dependency_plans_are_explicit_per_extension_without_install_steps(self) -> None:
+    def test_windows_dependency_plans_are_explicit_per_extension(self) -> None:
         observed_states: dict[str, str] = {}
         for extension_id in EXTENSION_IDS:
             descriptor = bootstrap.get_extension_descriptor(extension_id)
@@ -1081,7 +1157,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                 dependency_family=descriptor.dependency_family,
                 readiness_imports=descriptor.readiness_imports,
                 platform_info=WINDOWS_PLATFORM,
-                python_tag="cp311",
+                python_tag="cp312",
                 cuda_version="12.8",
             )
 
@@ -1089,7 +1165,7 @@ class RuntimeHarnessTests(unittest.TestCase):
             self.assertEqual(plan.platform_key, "windows-amd64")
             self.assertEqual(plan.plan_state, WINDOWS_PLAN_STATES[extension_id])
             self.assertFalse(plan.platform_supported)
-            if extension_id == "sd15":
+            if extension_id in {"sd15", "sdxl-base"}:
                 self.assertEqual(plan.shared_steps[0].packages, ("torch==2.7.0", "torchvision==0.22.0"))
                 self.assertEqual(plan.family_steps[0].packages[0], "diffusers==0.35.1")
             else:
@@ -1171,9 +1247,84 @@ class RuntimeHarnessTests(unittest.TestCase):
         self.assertEqual(record["dependency_plan_state"], dependencies.PLAN_STATE_CANDIDATE_INSTALL)
         self.assertFalse(record["platform_supported"])
 
+    def test_sdxl_windows_candidate_setup_attempts_fake_install_and_persists_failure(self) -> None:
+        runtime_root = self._make_runtime_root("sdxl-base")
+        self._make_windows_executable_python(runtime_root)
+        install_calls: list[str] = []
+
+        def fake_run_checked(*, command, step_name, cwd=None):
+            if step_name == "create_venv":
+                return None
+            if step_name == "upgrade_pip":
+                install_calls.append(step_name)
+                return None
+            raise AssertionError(f"unexpected command execution: {step_name}")
+
+        def fake_install_step(*, venv_python, install_step, cwd):
+            install_calls.append(install_step.name)
+            raise install_contract.SetupExecutionError(
+                step_name=install_step.name,
+                detail="fake pip failure for SDXL Windows candidate install",
+            )
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.dict(
+                    os.environ,
+                    {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)},
+                    clear=False,
+                )
+            )
+            stack.enter_context(patch("local_image_runtime.install_contract.detect_platform", return_value=WINDOWS_PLATFORM))
+            stack.enter_context(
+                patch(
+                    "local_image_runtime.install_contract.expected_venv_python",
+                    side_effect=lambda ext_dir: Path(ext_dir) / "venv" / "Scripts" / "python.exe",
+                )
+            )
+            stack.enter_context(patch("local_image_runtime.install_contract.python_tag_from_interpreter", return_value="cp312"))
+            stack.enter_context(patch("local_image_runtime.install_contract._run_checked", side_effect=fake_run_checked))
+            stack.enter_context(patch("local_image_runtime.install_contract._install_dependency_step", side_effect=fake_install_step))
+            hf_download = stack.enter_context(
+                patch(
+                    "local_image_runtime.weights.HuggingFaceSnapshotDownloader.snapshot_download",
+                    side_effect=AssertionError("unit tests must not download Hugging Face weights"),
+                )
+            )
+            smoke_imports = stack.enter_context(
+                patch(
+                    "local_image_runtime.bootstrap._smoke_test_runtime_imports",
+                    side_effect=AssertionError("failed setup must not run runtime import smoke tests"),
+                )
+            )
+
+            result = install_contract.run_install_setup_contract(
+                extension_id="sdxl-base",
+                stdin_text=self._windows_payload(runtime_root),
+            )
+
+        self.assertEqual(result.status, bootstrap.SETUP_STATUS_FAILED)
+        self.assertIn("upgrade_pip", install_calls)
+        self.assertIn("install_shared_torch", install_calls)
+        self.assertIn("fake pip failure for SDXL Windows candidate install", result.diagnostics)
+        diagnostics_text = " ".join(result.diagnostics + tuple(step.detail or "" for step in result.steps))
+        self.assertIn("candidate", diagnostics_text)
+        self.assertIn("not verified compatibility", diagnostics_text)
+        self.assertFalse(hf_download.called)
+        self.assertFalse(smoke_imports.called)
+
+        with patch.dict(os.environ, {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)}, clear=False):
+            snapshot = bootstrap.bootstrap_runtime(extension_id="sdxl-base")
+        record = bootstrap.get_extension_record(snapshot, "sdxl-base")
+        self.assertEqual(record["setup"]["status"], bootstrap.SETUP_STATUS_FAILED)
+        self.assertEqual(record["status"], bootstrap.EXTENSION_STATUS_ERROR)
+        self.assertEqual(record["setup_state"], dependencies.PLAN_STATE_CANDIDATE_INSTALL)
+        self.assertEqual(record["dependency_plan_state"], dependencies.PLAN_STATE_CANDIDATE_INSTALL)
+        self.assertFalse(record["platform_supported"])
+
     def test_windows_setup_fails_safely_without_dependency_install_attempt_for_blocked_targets(self) -> None:
         for extension_id in EXTENSION_IDS:
-            if extension_id == "sd15":
+            if extension_id in {"sd15", "sdxl-base"}:
                 continue
             with self.subTest(extension_id=extension_id):
                 runtime_root = self._make_runtime_root(extension_id)
