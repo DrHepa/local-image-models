@@ -997,6 +997,23 @@ class RuntimeHarnessTests(unittest.TestCase):
         self.assertIn("unverified", diagnostics_text)
         self.assertIn("not verified compatibility", diagnostics_text)
 
+    def test_sdxl_windows_candidate_matrix_reaches_executable_steps_for_runtime_python_tag(self) -> None:
+        plan = dependencies.resolve_dependency_plan(
+            extension_id="sdxl-base",
+            dependency_family="sdxl-base",
+            readiness_imports=("torch", "diffusers"),
+            platform_info=WINDOWS_PLATFORM,
+            python_tag="cp311",
+            cuda_version="12.8",
+        )
+
+        self.assertEqual(plan.plan_state, dependencies.PLAN_STATE_CANDIDATE_INSTALL)
+        self.assertTrue(install_contract._candidate_install_allowed(plan))
+        self.assertEqual(
+            [step.name for step in (*plan.shared_steps, *plan.family_steps)],
+            ["install_shared_torch", "install_shared_runtime", "install_family_dependencies"],
+        )
+
     def test_install_contract_allows_only_exact_sd15_windows_candidate_plan(self) -> None:
         valid_plan = DependencyPlan(
             extension_id="sd15",
@@ -1047,7 +1064,6 @@ class RuntimeHarnessTests(unittest.TestCase):
             ("wrong extension", {"extension_id": "flux-schnell", "dependency_family": "flux-schnell"}),
             ("wrong family", {"dependency_family": "sd15"}),
             ("wrong platform", {"platform_key": "linux-aarch64", "platform_system": "linux", "platform_machine": "aarch64"}),
-            ("wrong python", {"python_tag": "cp311"}),
             ("wrong cuda", {"cuda_variant": "cu124"}),
             ("wrong state", {"plan_state": dependencies.PLAN_STATE_VERIFIED, "platform_supported": True}),
             ("empty steps", {"shared_steps": (), "family_steps": ()}),

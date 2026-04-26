@@ -583,7 +583,6 @@ def resolve_dependency_plan(
             extension_id == "sdxl-base"
             and dependency_family == "sdxl-base"
             and platform_key == SD15_WINDOWS_PLATFORM_KEY
-            and python_tag == SD15_WINDOWS_PYTHON_TAG
             and windows_cuda_variant == SD15_WINDOWS_CUDA_VARIANT
         ):
             return _sdxl_windows_plan(
