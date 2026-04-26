@@ -25,11 +25,17 @@ The canonical shared code lives in `shared/runtime/local_image_runtime/` and is 
 
 ## Included model families
 
-| Extension ID | Visible name | Capabilities |
-| --- | --- | --- |
-| `sd15` | Stable Diffusion 1.5 | `text-to-image`, `image-to-image` |
-| `sdxl-base` | SDXL Base 1.0 | `text-to-image`, `image-to-image` |
-| `flux-schnell` | FLUX.1-schnell | `text-to-image` |
+| Extension ID | Visible name | Hugging Face model | Capabilities | Practical VRAM guidance |
+| --- | --- | --- | --- | --- |
+| `sd15` | Stable Diffusion 1.5 | [`runwayml/stable-diffusion-v1-5`](https://huggingface.co/runwayml/stable-diffusion-v1-5) | `text-to-image`, `image-to-image` | ~6GB+ recommended |
+| `sdxl-base` | SDXL Base 1.0 | [`stabilityai/stable-diffusion-xl-base-1.0`](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) | `text-to-image`, `image-to-image` | ~12GB+ recommended |
+| `flux-schnell` | FLUX.1-schnell | [`black-forest-labs/FLUX.1-schnell`](https://huggingface.co/black-forest-labs/FLUX.1-schnell) | `text-to-image` | ~16GB+ recommended; 24GB is more comfortable |
+
+These VRAM values are practical recommendations, not hard guarantees. Actual usage depends on resolution, precision, CPU/GPU offload, driver/runtime behavior, and memory optimizations available in the local environment.
+
+Current bundle support is functionally aligned for Linux ARM64 and Windows: SD15 and SDXL install, download weights, and generate successfully; FLUX.1-schnell installs, but its weight download depends on Hugging Face access for the exact model repository used by this extension.
+
+For FLUX.1-schnell weights, open [`https://huggingface.co/black-forest-labs/FLUX.1-schnell`](https://huggingface.co/black-forest-labs/FLUX.1-schnell), log in, accept the model conditions, and share contact information if Hugging Face requests it. Use the same Hugging Face account/token that Modly uses for the download; otherwise the extension cannot download the weights.
 
 The existing capability IDs remain unchanged by design:
 
@@ -173,7 +179,6 @@ Included here:
 Out of scope:
 
 - Modly core changes
-- real backend generation integration
 - model weight hosting or redistribution
 - build/release automation
 
@@ -185,4 +190,4 @@ Out of scope:
 4. Verify node-scoped weight readiness under `modelsDir`.
 5. Recheck the same baseline for `sd15`, `sdxl-base`, and `flux-schnell`.
 
-This repository remains scaffold-first: honest structure now, backend integration later.
+This repository remains source-first: it provides the extension bundle and runtime integration while leaving model weight hosting and redistribution to the upstream model providers.

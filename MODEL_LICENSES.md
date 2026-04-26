@@ -12,11 +12,11 @@ You must obtain, access, and use those model files according to the original ups
 
 ## Referenced models
 
-| Model | Upstream identifier | Upstream license / terms | Notes |
-| --- | --- | --- | --- |
-| Stable Diffusion 1.5 | `runwayml/stable-diffusion-v1-5` | `creativeml-openrail-m` | Weights are NOT included here. Use remains subject to the CreativeML Open RAIL-M terms. |
-| SDXL Base 1.0 | `stabilityai/stable-diffusion-xl-base-1.0` | `openrail++` / CreativeML Open RAIL++-M | Weights are NOT included here. Use remains subject to the SDXL upstream terms. |
-| FLUX.1-schnell | `black-forest-labs/FLUX.1-schnell` | `apache-2.0` | Access to model files/model card on Hugging Face requires accepting upstream conditions and sharing contact information. Weights are NOT included here. |
+| Model | Upstream identifier | Hugging Face page | Upstream license / terms | Notes |
+| --- | --- | --- | --- | --- |
+| Stable Diffusion 1.5 | `runwayml/stable-diffusion-v1-5` | [`runwayml/stable-diffusion-v1-5`](https://huggingface.co/runwayml/stable-diffusion-v1-5) | `creativeml-openrail-m` | Weights are NOT included here. Use remains subject to the CreativeML Open RAIL-M terms. |
+| SDXL Base 1.0 | `stabilityai/stable-diffusion-xl-base-1.0` | [`stabilityai/stable-diffusion-xl-base-1.0`](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) | `openrail++` / CreativeML Open RAIL++-M | Weights are NOT included here. Use remains subject to the SDXL upstream terms. |
+| FLUX.1-schnell | `black-forest-labs/FLUX.1-schnell` | [`black-forest-labs/FLUX.1-schnell`](https://huggingface.co/black-forest-labs/FLUX.1-schnell) | `apache-2.0` | Access to model files/model card on Hugging Face can require accepting upstream conditions and sharing contact information with the same Hugging Face account/token used for download. Weights are NOT included here. |
 
 ## What this means in practice
 
