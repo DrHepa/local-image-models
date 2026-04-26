@@ -16,6 +16,12 @@ MODELS_DIR_ENV_VARS = (
 
 FLUX_SCHNELL_EXTENSION_ID = "flux-schnell"
 FLUX_SCHNELL_TEXT_TO_IMAGE_NODE_ID = "text-to-image"
+FLUX_SCHNELL_HF_URL = "https://huggingface.co/black-forest-labs/FLUX.1-schnell"
+FLUX_SCHNELL_HF_GATED_GUIDANCE = (
+    f"Visit {FLUX_SCHNELL_HF_URL}, log in with the same Hugging Face account/token used by "
+    "Modly, accept the model conditions and share contact information if requested, then "
+    "retry the download in Modly."
+)
 
 
 class SnapshotDownloader(Protocol):
@@ -136,12 +142,52 @@ def _is_network_exception(exc: Exception) -> bool:
     )
 
 
+def _exception_search_text(exc: Exception) -> str:
+    values = [str(exc), type(exc).__name__]
+    response = getattr(exc, "response", None)
+    if response is not None:
+        values.extend(
+            str(value)
+            for value in (
+                getattr(response, "text", ""),
+                getattr(response, "reason", ""),
+                getattr(response, "url", ""),
+                response,
+            )
+            if value
+        )
+    return " ".join(values).casefold()
+
+
+def _is_likely_flux_hf_gated_access_error(exc: Exception) -> bool:
+    if isinstance(exc, PermissionError) or _http_status_code(exc) in {401, 403}:
+        return True
+
+    text = _exception_search_text(exc)
+    gated_markers = (
+        "gated",
+        "access denied",
+        "unauthorized",
+        "terms",
+        "token",
+        "contact information",
+        "repo not found",
+        "repository not found",
+    )
+    return any(marker in text for marker in gated_markers)
+
+
+def _with_flux_hf_gated_guidance(base_message: str) -> str:
+    return f"{base_message} {FLUX_SCHNELL_HF_GATED_GUIDANCE}"
+
+
 def _map_flux_download_exception(exc: Exception, *, target_dir: Path) -> FluxWeightDownloadError:
-    status_code = _http_status_code(exc)
-    if isinstance(exc, PermissionError) or status_code in {401, 403}:
+    if _is_likely_flux_hf_gated_access_error(exc):
         return FluxWeightAuthError(
-            "Flux Schnell weight download failed because Hugging Face authentication or gated "
-            "model access was denied. Configure an authorized Hugging Face token and retry."
+            _with_flux_hf_gated_guidance(
+                "Flux Schnell weight download failed because Hugging Face authentication or gated "
+                "model access was denied."
+            )
         )
 
     if isinstance(exc, OSError) and getattr(exc, "errno", None) in {

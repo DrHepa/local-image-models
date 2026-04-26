@@ -4743,6 +4743,139 @@ class RuntimeHarnessTests(unittest.TestCase):
 
                 self.assertIn(expected_message, str(raised.exception).lower())
 
+    def test_flux_weight_acquisition_http_auth_failures_include_hf_gated_guidance(self) -> None:
+        class StatusError(RuntimeError):
+            def __init__(
+                self,
+                message: str,
+                *,
+                status_code: int | None = None,
+                response_status: int | None = None,
+            ) -> None:
+                super().__init__(message)
+                if status_code is not None:
+                    self.status_code = status_code
+                if response_status is not None:
+                    self.response = SimpleNamespace(status_code=response_status)
+
+        class FailingDownloader:
+            def __init__(self, exc: Exception) -> None:
+                self.exc = exc
+
+            def snapshot_download(self, *, repo_id: str, local_dir: Path) -> Path:
+                raise self.exc
+
+        cases = (
+            StatusError("Unauthorized", response_status=401),
+            StatusError("Forbidden", status_code=403),
+        )
+
+        for exc in cases:
+            with self.subTest(exc=str(exc)), tempfile.TemporaryDirectory(prefix="flux-models-") as temp_dir:
+                with self.assertRaises(weights.FluxWeightAuthError) as raised:
+                    weights.acquire_flux_schnell_weights(
+                        models_dir=Path(temp_dir),
+                        downloader=FailingDownloader(exc),
+                    )
+
+                message = str(raised.exception)
+                self.assertIn("https://huggingface.co/black-forest-labs/FLUX.1-schnell", message)
+                self.assertIn("same Hugging Face account/token used by Modly", message)
+                self.assertIn("accept the model conditions", message)
+                self.assertIn("share contact information if requested", message)
+                self.assertIn("retry the download", message)
+
+    def test_flux_weight_acquisition_auth_text_failures_include_hf_gated_guidance(self) -> None:
+        class FailingDownloader:
+            def __init__(self, exc: Exception) -> None:
+                self.exc = exc
+
+            def snapshot_download(self, *, repo_id: str, local_dir: Path) -> Path:
+                raise self.exc
+
+        cases = (
+            RuntimeError("gated repo requires approval"),
+            RuntimeError("access denied for this model"),
+            RuntimeError("unauthorized request"),
+            RuntimeError("accept terms before download"),
+            RuntimeError("token does not have permission"),
+            RuntimeError("contact information must be shared"),
+            RuntimeError("repository not found for this authenticated user"),
+            PermissionError("repo not found for token"),
+        )
+
+        for exc in cases:
+            with self.subTest(exc=str(exc)), tempfile.TemporaryDirectory(prefix="flux-models-") as temp_dir:
+                with self.assertRaises(weights.FluxWeightAuthError) as raised:
+                    weights.acquire_flux_schnell_weights(
+                        models_dir=Path(temp_dir),
+                        downloader=FailingDownloader(exc),
+                    )
+
+                message = str(raised.exception)
+                self.assertIn("https://huggingface.co/black-forest-labs/FLUX.1-schnell", message)
+                self.assertIn("same Hugging Face account/token used by Modly", message)
+                self.assertIn("accept the model conditions", message)
+                self.assertIn("share contact information if requested", message)
+                self.assertIn("retry the download", message)
+
+    def test_flux_weight_acquisition_generic_failures_do_not_include_hf_gated_guidance(self) -> None:
+        class FailingDownloader:
+            def __init__(self, exc: Exception) -> None:
+                self.exc = exc
+
+            def snapshot_download(self, *, repo_id: str, local_dir: Path) -> Path:
+                raise self.exc
+
+        cases = (
+            RuntimeError("checksum mismatch for downloaded artifact"),
+            RuntimeError("disk full while expanding archive"),
+        )
+
+        for exc in cases:
+            with self.subTest(exc=str(exc)), tempfile.TemporaryDirectory(prefix="flux-models-") as temp_dir:
+                with self.assertRaises(weights.FluxWeightDownloadError) as raised:
+                    weights.acquire_flux_schnell_weights(
+                        models_dir=Path(temp_dir),
+                        downloader=FailingDownloader(exc),
+                    )
+
+                message = str(raised.exception)
+                self.assertIn(f"Flux Schnell weight download failed: {exc}", message)
+                self.assertNotIn("https://huggingface.co/black-forest-labs/FLUX.1-schnell", message)
+                self.assertNotIn("same Hugging Face account/token used by Modly", message)
+
+    def test_sd_weight_readiness_diagnostics_do_not_include_flux_hf_gated_guidance(self) -> None:
+        for extension_id in ("sd15", "sdxl-base"):
+            with self.subTest(extension_id=extension_id), tempfile.TemporaryDirectory(
+                prefix=f"{extension_id}-models-"
+            ) as temp_dir:
+                readiness = weights.evaluate_extension_weights(extension_id, models_dir=Path(temp_dir))
+
+                diagnostics = "\n".join(readiness["diagnostics"])
+                self.assertIn(extension_id, diagnostics)
+                self.assertNotIn("https://huggingface.co/black-forest-labs/FLUX.1-schnell", diagnostics)
+                self.assertNotIn("same Hugging Face account/token used by Modly", diagnostics)
+
+    def test_flux_weight_acquisition_success_does_not_emit_hf_gated_guidance(self) -> None:
+        class SuccessfulDownloader:
+            def snapshot_download(self, *, repo_id: str, local_dir: Path) -> Path:
+                local_dir.mkdir(parents=True, exist_ok=True)
+                (local_dir / "model_index.json").write_text("{}\n", encoding="utf-8")
+                return local_dir
+
+        with tempfile.TemporaryDirectory(prefix="flux-models-") as temp_dir:
+            result = weights.acquire_flux_schnell_weights(
+                models_dir=Path(temp_dir),
+                downloader=SuccessfulDownloader(),
+            )
+
+        result_text = json.dumps(result, sort_keys=True)
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(result["downloaded"])
+        self.assertNotIn("https://huggingface.co/black-forest-labs/FLUX.1-schnell", result_text)
+        self.assertNotIn("same Hugging Face account/token used by Modly", result_text)
+
     def test_flux_weight_acquisition_rejects_partial_download_without_check_file(self) -> None:
         class PartialDownloader:
             def snapshot_download(self, *, repo_id: str, local_dir: Path) -> Path:
