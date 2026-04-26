@@ -205,9 +205,12 @@ def _candidate_install_allowed(plan: DependencyPlan) -> bool:
     allowed_candidate_targets = {
         ("sd15", "sd15"),
         ("sdxl-base", "sdxl-base"),
+        ("flux-schnell", "flux-schnell"),
     }
+    python_tag_allowed = plan.extension_id != "flux-schnell" or plan.python_tag == "cp312"
     return (
         (plan.extension_id, plan.dependency_family) in allowed_candidate_targets
+        and python_tag_allowed
         and plan.platform_key == "windows-amd64"
         and plan.platform_system == "windows"
         and plan.platform_machine == "amd64"

@@ -26,7 +26,7 @@ SD15_WINDOWS_MODEL_REPO = "runwayml/stable-diffusion-v1-5"
 _WINDOWS_PLAN_STATES = {
     "sd15": PLAN_STATE_CANDIDATE_INSTALL,
     "sdxl-base": PLAN_STATE_CANDIDATE_INSTALL,
-    "flux-schnell": PLAN_STATE_UNSUPPORTED,
+    "flux-schnell": PLAN_STATE_CANDIDATE_INSTALL,
 }
 _PYPI_INDEX_URL = "https://pypi.org/simple"
 _TORCH_EXTRA_INDEX_URLS = {
@@ -176,6 +176,14 @@ def _windows_diagnostic(*, extension_id: str, plan_state: str) -> str:
                 "unverified dependency installation is enabled only for windows-amd64, Python cp312, "
                 "and CUDA cu128 to gather real pip, import, model-load, text-to-image, and Preview Image "
                 "evidence. This is not verified compatibility or runtime readiness."
+            )
+        if extension_id == "flux-schnell":
+            return (
+                "Flux Windows dependency setup for 'flux-schnell' is candidate_install: first-pass, "
+                "unverified dependency installation is enabled only for windows-amd64, Python cp312, "
+                "and CUDA cu128 to gather real pip and import evidence before any model/runtime smoke. "
+                "This is not verified compatibility or runtime readiness, and it does not solve "
+                "Hugging Face model access, token, terms acceptance, or VRAM risks."
             )
         return (
             f"Windows dependency setup for '{extension_id}' is candidate_install: first-pass, "
@@ -373,6 +381,29 @@ def _sdxl_windows_plan(
         platform_key=SD15_WINDOWS_PLATFORM_KEY,
         platform_supported=False,
         diagnostics=(_windows_diagnostic(extension_id="sdxl-base", plan_state=PLAN_STATE_CANDIDATE_INSTALL),),
+    )
+
+
+def _flux_windows_plan(
+    *,
+    readiness_imports: Iterable[str],
+    machine: str,
+    python_tag: str,
+) -> DependencyPlan:
+    return DependencyPlan(
+        extension_id="flux-schnell",
+        dependency_family="flux-schnell",
+        platform_system="windows",
+        platform_machine="amd64" if machine in WINDOWS_AMD64_MACHINES else machine,
+        python_tag=python_tag,
+        cuda_variant=SD15_WINDOWS_CUDA_VARIANT,
+        shared_steps=_sd15_windows_candidate_shared_steps(),
+        family_steps=_family_steps("flux-schnell"),
+        readiness_imports=tuple(module for module in readiness_imports if isinstance(module, str) and module.strip()),
+        plan_state=PLAN_STATE_CANDIDATE_INSTALL,
+        platform_key=SD15_WINDOWS_PLATFORM_KEY,
+        platform_supported=False,
+        diagnostics=(_windows_diagnostic(extension_id="flux-schnell", plan_state=PLAN_STATE_CANDIDATE_INSTALL),),
     )
 
 
@@ -586,6 +617,18 @@ def resolve_dependency_plan(
             and windows_cuda_variant == SD15_WINDOWS_CUDA_VARIANT
         ):
             return _sdxl_windows_plan(
+                readiness_imports=readiness_imports,
+                machine=machine,
+                python_tag=python_tag,
+            )
+        if (
+            extension_id == "flux-schnell"
+            and dependency_family == "flux-schnell"
+            and platform_key == SD15_WINDOWS_PLATFORM_KEY
+            and python_tag == SD15_WINDOWS_PYTHON_TAG
+            and windows_cuda_variant == SD15_WINDOWS_CUDA_VARIANT
+        ):
+            return _flux_windows_plan(
                 readiness_imports=readiness_imports,
                 machine=machine,
                 python_tag=python_tag,
