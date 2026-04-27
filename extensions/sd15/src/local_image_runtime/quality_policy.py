@@ -66,6 +66,22 @@ _QUALITY_POLICY: dict[str, dict[str, dict[str, dict[str, Any]]]] = {
             },
         },
     },
+    "flux-schnell": {
+        "text-to-image": {
+            "defaults": {
+                "width": 1024,
+                "height": 1024,
+                "steps": 4,
+                "guidance_scale": 0.0,
+                "max_sequence_length": 256,
+            },
+            "help": {
+                "prompt": "Prompt text for FLUX Schnell text-to-image generation.",
+                "guidance_scale": "FLUX Schnell uses guidance 0.0; non-zero guidance requires true CFG support.",
+                "max_sequence_length": "Maximum FLUX text token sequence length passed to Diffusers.",
+            },
+        },
+    },
 }
 
 

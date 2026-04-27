@@ -29,13 +29,6 @@
           "tooltip": "Prompt text for FLUX Schnell text-to-image generation."
         },
         {
-          "id": "negative_prompt",
-          "label": "Negative Prompt",
-          "type": "string",
-          "default": "",
-          "tooltip": "Optional prompt describing what to avoid."
-        },
-        {
           "id": "width",
           "label": "Width",
           "type": "int",
@@ -57,7 +50,7 @@
           "type": "int",
           "default": 4,
           "min": 1,
-          "max": 150
+          "max": 4
         },
         {
           "id": "guidance_scale",
@@ -65,8 +58,17 @@
           "type": "float",
           "default": 0,
           "min": 0,
-          "max": 50,
-          "tooltip": "Reserved for backend compatibility; scaffold defaults to 0.0."
+          "max": 0,
+          "tooltip": "FLUX Schnell uses guidance 0.0; non-zero guidance requires true CFG support."
+        },
+        {
+          "id": "max_sequence_length",
+          "label": "Max Sequence Length",
+          "type": "int",
+          "default": 256,
+          "min": 1,
+          "max": 256,
+          "tooltip": "Maximum FLUX text token sequence length passed to Diffusers."
         },
         {
           "id": "seed",

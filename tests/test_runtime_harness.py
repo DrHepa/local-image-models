@@ -1691,7 +1691,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                         "steps": 4,
                         "width": 512,
                         "height": 512,
-                        "guidance_scale": 7.5,
+                        "guidance_scale": 0.0 if expected_family == "flux" else 7.5,
                         "seed": 42,
                     },
                 }
@@ -1725,7 +1725,10 @@ class RuntimeHarnessTests(unittest.TestCase):
                 self.assertEqual(exit_code, 0)
                 self.assertEqual(len(invocations), 1)
                 self.assertEqual(invocations[0]["marker"], expected_marker)
-                self.assertEqual(invocations[0]["kwargs"]["negative_prompt"], payload["params"]["negative_prompt"])
+                if expected_family == "flux":
+                    self.assertNotIn("negative_prompt", invocations[0]["kwargs"])
+                else:
+                    self.assertEqual(invocations[0]["kwargs"]["negative_prompt"], payload["params"]["negative_prompt"])
                 self.assertTrue(Path(done_event["result"]["output_path"]).exists())
                 self.assertTrue(str(done_event["result"]["output_path"]).startswith(str(outputs_dir)))
                 self.assertEqual(
@@ -1734,7 +1737,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                         "family": expected_family,
                         "node_id": "text-to-image",
                         "seed": 42,
-                        "negative_prompt_used": True,
+                        "negative_prompt_used": expected_family != "flux",
                         "source_image_used": False,
                     },
                 )
@@ -1841,7 +1844,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                         "steps": 4,
                         "width": 512,
                         "height": 512,
-                        "guidance_scale": 7.5,
+                        "guidance_scale": 0.0 if expected_family == "flux" else 7.5,
                         "seed": 42,
                     },
                 }
@@ -1870,7 +1873,10 @@ class RuntimeHarnessTests(unittest.TestCase):
 
                 self.assertEqual(result_payload["extension_id"], extension_id)
                 self.assertEqual(len(invocations), 1)
-                self.assertEqual(invocations[0]["kwargs"]["negative_prompt"], payload["params"]["negative_prompt"])
+                if expected_family == "flux":
+                    self.assertNotIn("negative_prompt", invocations[0]["kwargs"])
+                else:
+                    self.assertEqual(invocations[0]["kwargs"]["negative_prompt"], payload["params"]["negative_prompt"])
                 self.assertTrue(Path(result_payload["result"]["output_path"]).exists())
                 self.assertTrue(str(result_payload["result"]["output_path"]).startswith(str(outputs_dir)))
                 self.assertEqual(
@@ -1879,7 +1885,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                         "family": expected_family,
                         "node_id": "text-to-image",
                         "seed": 42,
-                        "negative_prompt_used": True,
+                        "negative_prompt_used": expected_family != "flux",
                         "source_image_used": False,
                     },
                 )
@@ -2061,7 +2067,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                     "steps": 4,
                     "width": 512,
                     "height": 512,
-                    "guidance_scale": 7.5,
+                    "guidance_scale": 0.0 if expected_family == "flux" else 7.5,
                     "seed": 42,
                     "input": {"text": f"legacy generator text {extension_id}"},
                 }
@@ -2090,7 +2096,10 @@ class RuntimeHarnessTests(unittest.TestCase):
 
                 self.assertEqual(len(invocations), 1)
                 self.assertEqual(invocations[0]["kwargs"]["prompt"], params["prompt"])
-                self.assertEqual(invocations[0]["kwargs"]["negative_prompt"], params["negative_prompt"])
+                if expected_family == "flux":
+                    self.assertNotIn("negative_prompt", invocations[0]["kwargs"])
+                else:
+                    self.assertEqual(invocations[0]["kwargs"]["negative_prompt"], params["negative_prompt"])
                 self.assertFalse((outputs_dir / ".modly-inputs").exists())
                 self.assertTrue(actual_path.exists())
                 self.assertTrue(str(actual_path).startswith(str(outputs_dir)))
@@ -2483,7 +2492,213 @@ class RuntimeHarnessTests(unittest.TestCase):
             node_id="text-to-image",
             params={"steps": 4},
         )
-        self.assertEqual(flux_passthrough, {"steps": 4})
+        self.assertEqual(
+            flux_passthrough,
+            {
+                "width": 1024,
+                "height": 1024,
+                "steps": 4,
+                "guidance_scale": 0.0,
+                "max_sequence_length": 256,
+            },
+        )
+
+    def test_flux_text_to_image_missing_params_resolve_runtime_defaults(self) -> None:
+        import local_image_runtime.quality_policy as quality_policy
+
+        resolved = quality_policy.resolve_effective_params(
+            extension_id="flux-schnell",
+            node_id="text-to-image",
+            params={},
+        )
+
+        self.assertEqual(
+            resolved,
+            {
+                "width": 1024,
+                "height": 1024,
+                "steps": 4,
+                "guidance_scale": 0.0,
+                "max_sequence_length": 256,
+            },
+        )
+
+    def test_flux_max_sequence_length_validates_and_reaches_runner_kwargs(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        request = pipeline.ExecutionRequest(
+            node_id="text-to-image",
+            input={"text": "flux prompt"},
+            params={
+                "prompt": "flux prompt",
+                "width": 1024,
+                "height": 1024,
+                "steps": 4,
+                "guidance_scale": 0.0,
+                "max_sequence_length": 128,
+            },
+        )
+
+        validated = pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="flux-schnell")
+        self.assertEqual(validated.numeric_params["max_sequence_length"], 128)
+
+        kwargs = inference_runner._build_pipeline_kwargs(
+            {
+                "family": "flux",
+                "node_id": "text-to-image",
+                "prompt": "flux prompt",
+                "source_image_path": None,
+                "params": validated.numeric_params,
+            },
+            execution_device="cpu",
+        )
+        self.assertEqual(kwargs["max_sequence_length"], 128)
+
+    def test_flux_max_sequence_length_invalid_values_are_rejected_before_inference(self) -> None:
+        cases = (0, 257, 128.5, "128")
+
+        for value in cases:
+            with self.subTest(max_sequence_length=value):
+                request = pipeline.ExecutionRequest(
+                    node_id="text-to-image",
+                    input={"text": "flux prompt"},
+                    params={
+                        "prompt": "flux prompt",
+                        "width": 1024,
+                        "height": 1024,
+                        "steps": 4,
+                        "guidance_scale": 0.0,
+                        "max_sequence_length": value,
+                    },
+                )
+
+                with self.assertRaises(pipeline.RequestValidationError):
+                    pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="flux-schnell")
+
+    def test_flux_steps_outside_one_to_four_are_rejected_before_inference(self) -> None:
+        for value in (0, 5):
+            with self.subTest(steps=value):
+                request = pipeline.ExecutionRequest(
+                    node_id="text-to-image",
+                    input={"text": "flux prompt"},
+                    params={
+                        "prompt": "flux prompt",
+                        "width": 1024,
+                        "height": 1024,
+                        "steps": value,
+                        "guidance_scale": 0.0,
+                        "max_sequence_length": 128,
+                    },
+                )
+
+                with self.assertRaises(pipeline.RequestValidationError):
+                    pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="flux-schnell")
+
+    def test_flux_non_zero_guidance_scale_is_rejected_before_inference(self) -> None:
+        for value in (0.1, 1.0):
+            with self.subTest(guidance_scale=value):
+                request = pipeline.ExecutionRequest(
+                    node_id="text-to-image",
+                    input={"text": "flux prompt"},
+                    params={
+                        "prompt": "flux prompt",
+                        "width": 1024,
+                        "height": 1024,
+                        "steps": 4,
+                        "guidance_scale": value,
+                        "max_sequence_length": 128,
+                    },
+                )
+
+                with self.assertRaises(pipeline.RequestValidationError):
+                    pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="flux-schnell")
+
+    def test_flux_negative_prompt_is_omitted_from_backend_payload_and_runner_kwargs(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="flux-negative-suppression-"))
+        extension_root = Path(tempfile.mkdtemp(prefix="ext-root-flux-negative-"))
+        (extension_root / "src").mkdir(parents=True, exist_ok=True)
+        venv_python = self._make_executable_python(extension_root)
+        request = pipeline.ExecutionRequest(
+            node_id="text-to-image",
+            input={"text": "flux prompt"},
+            params={
+                "prompt": "flux prompt",
+                "negative_prompt": "avoid this",
+                "width": 1024,
+                "height": 1024,
+                "steps": 4,
+                "guidance_scale": 0.0,
+                "max_sequence_length": 128,
+            },
+            workspace_dir=str(workspace_dir),
+        )
+        payload_details = pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="flux-schnell")
+
+        job = pipeline._build_backend_job(
+            request=request,
+            extension_id="flux-schnell",
+            extension_record={"venv_python": str(venv_python), "model_dir": "/runtime/local/flux"},
+            payload_details=payload_details,
+            effective_workspace_dir=str(workspace_dir),
+        )
+
+        self.assertNotIn("negative_prompt", job.payload)
+        self.assertNotIn("negative_prompt", job.payload["params"])
+        kwargs = inference_runner._build_pipeline_kwargs(job.payload, execution_device="cpu")
+        self.assertNotIn("negative_prompt", kwargs)
+
+    def test_sd_families_keep_negative_prompt_guidance_steps_and_exclude_flux_sequence_length(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        cases = (
+            ("stable-diffusion", "sd negative", 7.5, 30),
+            ("sdxl", "sdxl negative", 5.0, 28),
+        )
+
+        for family, negative_prompt, guidance_scale, steps in cases:
+            with self.subTest(family=family):
+                kwargs = inference_runner._build_pipeline_kwargs(
+                    {
+                        "family": family,
+                        "node_id": "text-to-image",
+                        "prompt": f"{family} prompt",
+                        "negative_prompt": negative_prompt,
+                        "source_image_path": None,
+                        "params": {
+                            "steps": steps,
+                            "guidance_scale": guidance_scale,
+                            "width": 512,
+                            "height": 512,
+                            "max_sequence_length": 128,
+                        },
+                    },
+                    execution_device="cpu",
+                )
+
+                self.assertEqual(kwargs["negative_prompt"], negative_prompt)
+                self.assertEqual(kwargs["guidance_scale"], guidance_scale)
+                self.assertEqual(kwargs["num_inference_steps"], steps)
+                self.assertNotIn("max_sequence_length", kwargs)
+
+    def test_flux_manifest_exposes_sequence_length_and_hides_negative_prompt(self) -> None:
+        schema = self._extension_manifest_data("flux-schnell")["nodes"][0]["params_schema"]
+        params_by_id = {param["id"]: param for param in schema}
+
+        self.assertNotIn("negative_prompt", params_by_id)
+        self.assertEqual(
+            params_by_id["max_sequence_length"],
+            {
+                "id": "max_sequence_length",
+                "label": "Max Sequence Length",
+                "type": "int",
+                "default": 256,
+                "min": 1,
+                "max": 256,
+                "tooltip": "Maximum FLUX text token sequence length passed to Diffusers.",
+            },
+        )
 
     def test_pipeline_execute_applies_quality_policy_defaults_to_backend_payload(self) -> None:
         cases = (
@@ -4282,7 +4497,10 @@ class RuntimeHarnessTests(unittest.TestCase):
                 self.assertEqual(len(fake_pipeline.calls), 1)
                 invocation = fake_pipeline.calls[0]
                 self.assertEqual(invocation["prompt"], "test prompt")
-                self.assertEqual(invocation["negative_prompt"], "avoid blur")
+                if case["family"] == "flux":
+                    self.assertNotIn("negative_prompt", invocation)
+                else:
+                    self.assertEqual(invocation["negative_prompt"], "avoid blur")
                 self.assertEqual(invocation["num_inference_steps"], 4)
                 self.assertEqual(invocation["width"], 512)
                 self.assertEqual(invocation["height"], 512)
@@ -4306,7 +4524,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                             "family": case["family"],
                             "node_id": case["node_id"],
                             "seed": 42,
-                            "negative_prompt_used": True,
+                            "negative_prompt_used": case["family"] != "flux",
                             "source_image_used": case["source_image_path"] is not None,
                         },
                     },
@@ -4524,7 +4742,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                     "family": "flux",
                     "node_id": "text-to-image",
                     "seed": 7,
-                    "negative_prompt_used": True,
+                    "negative_prompt_used": False,
                     "source_image_used": False,
                 },
             },

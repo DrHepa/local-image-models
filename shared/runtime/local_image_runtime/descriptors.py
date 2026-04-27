@@ -165,18 +165,10 @@ EXTENSION_DESCRIPTORS = (
             "vae",
         ),
         node_defaults={
-            "text-to-image": {
-                "width": 1024,
-                "height": 1024,
-                "steps": 4,
-                "guidance_scale": 0.0,
-            },
+            "text-to-image": get_node_defaults("flux-schnell", "text-to-image"),
         },
         node_help={
-            "text-to-image": {
-                "prompt": "Prompt text for FLUX Schnell text-to-image generation.",
-                "guidance_scale": "Reserved for backend compatibility; scaffold defaults to 0.0.",
-            },
+            "text-to-image": get_node_help("flux-schnell", "text-to-image"),
         },
         node_weight_specs={
             "text-to-image": {

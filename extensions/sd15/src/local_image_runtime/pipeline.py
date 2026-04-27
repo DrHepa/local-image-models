@@ -113,6 +113,13 @@ def _validate_numeric_param(
     return numeric_value
 
 
+def _is_flux_text_to_image(extension_id: str | None, node_id: str) -> bool:
+    if extension_id is None:
+        return False
+    descriptor = get_extension_descriptor(extension_id)
+    return descriptor is not None and descriptor.family == "flux" and node_id == "text-to-image"
+
+
 def _require_supported_node(extension_id: str, node_id: str) -> None:
     descriptor = get_extension_descriptor(extension_id)
     if descriptor is None:
@@ -156,18 +163,41 @@ def _validate_text_prompt(value: Any, *, field_name: str) -> str:
 
 
 def _validate_node_payload(
-    request: ExecutionRequest, legacy_model_id: str | None
+    request: ExecutionRequest, legacy_model_id: str | None, extension_id: str | None = None
 ) -> ValidatedPayload:
+    flux_text_to_image = _is_flux_text_to_image(extension_id, request.node_id)
+    numeric_validators: dict[str, int | float | None] = {
+        "steps": _validate_numeric_param(
+            request.params,
+            "steps",
+            expected_type=int,
+            minimum=1,
+            maximum=4 if flux_text_to_image else 150,
+        ),
+        "width": _validate_numeric_param(request.params, "width", expected_type=int, minimum=64, maximum=2048),
+        "height": _validate_numeric_param(request.params, "height", expected_type=int, minimum=64, maximum=2048),
+        "strength": _validate_numeric_param(request.params, "strength", expected_type=float, minimum=0.0, maximum=1.0),
+        "guidance_scale": _validate_numeric_param(
+            request.params,
+            "guidance_scale",
+            expected_type=float,
+            minimum=0.0,
+            maximum=0.0 if flux_text_to_image else 50.0,
+        ),
+        "seed": _validate_numeric_param(request.params, "seed", expected_type=int, minimum=0),
+    }
+    if flux_text_to_image:
+        numeric_validators["max_sequence_length"] = _validate_numeric_param(
+            request.params,
+            "max_sequence_length",
+            expected_type=int,
+            minimum=1,
+            maximum=256,
+        )
+
     numeric_params = {
         name: value
-        for name, value in {
-            "steps": _validate_numeric_param(request.params, "steps", expected_type=int, minimum=1, maximum=150),
-            "width": _validate_numeric_param(request.params, "width", expected_type=int, minimum=64, maximum=2048),
-            "height": _validate_numeric_param(request.params, "height", expected_type=int, minimum=64, maximum=2048),
-            "strength": _validate_numeric_param(request.params, "strength", expected_type=float, minimum=0.0, maximum=1.0),
-            "guidance_scale": _validate_numeric_param(request.params, "guidance_scale", expected_type=float, minimum=0.0, maximum=50.0),
-            "seed": _validate_numeric_param(request.params, "seed", expected_type=int, minimum=0),
-        }.items()
+        for name, value in numeric_validators.items()
         if value is not None
     }
 
@@ -317,7 +347,14 @@ def _build_backend_job(
         f"generated-{extension_id}-{request.node_id}-{uuid4().hex}.png"
     )
     params = dict(request.params)
-    params.pop("negative_prompt", None)
+    if descriptor.family == "flux":
+        params.pop("negative_prompt", None)
+        negative_prompt = None
+    else:
+        params.pop("negative_prompt", None)
+        negative_prompt = _validate_optional_text_param(
+            request.params.get("negative_prompt"), field_name="negative_prompt"
+        )
 
     payload = {
         "extension_id": extension_id,
@@ -327,12 +364,11 @@ def _build_backend_job(
         "workspace_dir": str(workspace_dir),
         "output_path": str(output_path),
         "prompt": payload_details.prompt,
-        "negative_prompt": _validate_optional_text_param(
-            request.params.get("negative_prompt"), field_name="negative_prompt"
-        ),
         "source_image_path": payload_details.source_image_path,
         "params": params,
     }
+    if descriptor.family != "flux":
+        payload["negative_prompt"] = negative_prompt
     venv_python = _require_executable_venv_python(extension_record, extension_id=extension_id)
     runtime_src_dir = _derive_runtime_src_dir(venv_python=venv_python, extension_id=extension_id)
     return BackendJob(
@@ -719,7 +755,7 @@ def execute(
         temp_dir=request.temp_dir,
         model_dir_override=request.model_dir_override,
     )
-    payload_details = _validate_node_payload(effective_request, legacy_model_id)
+    payload_details = _validate_node_payload(effective_request, legacy_model_id, extension_id=extension_id)
     emit_log(
         f"Validated node '{request.node_id}' for extension '{extension_id}'"
         + (

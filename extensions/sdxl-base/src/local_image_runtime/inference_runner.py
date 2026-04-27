@@ -197,8 +197,9 @@ def _build_pipeline_kwargs(job: dict[str, Any], *, execution_device: str) -> dic
     if not isinstance(params, dict):
         raise InferenceRunnerError("Inference runner job field 'params' must be an object.")
 
+    family = _require_string_field(job, "family")
     kwargs: dict[str, Any] = {"prompt": job.get("prompt")}
-    if "negative_prompt" in job:
+    if family != "flux" and "negative_prompt" in job:
         kwargs["negative_prompt"] = job.get("negative_prompt")
 
     numeric_fields = {
@@ -210,6 +211,8 @@ def _build_pipeline_kwargs(job: dict[str, Any], *, execution_device: str) -> dic
     for source_name, target_name in numeric_fields.items():
         if source_name in params:
             kwargs[target_name] = params[source_name]
+    if family == "flux" and "max_sequence_length" in params:
+        kwargs["max_sequence_length"] = params["max_sequence_length"]
 
     generator = _seeded_generator(params, execution_device=execution_device)
     if generator is not None:
@@ -324,7 +327,7 @@ def run_child_job(job: dict[str, Any], *, stdout: TextIO | None = None) -> dict[
             "family": family,
             "node_id": node_id,
             "seed": params.get("seed"),
-            "negative_prompt_used": bool(job.get("negative_prompt")),
+            "negative_prompt_used": family != "flux" and bool(job.get("negative_prompt")),
             "source_image_used": job.get("source_image_path") is not None,
         },
     }
