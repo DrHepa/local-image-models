@@ -33,6 +33,11 @@ class RequestValidationError(DomainError):
     """Raised when an execution request fails domain validation."""
 
 
+SUPPORTED_OUTPUT_FORMATS = {"png", "jpeg"}
+DEFAULT_OUTPUT_FORMAT = "png"
+JPEG_OUTPUT_EXTENSION = ".jpg"
+
+
 @dataclass(frozen=True)
 class ExecutionRequest:
     node_id: str
@@ -113,6 +118,30 @@ def _validate_numeric_param(
     return numeric_value
 
 
+def _validate_output_params(params: dict[str, Any]) -> tuple[str, int | None]:
+    raw_format = params.get("output_format", DEFAULT_OUTPUT_FORMAT)
+    if not isinstance(raw_format, str) or not raw_format.strip():
+        raise RequestValidationError("Parameter 'output_format' must be 'png' or 'jpeg' when provided.")
+    output_format = raw_format.strip().lower()
+    if output_format not in SUPPORTED_OUTPUT_FORMATS:
+        raise RequestValidationError("Parameter 'output_format' must be 'png' or 'jpeg'.")
+
+    raw_quality = params.get("output_quality")
+    if raw_quality is None:
+        return output_format, None
+    if output_format == "png":
+        raise RequestValidationError("Parameter 'output_quality' is only valid when output_format is 'jpeg'.")
+    if isinstance(raw_quality, bool) or not isinstance(raw_quality, int):
+        raise RequestValidationError("Parameter 'output_quality' must be an integer from 1 to 100.")
+    if raw_quality < 1 or raw_quality > 100:
+        raise RequestValidationError("Parameter 'output_quality' must be between 1 and 100.")
+    return output_format, raw_quality
+
+
+def _extension_for_output_format(output_format: str) -> str:
+    return JPEG_OUTPUT_EXTENSION if output_format == "jpeg" else ".png"
+
+
 def _is_flux_text_to_image(extension_id: str | None, node_id: str) -> bool:
     if extension_id is None:
         return False
@@ -185,6 +214,13 @@ def _validate_node_payload(
             maximum=0.0 if flux_text_to_image else 50.0,
         ),
         "seed": _validate_numeric_param(request.params, "seed", expected_type=int, minimum=0),
+        "num_images_per_prompt": _validate_numeric_param(
+            request.params,
+            "num_images_per_prompt",
+            expected_type=int,
+            minimum=1,
+            maximum=4,
+        ),
     }
     if flux_text_to_image:
         numeric_validators["max_sequence_length"] = _validate_numeric_param(
@@ -343,8 +379,9 @@ def _build_backend_job(
         )
 
     workspace_dir = _resolve_workspace_dir(effective_workspace_dir)
+    output_format, output_quality = _validate_output_params(request.params)
     output_path = workspace_dir / (
-        f"generated-{extension_id}-{request.node_id}-{uuid4().hex}.png"
+        f"generated-{extension_id}-{request.node_id}-{uuid4().hex}{_extension_for_output_format(output_format)}"
     )
     params = dict(request.params)
     if descriptor.family == "flux":
@@ -363,6 +400,8 @@ def _build_backend_job(
         "model_dir": _resolve_backend_model_dir(request, extension_record),
         "workspace_dir": str(workspace_dir),
         "output_path": str(output_path),
+        "output_format": output_format,
+        "output_quality": output_quality,
         "prompt": payload_details.prompt,
         "source_image_path": payload_details.source_image_path,
         "params": params,
@@ -650,12 +689,11 @@ def _stop_backend_process(
         process.wait(timeout=terminate_grace_seconds)
 
 
-def _resolve_output_path_within_workspace(result: dict[str, Any], *, workspace_dir: Path) -> Path:
-    output_path = result.get("output_path")
-    if not isinstance(output_path, str) or not output_path.strip():
-        raise DomainError("Backend subprocess result must include a non-empty 'output_path'.")
+def _resolve_path_within_workspace(raw_path: Any, *, workspace_dir: Path, field_name: str) -> Path:
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise DomainError(f"Backend subprocess result must include a non-empty '{field_name}'.")
 
-    candidate = Path(output_path.strip())
+    candidate = Path(raw_path.strip())
     if not candidate.is_absolute():
         candidate = workspace_dir / candidate
     resolved_candidate = candidate.expanduser().resolve()
@@ -663,9 +701,30 @@ def _resolve_output_path_within_workspace(result: dict[str, Any], *, workspace_d
         resolved_candidate.relative_to(workspace_dir)
     except ValueError as exc:
         raise DomainError(
-            f"Backend subprocess output_path '{resolved_candidate}' is outside workspace_dir '{workspace_dir}'."
+            f"Backend subprocess {field_name} '{resolved_candidate}' is outside workspace_dir '{workspace_dir}'."
         ) from exc
     return resolved_candidate
+
+
+def _resolve_output_path_within_workspace(result: dict[str, Any], *, workspace_dir: Path) -> Path:
+    return _resolve_path_within_workspace(result.get("output_path"), workspace_dir=workspace_dir, field_name="output_path")
+
+
+def _normalize_backend_result_paths(result: dict[str, Any], *, workspace_dir: Path) -> dict[str, Any]:
+    resolved_result = dict(result)
+    resolved_output_path = _resolve_output_path_within_workspace(result, workspace_dir=workspace_dir)
+    resolved_result["output_path"] = str(resolved_output_path)
+
+    raw_output_paths = result.get("output_paths")
+    if raw_output_paths is not None:
+        if not isinstance(raw_output_paths, list) or not raw_output_paths:
+            raise DomainError("Backend subprocess result 'output_paths' must be a non-empty list when provided.")
+        resolved_result["output_paths"] = [
+            str(_resolve_path_within_workspace(raw_path, workspace_dir=workspace_dir, field_name="output_paths"))
+            for raw_path in raw_output_paths
+        ]
+        resolved_result["output_count"] = len(resolved_result["output_paths"])
+    return resolved_result
 
 
 def _run_backend_job(
@@ -723,10 +782,7 @@ def _run_backend_job(
     if result is None:
         raise DomainError("Backend subprocess did not emit a done event.")
 
-    resolved_output_path = _resolve_output_path_within_workspace(result, workspace_dir=job.workspace_dir)
-    resolved_result = dict(result)
-    resolved_result["output_path"] = str(resolved_output_path)
-    return resolved_result
+    return _normalize_backend_result_paths(result, workspace_dir=job.workspace_dir)
 
 
 def execute(

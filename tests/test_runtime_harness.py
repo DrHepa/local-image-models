@@ -360,6 +360,14 @@ class RuntimeHarnessTests(unittest.TestCase):
             from_pretrained=lambda model_dir: FakePipeline(pipeline_marker=marker, model_dir=model_dir)
         )
 
+    def _make_installed_extension_record(self, *, extension_id: str, workspace_dir: Path) -> dict[str, str]:
+        extension_root = Path(tempfile.mkdtemp(prefix=f"ext-root-{extension_id}-"))
+        (extension_root / "src").mkdir(parents=True, exist_ok=True)
+        return {
+            "venv_python": str(self._make_executable_python(extension_root)),
+            "model_dir": str(workspace_dir / "models" / extension_id),
+        }
+
     def _run_real_runner_subprocess(
         self,
         *,
@@ -2649,6 +2657,133 @@ class RuntimeHarnessTests(unittest.TestCase):
         kwargs = inference_runner._build_pipeline_kwargs(job.payload, execution_device="cpu")
         self.assertNotIn("negative_prompt", kwargs)
 
+    def test_num_images_per_prompt_validates_and_reaches_runner_kwargs(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        for extension_id, family, node_id in (
+            ("sd15", "stable-diffusion", "text-to-image"),
+            ("sdxl-base", "sdxl", "image-to-image"),
+            ("flux-schnell", "flux", "text-to-image"),
+        ):
+            with self.subTest(extension_id=extension_id, node_id=node_id):
+                workspace_dir = Path(tempfile.mkdtemp(prefix=f"num-images-{extension_id}-"))
+                input_payload = {"text": "prompt"}
+                params: dict[str, object] = {
+                    "prompt": "prompt",
+                    "steps": 4,
+                    "num_images_per_prompt": 4,
+                }
+                if node_id == "image-to-image":
+                    source_path = workspace_dir / "source.png"
+                    source_path.write_bytes(b"source")
+                    input_payload = {"filePath": str(source_path)}
+                    params["strength"] = 0.55
+                if family == "flux":
+                    params["guidance_scale"] = 0.0
+
+                request = pipeline.ExecutionRequest(
+                    node_id=node_id,
+                    input=input_payload,
+                    params=params,
+                    workspace_dir=str(workspace_dir),
+                )
+
+                validated = pipeline._validate_node_payload(request, legacy_model_id=None, extension_id=extension_id)
+                self.assertEqual(validated.numeric_params["num_images_per_prompt"], 4)
+
+                runner_payload = {
+                    "family": family,
+                    "node_id": node_id,
+                    "prompt": "prompt",
+                    "source_image_path": validated.source_image_path,
+                    "params": validated.numeric_params,
+                }
+                with patch("local_image_runtime.inference_runner._open_source_image", return_value=object()):
+                    kwargs = inference_runner._build_pipeline_kwargs(runner_payload, execution_device="cpu")
+                self.assertEqual(kwargs["num_images_per_prompt"], 4)
+
+    def test_num_images_per_prompt_invalid_values_are_rejected_before_inference(self) -> None:
+        for value in (0, 5, 2.5, "2", True):
+            with self.subTest(num_images_per_prompt=value):
+                request = pipeline.ExecutionRequest(
+                    node_id="text-to-image",
+                    input={"text": "prompt"},
+                    params={"prompt": "prompt", "steps": 4, "num_images_per_prompt": value},
+                )
+
+                with self.assertRaises(pipeline.RequestValidationError):
+                    pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="sd15")
+
+    def test_output_format_and_quality_invalid_values_are_rejected_before_inference(self) -> None:
+        cases = (
+            {"output_format": "gif"},
+            {"output_format": ""},
+            {"output_quality": 0, "output_format": "jpeg"},
+            {"output_quality": 101, "output_format": "jpeg"},
+            {"output_quality": 85},
+            {"output_format": "png", "output_quality": 85},
+            {"output_format": "jpeg", "output_quality": 90.5},
+        )
+
+        for params_delta in cases:
+            with self.subTest(params_delta=params_delta):
+                workspace_dir = Path(tempfile.mkdtemp(prefix="invalid-output-params-"))
+                runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
+                request = pipeline.ExecutionRequest(
+                    node_id="text-to-image",
+                    input={"text": "prompt"},
+                    params={"prompt": "prompt", "steps": 4, **params_delta},
+                    workspace_dir=str(workspace_dir),
+                )
+
+                with patch("local_image_runtime.pipeline.extension_is_installed", return_value=True), patch(
+                    "local_image_runtime.pipeline.get_extension_record",
+                    return_value=self._make_installed_extension_record(extension_id="sd15", workspace_dir=workspace_dir),
+                ), patch("local_image_runtime.pipeline.subprocess.Popen") as subprocess_popen:
+                    with self.assertRaises(pipeline.RequestValidationError):
+                        pipeline.execute(
+                            request,
+                            runtime,
+                            extension_id="sd15",
+                            emit_progress=lambda percent, label: None,
+                            emit_log=lambda message: None,
+                        )
+                subprocess_popen.assert_not_called()
+
+    def test_build_backend_job_defaults_to_single_png_and_jpeg_changes_extension(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="output-format-job-"))
+        extension_record = self._make_installed_extension_record(extension_id="sd15", workspace_dir=workspace_dir)
+
+        for params, expected_suffix, expected_format in (
+            ({"prompt": "png prompt", "steps": 4}, ".png", "png"),
+            ({"prompt": "jpeg prompt", "steps": 4, "output_format": "jpeg", "output_quality": 85}, ".jpg", "jpeg"),
+        ):
+            with self.subTest(params=params):
+                request = pipeline.ExecutionRequest(
+                    node_id="text-to-image",
+                    input={"text": "prompt"},
+                    params=params,
+                    workspace_dir=str(workspace_dir),
+                )
+                payload_details = pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="sd15")
+
+                job = pipeline._build_backend_job(
+                    request=request,
+                    extension_id="sd15",
+                    extension_record=extension_record,
+                    payload_details=payload_details,
+                    effective_workspace_dir=str(workspace_dir),
+                )
+
+                output_path = Path(job.payload["output_path"])
+                self.assertEqual(output_path.suffix, expected_suffix)
+                self.assertEqual(job.payload["output_format"], expected_format)
+                if "output_format" in params:
+                    self.assertEqual(job.payload["params"].get("output_format"), expected_format)
+                else:
+                    self.assertNotIn("output_format", job.payload["params"])
+                self.assertTrue(output_path.resolve().is_relative_to(workspace_dir.resolve()))
+
     def test_sd_families_keep_negative_prompt_guidance_steps_and_exclude_flux_sequence_length(self) -> None:
         import local_image_runtime.inference_runner as inference_runner
 
@@ -2681,6 +2816,266 @@ class RuntimeHarnessTests(unittest.TestCase):
                 self.assertEqual(kwargs["guidance_scale"], guidance_scale)
                 self.assertEqual(kwargs["num_inference_steps"], steps)
                 self.assertNotIn("max_sequence_length", kwargs)
+
+    def test_inference_runner_default_single_png_contract_is_unchanged(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="single-png-runner-"))
+        output_path = workspace_dir / "generated.png"
+        saved_paths: list[tuple[str, dict[str, object]]] = []
+
+        class FakeImage:
+            def save(self, output_path: str, **kwargs: object) -> None:
+                saved_paths.append((output_path, kwargs))
+                Path(output_path).write_bytes(b"png")
+
+        class FakePipeline:
+            def __call__(self, **kwargs: object) -> SimpleNamespace:
+                return SimpleNamespace(images=[FakeImage()])
+
+        job = {
+            "model_dir": str(workspace_dir / "model"),
+            "output_path": str(output_path),
+            "family": "stable-diffusion",
+            "node_id": "text-to-image",
+            "prompt": "prompt",
+            "source_image_path": None,
+            "params": {"steps": 4},
+        }
+
+        loader = SimpleNamespace(from_pretrained=lambda model_dir: FakePipeline())
+        with patch.dict(inference_runner._PIPELINE_LOADERS, {("stable-diffusion", "text-to-image"): loader}, clear=True), patch(
+            "local_image_runtime.inference_runner._load_torch", return_value=None
+        ):
+            result = inference_runner.run_child_job(job, stdout=StringIO())
+
+        self.assertEqual(saved_paths, [(str(output_path), {})])
+        self.assertEqual(result["output_path"], str(output_path))
+        self.assertEqual(result["output_paths"], [str(output_path)])
+        self.assertEqual(result["output_count"], 1)
+        self.assertEqual(result["output_format"], "png")
+        self.assertTrue(output_path.exists())
+        self.assertEqual(list(workspace_dir.glob("*.jpg")), [])
+
+    def test_inference_runner_saves_all_returned_images_with_numbered_paths(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="multi-image-runner-"))
+        output_path = workspace_dir / "generated-sd15-text.png"
+        saved_paths: list[str] = []
+
+        class FakeImage:
+            def __init__(self, marker: str) -> None:
+                self.marker = marker
+
+            def save(self, output_path: str, **kwargs: object) -> None:
+                saved_paths.append(output_path)
+                Path(output_path).write_bytes(self.marker.encode("utf-8"))
+
+        class FakePipeline:
+            def __call__(self, **kwargs: object) -> SimpleNamespace:
+                return SimpleNamespace(images=[FakeImage("zero"), FakeImage("one"), FakeImage("two")])
+
+        job = {
+            "model_dir": str(workspace_dir / "model"),
+            "output_path": str(output_path),
+            "family": "stable-diffusion",
+            "node_id": "text-to-image",
+            "prompt": "prompt",
+            "source_image_path": None,
+            "output_format": "png",
+            "params": {"steps": 4, "num_images_per_prompt": 3},
+        }
+
+        loader = SimpleNamespace(from_pretrained=lambda model_dir: FakePipeline())
+        with patch.dict(inference_runner._PIPELINE_LOADERS, {("stable-diffusion", "text-to-image"): loader}, clear=True), patch(
+            "local_image_runtime.inference_runner._load_torch", return_value=None
+        ):
+            result = inference_runner.run_child_job(job, stdout=StringIO())
+
+        expected_paths = [
+            output_path,
+            workspace_dir / "generated-sd15-text-1.png",
+            workspace_dir / "generated-sd15-text-2.png",
+        ]
+        self.assertEqual(saved_paths, [str(path) for path in expected_paths])
+        self.assertEqual(result["output_path"], str(output_path))
+        self.assertEqual(result["output_paths"], [str(path) for path in expected_paths])
+        self.assertEqual(result["output_count"], 3)
+        self.assertEqual(result["output_format"], "png")
+        sidecar = output_path.with_suffix(output_path.suffix + ".json")
+        self.assertEqual(
+            json.loads(sidecar.read_text(encoding="utf-8")),
+            {
+                "output_path": str(output_path),
+                "output_paths": [str(path) for path in expected_paths],
+                "output_count": 3,
+                "output_format": "png",
+            },
+        )
+        self.assertEqual([path.read_text(encoding="utf-8") for path in expected_paths], ["zero", "one", "two"])
+
+    def test_inference_runner_reports_actual_count_when_request_asks_for_two_but_one_returns(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="multi-image-under-return-"))
+        output_path = workspace_dir / "generated-sd15-text.png"
+        pipeline_kwargs: list[dict[str, object]] = []
+        saved_paths: list[str] = []
+
+        class FakeImage:
+            def save(self, output_path: str, **kwargs: object) -> None:
+                saved_paths.append(output_path)
+                Path(output_path).write_bytes(b"only-returned-image")
+
+        class FakePipeline:
+            def __call__(self, **kwargs: object) -> SimpleNamespace:
+                pipeline_kwargs.append(kwargs)
+                return SimpleNamespace(images=[FakeImage()])
+
+        job = {
+            "model_dir": str(workspace_dir / "model"),
+            "output_path": str(output_path),
+            "family": "stable-diffusion",
+            "node_id": "text-to-image",
+            "prompt": "prompt",
+            "source_image_path": None,
+            "output_format": "png",
+            "params": {"steps": 4, "num_images_per_prompt": 2},
+        }
+
+        loader = SimpleNamespace(from_pretrained=lambda model_dir: FakePipeline())
+        with patch.dict(inference_runner._PIPELINE_LOADERS, {("stable-diffusion", "text-to-image"): loader}, clear=True), patch(
+            "local_image_runtime.inference_runner._load_torch", return_value=None
+        ):
+            result = inference_runner.run_child_job(job, stdout=StringIO())
+
+        self.assertEqual(pipeline_kwargs[0]["num_images_per_prompt"], 2)
+        self.assertEqual(saved_paths, [str(output_path)])
+        self.assertEqual(result["output_path"], str(output_path))
+        self.assertEqual(result["output_paths"], [str(output_path)])
+        self.assertEqual(result["output_count"], 1)
+        self.assertEqual(output_path.read_bytes(), b"only-returned-image")
+        self.assertFalse(output_path.with_name("generated-sd15-text-1.png").exists())
+
+    def test_inference_runner_reports_actual_count_when_request_asks_for_two_but_three_return(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="multi-image-over-return-"))
+        output_path = workspace_dir / "generated-sd15-text.png"
+        pipeline_kwargs: list[dict[str, object]] = []
+        saved_paths: list[str] = []
+
+        class FakeImage:
+            def __init__(self, marker: str) -> None:
+                self.marker = marker
+
+            def save(self, output_path: str, **kwargs: object) -> None:
+                saved_paths.append(output_path)
+                Path(output_path).write_bytes(self.marker.encode("utf-8"))
+
+        class FakePipeline:
+            def __call__(self, **kwargs: object) -> SimpleNamespace:
+                pipeline_kwargs.append(kwargs)
+                return SimpleNamespace(images=[FakeImage("zero"), FakeImage("one"), FakeImage("two")])
+
+        job = {
+            "model_dir": str(workspace_dir / "model"),
+            "output_path": str(output_path),
+            "family": "stable-diffusion",
+            "node_id": "text-to-image",
+            "prompt": "prompt",
+            "source_image_path": None,
+            "output_format": "png",
+            "params": {"steps": 4, "num_images_per_prompt": 2},
+        }
+
+        loader = SimpleNamespace(from_pretrained=lambda model_dir: FakePipeline())
+        with patch.dict(inference_runner._PIPELINE_LOADERS, {("stable-diffusion", "text-to-image"): loader}, clear=True), patch(
+            "local_image_runtime.inference_runner._load_torch", return_value=None
+        ):
+            result = inference_runner.run_child_job(job, stdout=StringIO())
+
+        expected_paths = [
+            output_path,
+            workspace_dir / "generated-sd15-text-1.png",
+            workspace_dir / "generated-sd15-text-2.png",
+        ]
+        self.assertEqual(pipeline_kwargs[0]["num_images_per_prompt"], 2)
+        self.assertEqual(saved_paths, [str(path) for path in expected_paths])
+        self.assertEqual(result["output_path"], str(output_path))
+        self.assertEqual(result["output_paths"], [str(path) for path in expected_paths])
+        self.assertEqual(result["output_count"], 3)
+        self.assertEqual([path.read_text(encoding="utf-8") for path in expected_paths], ["zero", "one", "two"])
+
+    def test_inference_runner_saves_jpeg_with_rgb_conversion_and_quality(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="jpeg-runner-"))
+        output_path = workspace_dir / "generated.jpg"
+        save_calls: list[tuple[str, dict[str, object], str]] = []
+
+        class FakeImage:
+            def __init__(self, mode: str = "RGBA") -> None:
+                self.mode = mode
+
+            def convert(self, mode: str) -> "FakeImage":
+                self.converted_to = mode
+                return FakeImage(mode=mode)
+
+            def save(self, output_path: str, **kwargs: object) -> None:
+                save_calls.append((output_path, kwargs, self.mode))
+                Path(output_path).write_bytes(b"jpeg")
+
+        class FakePipeline:
+            def __call__(self, **kwargs: object) -> SimpleNamespace:
+                return SimpleNamespace(images=[FakeImage()])
+
+        job = {
+            "model_dir": str(workspace_dir / "model"),
+            "output_path": str(output_path),
+            "family": "stable-diffusion",
+            "node_id": "text-to-image",
+            "prompt": "prompt",
+            "source_image_path": None,
+            "output_format": "jpeg",
+            "params": {"steps": 4, "output_format": "jpeg", "output_quality": 85},
+        }
+
+        loader = SimpleNamespace(from_pretrained=lambda model_dir: FakePipeline())
+        with patch.dict(inference_runner._PIPELINE_LOADERS, {("stable-diffusion", "text-to-image"): loader}, clear=True), patch(
+            "local_image_runtime.inference_runner._load_torch", return_value=None
+        ):
+            result = inference_runner.run_child_job(job, stdout=StringIO())
+
+        self.assertEqual(save_calls, [(str(output_path), {"quality": 85}, "RGB")])
+        self.assertEqual(Path(result["output_path"]).suffix, ".jpg")
+        self.assertEqual(result["output_paths"], [str(output_path)])
+        self.assertEqual(result["output_format"], "jpeg")
+
+    def test_pipeline_normalizes_and_contains_all_reported_output_paths(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="contained-output-paths-"))
+        inside_primary = workspace_dir / "primary.png"
+        inside_secondary = workspace_dir / "primary-1.png"
+        outside = workspace_dir.parent / "escaped.png"
+
+        normalized = pipeline._normalize_backend_result_paths(
+            {
+                "output_path": str(inside_primary),
+                "output_paths": [str(inside_primary), str(inside_secondary)],
+                "output_count": 2,
+                "output_format": "png",
+            },
+            workspace_dir=workspace_dir.resolve(),
+        )
+        self.assertEqual(normalized["output_paths"], [str(inside_primary.resolve()), str(inside_secondary.resolve())])
+        self.assertEqual(normalized["output_count"], 2)
+
+        with self.assertRaisesRegex(pipeline.DomainError, "output_paths.*outside workspace_dir"):
+            pipeline._normalize_backend_result_paths(
+                {"output_path": str(inside_primary), "output_paths": [str(inside_primary), str(outside)]},
+                workspace_dir=workspace_dir.resolve(),
+            )
 
     def test_flux_manifest_exposes_sequence_length_and_hides_negative_prompt(self) -> None:
         schema = self._extension_manifest_data("flux-schnell")["nodes"][0]["params_schema"]
@@ -3007,6 +3402,55 @@ class RuntimeHarnessTests(unittest.TestCase):
                     for param_id, expected_tooltip in expected_help.items():
                         self.assertEqual(params_schema[param_id]["tooltip"], expected_tooltip)
 
+    def test_manifests_expose_multi_image_and_output_format_parameters(self) -> None:
+        expected_nodes = {
+            "sd15": ("text-to-image", "image-to-image"),
+            "sdxl-base": ("text-to-image", "image-to-image"),
+            "flux-schnell": ("text-to-image",),
+        }
+
+        for extension_id, node_ids in expected_nodes.items():
+            manifest = self._extension_manifest_data(extension_id)
+            nodes = {node["id"]: node for node in manifest["nodes"]}
+            for node_id in node_ids:
+                with self.subTest(extension_id=extension_id, node_id=node_id):
+                    params_schema = {schema["id"]: schema for schema in nodes[node_id]["params_schema"]}
+                    self.assertEqual(
+                        params_schema["num_images_per_prompt"],
+                        {
+                            "id": "num_images_per_prompt",
+                            "label": "Images",
+                            "type": "int",
+                            "default": 1,
+                            "min": 1,
+                            "max": 4,
+                            "tooltip": "Number of images to generate for one prompt; every returned image is saved.",
+                        },
+                    )
+                    self.assertEqual(
+                        params_schema["output_format"],
+                        {
+                            "id": "output_format",
+                            "label": "Output Format",
+                            "type": "select",
+                            "default": "png",
+                            "options": ["png", "jpeg"],
+                            "tooltip": "File format for generated images. PNG preserves existing behavior; JPEG supports output_quality.",
+                        },
+                    )
+                    self.assertEqual(
+                        params_schema["output_quality"],
+                        {
+                            "id": "output_quality",
+                            "label": "JPEG Quality",
+                            "type": "int",
+                            "default": 85,
+                            "min": 1,
+                            "max": 100,
+                            "tooltip": "JPEG quality from 1 to 100. Only valid when output_format is jpeg.",
+                        },
+                    )
+
     def test_pipeline_execute_serializes_subprocess_payload_by_family_and_node(self) -> None:
         import local_image_runtime.quality_policy as quality_policy
 
@@ -3178,6 +3622,9 @@ class RuntimeHarnessTests(unittest.TestCase):
                     result,
                     {
                         "output_path": str(expected_output_path),
+                        "output_paths": [str(expected_output_path)],
+                        "output_count": 1,
+                        "output_format": "png",
                         "metadata": {
                             "family": expected_family,
                             "node_id": request.node_id,
@@ -4520,6 +4967,9 @@ class RuntimeHarnessTests(unittest.TestCase):
                     events[-1]["result"],
                     {
                         "output_path": str(output_path),
+                        "output_paths": [str(output_path)],
+                        "output_count": 1,
+                        "output_format": "png",
                         "metadata": {
                             "family": case["family"],
                             "node_id": case["node_id"],
@@ -4738,6 +5188,9 @@ class RuntimeHarnessTests(unittest.TestCase):
             events[-1]["result"],
             {
                 "output_path": str(output_path),
+                "output_paths": [str(output_path)],
+                "output_count": 1,
+                "output_format": "png",
                 "metadata": {
                     "family": "flux",
                     "node_id": "text-to-image",

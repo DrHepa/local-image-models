@@ -207,6 +207,7 @@ def _build_pipeline_kwargs(job: dict[str, Any], *, execution_device: str) -> dic
         "width": "width",
         "height": "height",
         "guidance_scale": "guidance_scale",
+        "num_images_per_prompt": "num_images_per_prompt",
     }
     for source_name, target_name in numeric_fields.items():
         if source_name in params:
@@ -229,6 +230,28 @@ def _build_pipeline_kwargs(job: dict[str, Any], *, execution_device: str) -> dic
             kwargs["strength"] = params["strength"]
 
     return kwargs
+
+
+def _derive_numbered_output_path(primary_output_file: Path, image_index: int) -> Path:
+    if image_index == 0:
+        return primary_output_file
+    return primary_output_file.with_name(f"{primary_output_file.stem}-{image_index}{primary_output_file.suffix}")
+
+
+def _save_image(image: Any, output_file: Path, *, output_format: str, output_quality: int | None) -> None:
+    save_target = image
+    save_kwargs: dict[str, Any] = {}
+    if output_format == "jpeg":
+        if getattr(save_target, "mode", None) != "RGB" and callable(getattr(save_target, "convert", None)):
+            save_target = save_target.convert("RGB")
+        if output_quality is not None:
+            save_kwargs["quality"] = output_quality
+    save_target.save(str(output_file), **save_kwargs)
+
+
+def _write_output_metadata_sidecar(primary_output_file: Path, metadata: dict[str, Any]) -> None:
+    sidecar_path = primary_output_file.with_suffix(primary_output_file.suffix + ".json")
+    sidecar_path.write_text(json.dumps(metadata, sort_keys=True), encoding="utf-8")
 
 
 def _run_pipeline_with_liveness(
@@ -312,7 +335,26 @@ def run_child_job(job: dict[str, Any], *, stdout: TextIO | None = None) -> dict[
     output_file = Path(output_path)
     output_file.parent.mkdir(parents=True, exist_ok=True)
     _emit_stage_event(saving_label, stdout=stdout)
-    images[0].save(str(output_file))
+    params = job.get("params") if isinstance(job.get("params"), dict) else {}
+    output_format = job.get("output_format") if isinstance(job.get("output_format"), str) else params.get("output_format", "png")
+    output_format = output_format.strip().lower() if isinstance(output_format, str) and output_format.strip() else "png"
+    output_quality = job.get("output_quality")
+    if output_quality is None:
+        output_quality = params.get("output_quality")
+    output_quality = output_quality if isinstance(output_quality, int) and not isinstance(output_quality, bool) else None
+    output_paths: list[str] = []
+    for index, image in enumerate(images):
+        image_output_file = _derive_numbered_output_path(output_file, index)
+        _save_image(image, image_output_file, output_format=output_format, output_quality=output_quality)
+        output_paths.append(str(image_output_file))
+    output_metadata = {
+        "output_path": str(output_file),
+        "output_paths": output_paths,
+        "output_count": len(output_paths),
+        "output_format": output_format,
+    }
+    if len(output_paths) > 1 or output_format != "png":
+        _write_output_metadata_sidecar(output_file, output_metadata)
     _emit_memory_event_for_stage(
         saving_label,
         extension_id=extension_id,
@@ -320,9 +362,8 @@ def run_child_job(job: dict[str, Any], *, stdout: TextIO | None = None) -> dict[
         stdout=stdout,
     )
 
-    params = job.get("params") if isinstance(job.get("params"), dict) else {}
     return {
-        "output_path": str(output_file),
+        **output_metadata,
         "metadata": {
             "family": family,
             "node_id": node_id,
