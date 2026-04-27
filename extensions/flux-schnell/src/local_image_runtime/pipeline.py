@@ -37,6 +37,7 @@ SUPPORTED_OUTPUT_FORMATS = {"png", "jpeg"}
 DEFAULT_OUTPUT_FORMAT = "png"
 JPEG_OUTPUT_EXTENSION = ".jpg"
 FLUX_SCHNELL_MAX_STEPS = 30
+FLUX_SCHNELL_MAX_GUIDANCE_SCALE = 50.0
 
 
 @dataclass(frozen=True)
@@ -212,7 +213,7 @@ def _validate_node_payload(
             "guidance_scale",
             expected_type=float,
             minimum=0.0,
-            maximum=0.0 if flux_text_to_image else 50.0,
+            maximum=FLUX_SCHNELL_MAX_GUIDANCE_SCALE if flux_text_to_image else 50.0,
         ),
         "seed": _validate_numeric_param(request.params, "seed", expected_type=int, minimum=0),
         "num_images_per_prompt": _validate_numeric_param(

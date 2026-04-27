@@ -2682,8 +2682,44 @@ class RuntimeHarnessTests(unittest.TestCase):
                 with self.assertRaises(pipeline.RequestValidationError):
                     pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="flux-schnell")
 
-    def test_flux_non_zero_guidance_scale_is_rejected_before_inference(self) -> None:
-        for value in (0.1, 1.0):
+    def test_flux_guidance_scale_five_reaches_backend_and_runner(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="flux-guidance-pass-through-"))
+        extension_root = Path(tempfile.mkdtemp(prefix="ext-root-flux-guidance-"))
+        (extension_root / "src").mkdir(parents=True, exist_ok=True)
+        venv_python = self._make_executable_python(extension_root)
+        request = pipeline.ExecutionRequest(
+            node_id="text-to-image",
+            input={"text": "flux prompt"},
+            params={
+                "prompt": "flux prompt",
+                "width": 1024,
+                "height": 1024,
+                "steps": 4,
+                "guidance_scale": 5.0,
+                "max_sequence_length": 128,
+            },
+            workspace_dir=str(workspace_dir),
+        )
+
+        payload_details = pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="flux-schnell")
+        self.assertEqual(payload_details.numeric_params["guidance_scale"], 5.0)
+
+        job = pipeline._build_backend_job(
+            request=request,
+            extension_id="flux-schnell",
+            extension_record={"venv_python": str(venv_python), "model_dir": "/runtime/local/flux"},
+            payload_details=payload_details,
+            effective_workspace_dir=str(workspace_dir),
+        )
+
+        self.assertEqual(job.payload["params"]["guidance_scale"], 5.0)
+        kwargs = inference_runner._build_pipeline_kwargs(job.payload, execution_device="cpu")
+        self.assertEqual(kwargs["guidance_scale"], 5.0)
+
+    def test_flux_invalid_guidance_scale_values_are_rejected_before_inference(self) -> None:
+        for value in (-0.1, -1.0, "5"):
             with self.subTest(guidance_scale=value):
                 request = pipeline.ExecutionRequest(
                     node_id="text-to-image",
@@ -3184,6 +3220,18 @@ class RuntimeHarnessTests(unittest.TestCase):
                 "min": 1,
                 "max": 256,
                 "tooltip": "Maximum FLUX text token sequence length passed to Diffusers.",
+            },
+        )
+        self.assertEqual(
+            params_by_id["guidance_scale"],
+            {
+                "id": "guidance_scale",
+                "label": "Guidance Scale",
+                "type": "float",
+                "default": 0,
+                "min": 0,
+                "max": 50,
+                "tooltip": "Recommended 0.0 for FLUX Schnell; higher values are experimental and may not improve quality unless the active pipeline supports them.",
             },
         )
 

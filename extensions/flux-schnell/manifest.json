@@ -59,8 +59,8 @@
           "type": "float",
           "default": 0,
           "min": 0,
-          "max": 0,
-          "tooltip": "FLUX Schnell uses guidance 0.0; non-zero guidance requires true CFG support."
+          "max": 50,
+          "tooltip": "Recommended 0.0 for FLUX Schnell; higher values are experimental and may not improve quality unless the active pipeline supports them."
         },
         {
           "id": "max_sequence_length",

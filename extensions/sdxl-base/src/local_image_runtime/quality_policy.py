@@ -78,7 +78,7 @@ _QUALITY_POLICY: dict[str, dict[str, dict[str, dict[str, Any]]]] = {
             "help": {
                 "prompt": "Prompt text for FLUX Schnell text-to-image generation.",
                 "steps": "Recommended range is 1-4 for FLUX Schnell; higher values are experimental and may not improve quality.",
-                "guidance_scale": "FLUX Schnell uses guidance 0.0; non-zero guidance requires true CFG support.",
+                "guidance_scale": "Recommended 0.0 for FLUX Schnell; higher values are experimental and may not improve quality unless the active pipeline supports them.",
                 "max_sequence_length": "Maximum FLUX text token sequence length passed to Diffusers.",
             },
         },
