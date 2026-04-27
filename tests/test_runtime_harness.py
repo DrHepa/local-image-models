@@ -2836,8 +2836,6 @@ class RuntimeHarnessTests(unittest.TestCase):
             {"output_format": ""},
             {"output_quality": 0, "output_format": "jpeg"},
             {"output_quality": 101, "output_format": "jpeg"},
-            {"output_quality": 85},
-            {"output_format": "png", "output_quality": 85},
             {"output_format": "jpeg", "output_quality": 90.5},
         )
 
@@ -2866,13 +2864,14 @@ class RuntimeHarnessTests(unittest.TestCase):
                         )
                 subprocess_popen.assert_not_called()
 
-    def test_build_backend_job_defaults_to_single_png_and_jpeg_changes_extension(self) -> None:
+    def test_build_backend_job_ignores_png_quality_and_preserves_jpeg_quality(self) -> None:
         workspace_dir = Path(tempfile.mkdtemp(prefix="output-format-job-"))
         extension_record = self._make_installed_extension_record(extension_id="sd15", workspace_dir=workspace_dir)
 
-        for params, expected_suffix, expected_format in (
-            ({"prompt": "png prompt", "steps": 4}, ".png", "png"),
-            ({"prompt": "jpeg prompt", "steps": 4, "output_format": "jpeg", "output_quality": 85}, ".jpg", "jpeg"),
+        for params, expected_suffix, expected_format, expected_quality in (
+            ({"prompt": "png prompt", "steps": 4}, ".png", "png", None),
+            ({"prompt": "png prompt", "steps": 4, "output_format": "png", "output_quality": 85}, ".png", "png", None),
+            ({"prompt": "jpeg prompt", "steps": 4, "output_format": "jpeg", "output_quality": 85}, ".jpg", "jpeg", 85),
         ):
             with self.subTest(params=params):
                 request = pipeline.ExecutionRequest(
@@ -2894,10 +2893,14 @@ class RuntimeHarnessTests(unittest.TestCase):
                 output_path = Path(job.payload["output_path"])
                 self.assertEqual(output_path.suffix, expected_suffix)
                 self.assertEqual(job.payload["output_format"], expected_format)
-                if "output_format" in params:
-                    self.assertEqual(job.payload["params"].get("output_format"), expected_format)
+                self.assertEqual(job.payload["output_quality"], expected_quality)
+                if expected_format == "jpeg":
+                    self.assertEqual(job.payload["params"].get("output_format"), "jpeg")
+                    self.assertEqual(job.payload["params"].get("output_quality"), expected_quality)
                 else:
-                    self.assertNotIn("output_format", job.payload["params"])
+                    if "output_format" not in params:
+                        self.assertNotIn("output_format", job.payload["params"])
+                    self.assertNotIn("output_quality", job.payload["params"])
                 self.assertTrue(output_path.resolve().is_relative_to(workspace_dir.resolve()))
 
     def test_sd_families_keep_negative_prompt_guidance_steps_and_exclude_flux_sequence_length(self) -> None:
@@ -3563,7 +3566,10 @@ class RuntimeHarnessTests(unittest.TestCase):
                             "label": "Output Format",
                             "type": "select",
                             "default": "png",
-                            "options": ["png", "jpeg"],
+                            "options": [
+                                {"value": "png", "label": "PNG"},
+                                {"value": "jpeg", "label": "JPEG"},
+                            ],
                             "tooltip": "File format for generated images. PNG preserves existing behavior; JPEG supports output_quality.",
                         },
                     )

@@ -132,7 +132,7 @@ def _validate_output_params(params: dict[str, Any]) -> tuple[str, int | None]:
     if raw_quality is None:
         return output_format, None
     if output_format == "png":
-        raise RequestValidationError("Parameter 'output_quality' is only valid when output_format is 'jpeg'.")
+        return output_format, None
     if isinstance(raw_quality, bool) or not isinstance(raw_quality, int):
         raise RequestValidationError("Parameter 'output_quality' must be an integer from 1 to 100.")
     if raw_quality < 1 or raw_quality > 100:
@@ -386,6 +386,8 @@ def _build_backend_job(
         f"generated-{extension_id}-{request.node_id}-{uuid4().hex}{_extension_for_output_format(output_format)}"
     )
     params = dict(request.params)
+    if output_format == "png":
+        params.pop("output_quality", None)
     if descriptor.family == "flux":
         params.pop("negative_prompt", None)
         negative_prompt = None

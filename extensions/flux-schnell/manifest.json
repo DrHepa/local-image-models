@@ -84,7 +84,16 @@
           "label": "Output Format",
           "type": "select",
           "default": "png",
-          "options": ["png", "jpeg"],
+          "options": [
+            {
+              "value": "png",
+              "label": "PNG"
+            },
+            {
+              "value": "jpeg",
+              "label": "JPEG"
+            }
+          ],
           "tooltip": "File format for generated images. PNG preserves existing behavior; JPEG supports output_quality."
         },
         {
