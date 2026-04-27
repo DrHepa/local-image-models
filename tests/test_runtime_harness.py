@@ -2583,8 +2583,88 @@ class RuntimeHarnessTests(unittest.TestCase):
                 with self.assertRaises(pipeline.RequestValidationError):
                     pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="flux-schnell")
 
-    def test_flux_steps_outside_one_to_four_are_rejected_before_inference(self) -> None:
-        for value in (0, 5):
+    def test_flux_high_steps_are_preserved_before_backend_and_runner(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="flux-stale-steps-"))
+        runtime = self._make_runtime_snapshot(outputs_dir=workspace_dir)
+        runtime_root = Path(tempfile.mkdtemp(prefix="ext-root-flux-steps-"))
+        (runtime_root / "src").mkdir(parents=True, exist_ok=True)
+        venv_python = self._make_executable_python(runtime_root)
+        extension_record = {
+            "venv_python": str(venv_python),
+            "model_dir": str(runtime.paths.models_dir / "flux-schnell"),
+        }
+        serialized_payloads: list[dict[str, object]] = []
+
+        request = pipeline.ExecutionRequest(
+            node_id="text-to-image",
+            input={"text": "flux prompt"},
+            params={
+                "prompt": "flux prompt",
+                "width": 1024,
+                "height": 1024,
+                "steps": 30,
+                "guidance_scale": 0.0,
+                "max_sequence_length": 128,
+            },
+            workspace_dir=str(workspace_dir),
+        )
+
+        def capture_serialized_payload(command, *, stdin, stdout, stderr, text, bufsize, cwd, env):
+            def on_stdin_close(payload_text: str) -> tuple[list[str], list[str], int]:
+                serialized_payloads.append(json.loads(payload_text))
+                return (
+                    [json.dumps({"type": "done", "result": {"output_path": str(workspace_dir / "result.png")}}) + "\n"],
+                    [],
+                    0,
+                )
+
+            return self._FakePopen(
+                stdout_lines=[],
+                stderr_lines=[],
+                on_stdin_close=on_stdin_close,
+            )
+
+        with patch("local_image_runtime.pipeline.extension_is_installed", return_value=True), patch(
+            "local_image_runtime.pipeline.get_extension_record",
+            return_value=extension_record,
+        ), patch(
+            "local_image_runtime.pipeline.subprocess.Popen",
+            side_effect=capture_serialized_payload,
+        ):
+            pipeline.execute(
+                request,
+                runtime,
+                extension_id="flux-schnell",
+                emit_progress=lambda percent, label: None,
+                emit_log=lambda message: None,
+            )
+
+        self.assertEqual(len(serialized_payloads), 1)
+        self.assertEqual(serialized_payloads[0]["params"]["steps"], 30)
+        runner_kwargs = inference_runner._build_pipeline_kwargs(serialized_payloads[0], execution_device="cpu")
+        self.assertEqual(runner_kwargs["num_inference_steps"], 30)
+
+    def test_flux_invalid_low_steps_are_still_rejected_before_inference(self) -> None:
+        request = pipeline.ExecutionRequest(
+            node_id="text-to-image",
+            input={"text": "flux prompt"},
+            params={
+                "prompt": "flux prompt",
+                "width": 1024,
+                "height": 1024,
+                "steps": 0,
+                "guidance_scale": 0.0,
+                "max_sequence_length": 128,
+            },
+        )
+
+        with self.assertRaises(pipeline.RequestValidationError):
+            pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="flux-schnell")
+
+    def test_flux_non_integer_steps_are_still_rejected_before_inference(self) -> None:
+        for value in (1.5, "4"):
             with self.subTest(steps=value):
                 request = pipeline.ExecutionRequest(
                     node_id="text-to-image",
@@ -3083,6 +3163,18 @@ class RuntimeHarnessTests(unittest.TestCase):
 
         self.assertNotIn("negative_prompt", params_by_id)
         self.assertEqual(
+            params_by_id["steps"],
+            {
+                "id": "steps",
+                "label": "Steps",
+                "type": "int",
+                "default": 4,
+                "min": 1,
+                "max": 30,
+                "tooltip": "Recommended range is 1-4 for FLUX Schnell; higher values are experimental and may not improve quality.",
+            },
+        )
+        self.assertEqual(
             params_by_id["max_sequence_length"],
             {
                 "id": "max_sequence_length",
@@ -3402,7 +3494,7 @@ class RuntimeHarnessTests(unittest.TestCase):
                     for param_id, expected_tooltip in expected_help.items():
                         self.assertEqual(params_schema[param_id]["tooltip"], expected_tooltip)
 
-    def test_manifests_expose_multi_image_and_output_format_parameters(self) -> None:
+    def test_manifests_hide_multi_image_and_expose_output_format_parameters(self) -> None:
         expected_nodes = {
             "sd15": ("text-to-image", "image-to-image"),
             "sdxl-base": ("text-to-image", "image-to-image"),
@@ -3415,18 +3507,7 @@ class RuntimeHarnessTests(unittest.TestCase):
             for node_id in node_ids:
                 with self.subTest(extension_id=extension_id, node_id=node_id):
                     params_schema = {schema["id"]: schema for schema in nodes[node_id]["params_schema"]}
-                    self.assertEqual(
-                        params_schema["num_images_per_prompt"],
-                        {
-                            "id": "num_images_per_prompt",
-                            "label": "Images",
-                            "type": "int",
-                            "default": 1,
-                            "min": 1,
-                            "max": 4,
-                            "tooltip": "Number of images to generate for one prompt; every returned image is saved.",
-                        },
-                    )
+                    self.assertNotIn("num_images_per_prompt", params_schema)
                     self.assertEqual(
                         params_schema["output_format"],
                         {

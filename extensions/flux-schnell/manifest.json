@@ -50,7 +50,8 @@
           "type": "int",
           "default": 4,
           "min": 1,
-          "max": 4
+          "max": 30,
+          "tooltip": "Recommended range is 1-4 for FLUX Schnell; higher values are experimental and may not improve quality."
         },
         {
           "id": "guidance_scale",
@@ -77,15 +78,6 @@
           "default": 42,
           "min": 0,
           "max": 2147483647
-        },
-        {
-          "id": "num_images_per_prompt",
-          "label": "Images",
-          "type": "int",
-          "default": 1,
-          "min": 1,
-          "max": 4,
-          "tooltip": "Number of images to generate for one prompt; every returned image is saved."
         },
         {
           "id": "output_format",

@@ -36,6 +36,7 @@ class RequestValidationError(DomainError):
 SUPPORTED_OUTPUT_FORMATS = {"png", "jpeg"}
 DEFAULT_OUTPUT_FORMAT = "png"
 JPEG_OUTPUT_EXTENSION = ".jpg"
+FLUX_SCHNELL_MAX_STEPS = 30
 
 
 @dataclass(frozen=True)
@@ -201,7 +202,7 @@ def _validate_node_payload(
             "steps",
             expected_type=int,
             minimum=1,
-            maximum=4 if flux_text_to_image else 150,
+            maximum=FLUX_SCHNELL_MAX_STEPS if flux_text_to_image else 150,
         ),
         "width": _validate_numeric_param(request.params, "width", expected_type=int, minimum=64, maximum=2048),
         "height": _validate_numeric_param(request.params, "height", expected_type=int, minimum=64, maximum=2048),
