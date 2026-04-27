@@ -33,9 +33,22 @@ The canonical shared code lives in `shared/runtime/local_image_runtime/` and is 
 
 These VRAM values are practical recommendations, not hard guarantees. Actual usage depends on resolution, precision, CPU/GPU offload, driver/runtime behavior, and memory optimizations available in the local environment.
 
-Current bundle support is functionally aligned for Linux ARM64 and Windows: SD15 and SDXL install, download weights, and generate successfully; FLUX.1-schnell installs, but its weight download depends on Hugging Face access for the exact model repository used by this extension.
+Current bundle support is functionally aligned for Linux ARM64 and Windows: SD15, SDXL, and FLUX.1-schnell install, download weights, and generate successfully when the local machine has the required runtime resources and upstream model access.
 
 For FLUX.1-schnell weights, open [`https://huggingface.co/black-forest-labs/FLUX.1-schnell`](https://huggingface.co/black-forest-labs/FLUX.1-schnell), log in, accept the model conditions, and share contact information if Hugging Face requests it. Use the same Hugging Face account/token that Modly uses for the download; otherwise the extension cannot download the weights.
+
+## Current Modly compatibility notes
+
+- This is a bundled local image model extension pack for Modly-compatible local model workflows.
+- Host-side bundle/model support is still ahead of upstream Modly in a few areas and is being discussed in [Modly issue #114](https://github.com/lightningpixel/modly/issues/114), so use a compatible Modly branch/fork until that support lands upstream.
+- Current preview flows use the primary generated image (`output_path`). The runtime can preserve additional output metadata internally, but richer multi-output display is a future Modly integration task.
+
+## Generation controls
+
+- SD15 and SDXL expose text-to-image and image-to-image controls such as prompt, negative prompt, size, steps, guidance scale, seed, and output format.
+- FLUX.1-schnell exposes text-to-image controls tuned for its pipeline, including prompt, size, steps, guidance scale, maximum sequence length, seed, and output format.
+- PNG is the default output format. JPEG output is available with a configurable JPEG quality value.
+- FLUX.1-schnell recommends low step counts (`1`-`4`) and guidance `0.0`, but higher values are allowed for experimentation and may not improve quality.
 
 The existing capability IDs remain unchanged by design:
 
