@@ -63,13 +63,19 @@ def is_retryable_diffusers_load_error(error: Exception) -> bool:
     return False
 
 
-def apply_post_load_memory_optimizations(*, pipeline: Any, extension_id: str) -> None:
+def apply_post_load_memory_optimizations(
+    *,
+    pipeline: Any,
+    extension_id: str,
+    enable_attention_slicing: bool = True,
+) -> None:
     if extension_id not in _OPTIMIZED_EXTENSION_IDS:
         return
 
-    enable_attention_slicing = getattr(pipeline, "enable_attention_slicing", None)
-    if callable(enable_attention_slicing):
-        enable_attention_slicing("auto")
+    if enable_attention_slicing:
+        attention_slicing = getattr(pipeline, "enable_attention_slicing", None)
+        if callable(attention_slicing):
+            attention_slicing("auto")
 
     enable_vae_slicing = getattr(pipeline, "enable_vae_slicing", None)
     if callable(enable_vae_slicing):

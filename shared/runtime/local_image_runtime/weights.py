@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any, Protocol
 
-from .descriptors import get_extension_descriptor, get_node_weight_specs
+from .descriptors import get_extension_descriptor, get_node_weight_specs, get_optional_feature_specs
 
 
 MODELS_DIR_ENV_VARS = (
@@ -25,15 +25,30 @@ FLUX_SCHNELL_HF_GATED_GUIDANCE = (
 
 
 class SnapshotDownloader(Protocol):
-    def snapshot_download(self, *, repo_id: str, local_dir: Path) -> Path:
+    def snapshot_download(
+        self,
+        *,
+        repo_id: str,
+        local_dir: Path,
+        allow_patterns: tuple[str, ...] | None = None,
+    ) -> Path:
         ...
 
 
 class HuggingFaceSnapshotDownloader:
-    def snapshot_download(self, *, repo_id: str, local_dir: Path) -> Path:
+    def snapshot_download(
+        self,
+        *,
+        repo_id: str,
+        local_dir: Path,
+        allow_patterns: tuple[str, ...] | None = None,
+    ) -> Path:
         from huggingface_hub import snapshot_download
 
-        return Path(snapshot_download(repo_id=repo_id, local_dir=str(local_dir)))
+        kwargs: dict[str, Any] = {"repo_id": repo_id, "local_dir": str(local_dir)}
+        if allow_patterns is not None:
+            kwargs["allow_patterns"] = list(allow_patterns)
+        return Path(snapshot_download(**kwargs))
 
 
 class FluxWeightDownloadError(RuntimeError):
@@ -54,6 +69,14 @@ class FluxWeightDiskError(FluxWeightDownloadError):
 
 class FluxWeightPartialDownloadError(FluxWeightDownloadError):
     """Raised when the downloader returns without the required check file."""
+
+
+class OptionalFeatureWeightDownloadError(RuntimeError):
+    """Base error for optional feature weight acquisition failures."""
+
+
+class OptionalFeatureWeightPartialDownloadError(OptionalFeatureWeightDownloadError):
+    """Raised when an optional feature download misses its required check file."""
 
 
 def _unique_strings(values: list[str]) -> list[str]:
@@ -261,6 +284,78 @@ def acquire_flux_schnell_weights(
     }
 
 
+def acquire_optional_feature_weights(
+    extension_id: str,
+    feature_id: str,
+    models_dir: str | Path,
+    *,
+    downloader: SnapshotDownloader | None = None,
+) -> dict[str, Any]:
+    optional_specs = get_optional_feature_specs(extension_id)
+    feature_spec = optional_specs.get(feature_id)
+    if feature_spec is None:
+        raise ValueError(f"Unknown optional feature '{feature_id}' for extension '{extension_id}'.")
+    if not feature_spec.get("supported", True):
+        reason = feature_spec.get("unsupported_reason") or f"Optional feature '{feature_id}' is not supported."
+        raise ValueError(str(reason))
+
+    repo_id = feature_spec["hf_repo"]
+    download_check = feature_spec["download_check"]
+    required_files = tuple(feature_spec.get("required_files", (download_check,)))
+    allow_patterns = tuple(feature_spec.get("allow_patterns", required_files))
+    root = Path(models_dir).expanduser().resolve()
+    target_dir = extension_models_dir(root, extension_id) / "optional" / feature_id
+    check_path = target_dir / download_check
+    missing_files = tuple(relative_path for relative_path in required_files if not (target_dir / relative_path).exists())
+
+    if not missing_files:
+        return {
+            "status": "ready",
+            "extension_id": extension_id,
+            "feature_id": feature_id,
+            "node_id": feature_spec["node_id"],
+            "hf_repo": repo_id,
+            "model_dir": str(target_dir),
+            "check_path": str(check_path),
+            "required_files": required_files,
+            "missing_files": (),
+            "downloaded": False,
+        }
+
+    active_downloader = downloader or HuggingFaceSnapshotDownloader()
+    try:
+        active_downloader.snapshot_download(
+            repo_id=repo_id,
+            local_dir=target_dir,
+            allow_patterns=allow_patterns,
+        )
+    except Exception as exc:
+        raise OptionalFeatureWeightDownloadError(
+            f"Optional feature '{feature_id}' weight download failed for extension '{extension_id}': {exc}"
+        ) from exc
+
+    missing_files = tuple(relative_path for relative_path in required_files if not (target_dir / relative_path).exists())
+    if missing_files:
+        raise OptionalFeatureWeightPartialDownloadError(
+            f"Optional feature '{feature_id}' weight download appears partial: required files "
+            f"{', '.join(str(target_dir / relative_path) for relative_path in missing_files)} "
+            "are missing after snapshot download."
+        )
+
+    return {
+        "status": "ready",
+        "extension_id": extension_id,
+        "feature_id": feature_id,
+        "node_id": feature_spec["node_id"],
+        "hf_repo": repo_id,
+        "model_dir": str(target_dir),
+        "check_path": str(check_path),
+        "required_files": required_files,
+        "missing_files": (),
+        "downloaded": True,
+    }
+
+
 def evaluate_extension_weights(
     extension_id: str,
     *,
@@ -280,6 +375,7 @@ def evaluate_extension_weights(
 
     diagnostics = list(resolved_models["diagnostics"])
     nodes: dict[str, dict[str, Any]] = {}
+    optional_features: dict[str, dict[str, Any]] = {}
     ready_node_count = 0
 
     if resolved_models_dir is not None:
@@ -354,6 +450,52 @@ def evaluate_extension_weights(
             "diagnostics": node_diagnostics,
         }
 
+    for feature_id, spec in get_optional_feature_specs(extension_id).items():
+        download_check = spec["download_check"]
+        required_files = tuple(spec.get("required_files", (download_check,)))
+        feature_root = extension_models_dir(resolved_models_dir, extension_id) / "optional" / feature_id if resolved_models_dir is not None else None
+        check_path = feature_root / download_check if feature_root is not None and download_check else None
+        missing_files = (
+            tuple(relative_path for relative_path in required_files if not (feature_root / relative_path).exists())
+            if feature_root is not None
+            else required_files
+        )
+        feature_diagnostics: list[str] = []
+        status = "missing"
+        if not spec.get("supported", True):
+            status = "unsupported"
+            missing_files = ()
+            reason = spec.get("unsupported_reason") or f"Optional {spec['label']} is not supported."
+            feature_diagnostics.append(str(reason))
+        elif resolved_models_dir is None:
+            status = "unconfigured"
+            feature_diagnostics.append(
+                f"Optional {spec['label']} readiness cannot be evaluated without modelsDir."
+            )
+        elif not missing_files:
+            status = "ready"
+        else:
+            feature_diagnostics.append(
+                f"Optional {spec['label']} is missing for '{extension_id}/{spec['node_id']}'. "
+                f"Expected IP-Adapter required files {', '.join(missing_files)} under '{feature_root}'."
+            )
+        diagnostics.extend(feature_diagnostics)
+        optional_features[feature_id] = {
+            "feature_id": feature_id,
+            "label": spec["label"],
+            "family": spec["family"],
+            "node_id": spec["node_id"],
+            "status": status,
+            "ready": status == "ready",
+            "hf_repo": spec["hf_repo"],
+            "download_check": download_check,
+            "required_files": required_files,
+            "missing_files": missing_files,
+            "model_dir": str(feature_root) if feature_root is not None else None,
+            "check_path": str(check_path) if check_path is not None else None,
+            "diagnostics": feature_diagnostics,
+        }
+
     overall_status = "ready"
     if resolved_models_dir is None:
         overall_status = "unconfigured"
@@ -372,6 +514,7 @@ def evaluate_extension_weights(
         "ready_node_count": ready_node_count,
         "total_node_count": len(nodes),
         "nodes": nodes,
+        "optional_features": optional_features,
         "diagnostics": _unique_strings(diagnostics),
         "legacy": {
             "model_dir": str(legacy_extension_dir) if legacy_extension_dir is not None else None,
@@ -390,7 +533,10 @@ __all__ = [
     "FluxWeightPartialDownloadError",
     "HuggingFaceSnapshotDownloader",
     "MODELS_DIR_ENV_VARS",
+    "OptionalFeatureWeightDownloadError",
+    "OptionalFeatureWeightPartialDownloadError",
     "SnapshotDownloader",
+    "acquire_optional_feature_weights",
     "acquire_flux_schnell_weights",
     "download_check_path",
     "evaluate_extension_weights",

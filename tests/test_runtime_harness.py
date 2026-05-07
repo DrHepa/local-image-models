@@ -26,6 +26,7 @@ if str(RUNTIME_ROOT) not in sys.path:
 from local_image_runtime import (  # noqa: E402
     bootstrap,
     dependencies,
+    descriptors,
     install_contract,
     pipeline,
     runtime_adapter,
@@ -538,6 +539,20 @@ class RuntimeHarnessTests(unittest.TestCase):
         )
         return None
 
+    def _fake_optional_feature_acquisition(self, extension_id, feature_id, models_dir, *, downloader=None):
+        target_dir = Path(models_dir) / extension_id / "optional" / feature_id
+        check_path = target_dir / "sdxl_models" / "ip-adapter_sdxl.bin"
+        check_path.parent.mkdir(parents=True, exist_ok=True)
+        check_path.write_bytes(b"adapter")
+        return {
+            "status": "ready",
+            "extension_id": extension_id,
+            "feature_id": feature_id,
+            "model_dir": str(target_dir),
+            "check_path": str(check_path),
+            "downloaded": True,
+        }
+
     def _run_setup_success(
         self, extension_id: str, runtime_root: Path | None = None
     ) -> tuple[Path, install_contract.SetupResult]:
@@ -561,6 +576,12 @@ class RuntimeHarnessTests(unittest.TestCase):
             )
             stack.enter_context(
                 patch("local_image_runtime.install_contract._install_dependency_step", return_value=None)
+            )
+            stack.enter_context(
+                patch(
+                    "local_image_runtime.install_contract.acquire_optional_feature_weights",
+                    side_effect=self._fake_optional_feature_acquisition,
+                )
             )
             stack.enter_context(
                 patch("local_image_runtime.bootstrap._smoke_test_runtime_imports", return_value=(True, "stubbed imports"))
@@ -2353,6 +2374,64 @@ class RuntimeHarnessTests(unittest.TestCase):
         self.assertEqual(materialized_input.read_bytes(), b"fake-image-bytes")
         self.assertEqual(materialized_input.parent, outputs_dir / ".modly-inputs")
 
+    def test_build_generate_request_for_sdxl_image_to_image_propagates_style_reference_to_conditioning(self) -> None:
+        for input_key in ("Style reference", "style_reference"):
+            with self.subTest(input_key=input_key):
+                generator_class = self._load_generator_class("sdxl-base")
+                model_dir = self._make_model_dir("sdxl-base", "image-to-image")
+                outputs_dir = Path(tempfile.mkdtemp(prefix="outputs-sdxl-style-generator-"))
+                style_reference = outputs_dir / "style-reference.png"
+                style_reference.write_bytes(f"style-reference-{input_key}".encode("utf-8"))
+                generator = generator_class(model_dir, outputs_dir)
+
+                request = generator._build_generate_request(
+                    b"primary-image-bytes",
+                    {
+                        "prompt": "variation",
+                        "strength": 0.35,
+                        "reference_strength": 0.4,
+                        "input": {input_key: str(style_reference)},
+                    },
+                )
+                payload_details = pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="sdxl-base")
+                self.assertIsNotNone(payload_details.conditioning)
+                self.assertEqual(
+                    payload_details.conditioning.to_backend_payload(),
+                    {"references": [{"role": "style", "filePath": str(style_reference.resolve())}]},
+                )
+                self.assertEqual(payload_details.numeric_params["reference_strength"], 0.4)
+                materialized_input = Path(request.input["filePath"])
+                self.assertEqual(materialized_input.read_bytes(), b"primary-image-bytes")
+
+    def test_build_generate_request_for_sdxl_image_to_image_maps_left_image_path_to_style_reference(self) -> None:
+        generator_class = self._load_generator_class("sdxl-base")
+        model_dir = self._make_model_dir("sdxl-base", "image-to-image")
+        outputs_dir = Path(tempfile.mkdtemp(prefix="outputs-sdxl-left-generator-"))
+        style_reference = outputs_dir / "left-style-reference.png"
+        style_reference.write_bytes(b"left-style-reference")
+        generator = generator_class(model_dir, outputs_dir)
+
+        request = generator._build_generate_request(
+            b"primary-front-image-bytes",
+            {
+                "prompt": "variation",
+                "strength": 0.35,
+                "reference_strength": 0.45,
+                "left_image_path": str(style_reference),
+            },
+        )
+        payload_details = pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="sdxl-base")
+
+        self.assertIsNotNone(payload_details.conditioning)
+        self.assertEqual(
+            payload_details.conditioning.to_backend_payload(),
+            {"references": [{"role": "style", "filePath": str(style_reference.resolve())}]},
+        )
+        self.assertEqual(payload_details.numeric_params["reference_strength"], 0.45)
+        self.assertNotIn("left_image_path", request.params)
+        materialized_input = Path(request.input["filePath"])
+        self.assertEqual(materialized_input.read_bytes(), b"primary-front-image-bytes")
+
     def test_extension_generator_generate_rejects_invalid_image_to_image_strength(self) -> None:
         generator_class = self._load_generator_class("sd15")
         model_dir = self._make_model_dir("sd15", "image-to-image")
@@ -2377,6 +2456,71 @@ class RuntimeHarnessTests(unittest.TestCase):
             ):
                 generator.generate(b"fake-image-bytes", {"prompt": "variation"})
 
+    def test_image_to_image_validation_rejects_zero_effective_denoising_steps(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="img2img-zero-steps-"))
+        source_path = workspace_dir / "primary-source.png"
+        source_path.write_bytes(b"primary")
+        request = pipeline.ExecutionRequest(
+            node_id="image-to-image",
+            input={"filePath": str(source_path)},
+            params={"prompt": "variation", "strength": 0.35, "steps": 1},
+            workspace_dir=str(workspace_dir),
+        )
+
+        with self.assertRaisesRegex(
+            pipeline.RequestValidationError,
+            "steps.*strength.*at least one.*denoising.*step",
+        ):
+            pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="sdxl-base")
+
+    def test_image_to_image_validation_accepts_low_combo_with_effective_denoising_step(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="img2img-one-step-"))
+        source_path = workspace_dir / "primary-source.png"
+        source_path.write_bytes(b"primary")
+        request = pipeline.ExecutionRequest(
+            node_id="image-to-image",
+            input={"filePath": str(source_path)},
+            params={"prompt": "variation", "strength": 0.8, "steps": 2},
+            workspace_dir=str(workspace_dir),
+        )
+
+        validated = pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="sdxl-base")
+
+        self.assertEqual(validated.numeric_params["steps"], 2)
+        self.assertEqual(validated.numeric_params["strength"], 0.8)
+        self.assertEqual(validated.source_image_path, str(source_path.resolve()))
+
+    def test_inference_runner_rejects_zero_effective_denoising_steps_before_diffusers(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        class FailingIfDiffusersInvoked:
+            def from_pretrained(self, model_dir: str, **kwargs: object) -> object:
+                raise AssertionError("Diffusers must not be invoked for invalid zero-step img2img params")
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="runner-img2img-zero-steps-"))
+        job = {
+            "extension_id": "sdxl-base",
+            "family": "sdxl",
+            "node_id": "image-to-image",
+            "model_dir": str(workspace_dir / "model"),
+            "workspace_dir": str(workspace_dir),
+            "output_path": str(workspace_dir / "result.png"),
+            "prompt": "variation",
+            "source_image_path": str(workspace_dir / "source.png"),
+            "params": {"steps": 1, "strength": 0.35},
+        }
+
+        with patch.dict(
+            inference_runner._PIPELINE_LOADERS,
+            {("sdxl", "image-to-image"): FailingIfDiffusersInvoked()},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                inference_runner.InferenceRunnerError,
+                "steps.*strength.*at least one.*denoising.*step",
+            ):
+                inference_runner.run_child_job(job)
+
     def test_pipeline_validate_node_payload_rejects_nonexistent_image_to_image_source_file(self) -> None:
         workspace_dir = Path(tempfile.mkdtemp(prefix="workspace-missing-source-"))
         request = pipeline.ExecutionRequest(
@@ -2391,6 +2535,1058 @@ class RuntimeHarnessTests(unittest.TestCase):
             "image-to-image input.filePath must point to an existing local file",
         ):
             pipeline._validate_node_payload(request, legacy_model_id=None)
+
+    def test_baseline_text_to_image_payload_and_runner_kwargs_omit_conditioning(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="baseline-text-conditioning-"))
+        extension_root = Path(tempfile.mkdtemp(prefix="ext-root-baseline-text-"))
+        (extension_root / "src").mkdir(parents=True, exist_ok=True)
+        venv_python = self._make_executable_python(extension_root)
+        request = pipeline.ExecutionRequest(
+            node_id="text-to-image",
+            input={"text": "baseline text"},
+            params={"prompt": "baseline text", "steps": 4, "guidance_scale": 7.5},
+            workspace_dir=str(workspace_dir),
+        )
+
+        payload_details = pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="sd15")
+        self.assertIsNone(payload_details.conditioning)
+        job = pipeline._build_backend_job(
+            request=request,
+            extension_id="sd15",
+            extension_record={"venv_python": str(venv_python), "model_dir": "/runtime/local/sd15"},
+            payload_details=payload_details,
+            effective_workspace_dir=str(workspace_dir),
+        )
+
+        self.assertNotIn("conditioning", job.payload)
+        runner_kwargs = inference_runner._build_pipeline_kwargs(job.payload, execution_device="cpu")
+        self.assertEqual(runner_kwargs["prompt"], "baseline text")
+        self.assertEqual(runner_kwargs["num_inference_steps"], 4)
+        self.assertEqual(runner_kwargs["guidance_scale"], 7.5)
+        self.assertNotIn("image", runner_kwargs)
+        self.assertNotIn("strength", runner_kwargs)
+        self.assertNotIn("ip_adapter_image", runner_kwargs)
+        self.assertNotIn("control_image", runner_kwargs)
+
+    def test_baseline_image_to_image_keeps_primary_source_and_omits_conditioning(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="baseline-img2img-conditioning-"))
+        source_path = workspace_dir / "primary-source.png"
+        source_path.write_bytes(b"primary")
+        extension_root = Path(tempfile.mkdtemp(prefix="ext-root-baseline-img2img-"))
+        (extension_root / "src").mkdir(parents=True, exist_ok=True)
+        venv_python = self._make_executable_python(extension_root)
+        source_image_token = object()
+        request = pipeline.ExecutionRequest(
+            node_id="image-to-image",
+            input={"filePath": str(source_path)},
+            params={"prompt": "variation", "strength": 0.55, "steps": 4},
+            workspace_dir=str(workspace_dir),
+        )
+
+        payload_details = pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="sdxl-base")
+        self.assertEqual(payload_details.source_image_path, str(source_path.resolve()))
+        self.assertIsNone(payload_details.conditioning)
+        job = pipeline._build_backend_job(
+            request=request,
+            extension_id="sdxl-base",
+            extension_record={"venv_python": str(venv_python), "model_dir": "/runtime/local/sdxl"},
+            payload_details=payload_details,
+            effective_workspace_dir=str(workspace_dir),
+        )
+
+        self.assertEqual(job.payload["source_image_path"], str(source_path.resolve()))
+        self.assertNotIn("conditioning", job.payload)
+        with patch("local_image_runtime.inference_runner._open_source_image", return_value=source_image_token) as open_source_image:
+            runner_kwargs = inference_runner._build_pipeline_kwargs(job.payload, execution_device="cpu")
+
+        open_source_image.assert_called_once_with(str(source_path.resolve()))
+        self.assertIs(runner_kwargs["image"], source_image_token)
+        self.assertEqual(runner_kwargs["strength"], 0.55)
+        self.assertNotIn("ip_adapter_image", runner_kwargs)
+        self.assertNotIn("control_image", runner_kwargs)
+
+    def test_empty_conditioning_contract_is_inert_for_image_to_image(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="empty-conditioning-"))
+        source_path = workspace_dir / "primary-source.png"
+        source_path.write_bytes(b"primary")
+        extension_root = Path(tempfile.mkdtemp(prefix="ext-root-empty-conditioning-"))
+        (extension_root / "src").mkdir(parents=True, exist_ok=True)
+        venv_python = self._make_executable_python(extension_root)
+        request = pipeline.ExecutionRequest(
+            node_id="image-to-image",
+            input={"filePath": str(source_path), "conditioning": {"references": [], "controls": []}},
+            params={"prompt": "variation", "strength": 0.55, "steps": 4},
+            workspace_dir=str(workspace_dir),
+        )
+
+        payload_details = pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="sdxl-base")
+        self.assertIsNone(payload_details.conditioning)
+        job = pipeline._build_backend_job(
+            request=request,
+            extension_id="sdxl-base",
+            extension_record={"venv_python": str(venv_python), "model_dir": "/runtime/local/sdxl"},
+            payload_details=payload_details,
+            effective_workspace_dir=str(workspace_dir),
+        )
+
+        self.assertEqual(job.payload["source_image_path"], str(source_path.resolve()))
+        self.assertNotIn("conditioning", job.payload)
+
+    def test_base_image_to_image_rejects_handcrafted_control_conditioning_payloads(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="base-img2img-control-guard-"))
+        source_path = workspace_dir / "primary-source.png"
+        control_path = workspace_dir / "control-source.png"
+        source_path.write_bytes(b"primary")
+        control_path.write_bytes(b"control")
+
+        cases = (
+            (
+                "sdxl-base",
+                {"filePath": str(source_path), "conditioning": {"controls": [{"role": "structure", "control_type": "canny", "filePath": str(control_path)}]}},
+                {"prompt": "variation", "strength": 0.55, "steps": 4},
+            ),
+            (
+                "sd15",
+                {"filePath": str(source_path)},
+                {"prompt": "variation", "strength": 0.55, "steps": 4, "conditioning": {"controls": [{"role": "structure", "control_type": "depth", "filePath": str(control_path)}]}},
+            ),
+        )
+        for extension_id, input_payload, params in cases:
+            with self.subTest(extension_id=extension_id):
+                request = pipeline.ExecutionRequest(
+                    node_id="image-to-image",
+                    input=input_payload,
+                    params=params,
+                    workspace_dir=str(workspace_dir),
+                )
+
+                with self.assertRaisesRegex(
+                    pipeline.RequestValidationError,
+                    "ControlNet.*control conditioning.*not supported.*base image-to-image.*explicit ControlNet nodes",
+                ):
+                    pipeline._validate_node_payload(request, legacy_model_id=None, extension_id=extension_id)
+
+    def test_conditioning_contract_rejects_anonymous_ordered_image_inputs(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="anonymous-conditioning-"))
+        source_path = workspace_dir / "primary-source.png"
+        source_path.write_bytes(b"primary")
+
+        for anonymous_key in ("Image 2", "Image 3", "image_4"):
+            with self.subTest(anonymous_key=anonymous_key):
+                request = pipeline.ExecutionRequest(
+                    node_id="image-to-image",
+                    input={"filePath": str(source_path), anonymous_key: str(source_path)},
+                    params={"prompt": "variation", "strength": 0.55, "steps": 4},
+                    workspace_dir=str(workspace_dir),
+                )
+
+                with self.assertRaisesRegex(pipeline.RequestValidationError, "Anonymous image input"):
+                    pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="sdxl-base")
+
+    def test_sdxl_style_reference_payload_defaults_strength_and_serializes_conditioning(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="sdxl-style-reference-"))
+        source_path = workspace_dir / "primary-source.png"
+        reference_path = workspace_dir / "style-reference.png"
+        source_path.write_bytes(b"primary")
+        reference_path.write_bytes(b"style")
+        extension_root = Path(tempfile.mkdtemp(prefix="ext-root-sdxl-style-"))
+        (extension_root / "src").mkdir(parents=True, exist_ok=True)
+        venv_python = self._make_executable_python(extension_root)
+        request = pipeline.ExecutionRequest(
+            node_id="image-to-image",
+            input={"filePath": str(source_path), "Style reference": str(reference_path)},
+            params={"prompt": "variation", "strength": 0.55, "steps": 4},
+            workspace_dir=str(workspace_dir),
+        )
+
+        payload_details = pipeline._validate_node_payload(request, legacy_model_id=None, extension_id="sdxl-base")
+        self.assertIsNotNone(payload_details.conditioning)
+        self.assertEqual(payload_details.numeric_params["reference_strength"], 0.6)
+        self.assertEqual(
+            payload_details.conditioning.to_backend_payload(),
+            {"references": [{"role": "style", "filePath": str(reference_path.resolve())}]},
+        )
+        job = pipeline._build_backend_job(
+            request=request,
+            extension_id="sdxl-base",
+            extension_record={"venv_python": str(venv_python), "model_dir": "/runtime/local/sdxl"},
+            payload_details=payload_details,
+            effective_workspace_dir=str(workspace_dir),
+        )
+
+        self.assertEqual(job.payload["source_image_path"], str(source_path.resolve()))
+        self.assertEqual(job.payload["params"]["reference_strength"], 0.6)
+        self.assertEqual(job.payload["conditioning"], {"references": [{"role": "style", "filePath": str(reference_path.resolve())}]})
+
+    def test_sdxl_style_reference_validates_strength_bounds_family_and_count(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="sdxl-style-validation-"))
+        source_path = workspace_dir / "primary-source.png"
+        reference_path = workspace_dir / "style-reference.png"
+        second_reference_path = workspace_dir / "second-reference.png"
+        source_path.write_bytes(b"primary")
+        reference_path.write_bytes(b"style")
+        second_reference_path.write_bytes(b"second")
+
+        invalid_cases = (
+            (
+                "sdxl-base",
+                {"filePath": str(source_path), "Style reference": str(reference_path)},
+                {"prompt": "variation", "strength": 0.55, "reference_strength": 1.2},
+                "reference_strength.*<= 1.0",
+            ),
+            (
+                "sdxl-base",
+                {"filePath": str(source_path), "Style reference": str(reference_path), "style_reference": str(second_reference_path)},
+                {"prompt": "variation", "strength": 0.55},
+                "one style reference",
+            ),
+            (
+                "sd15",
+                {"filePath": str(source_path), "Style reference": str(reference_path)},
+                {"prompt": "variation", "strength": 0.55},
+                "SD1.5.*not supported.*not verified",
+            ),
+        )
+        for extension_id, input_payload, params, expected_message in invalid_cases:
+            with self.subTest(extension_id=extension_id, expected_message=expected_message):
+                request = pipeline.ExecutionRequest(
+                    node_id="image-to-image",
+                    input=input_payload,
+                    params=params,
+                    workspace_dir=str(workspace_dir),
+                )
+                with self.assertRaisesRegex(pipeline.RequestValidationError, expected_message):
+                    pipeline._validate_node_payload(request, legacy_model_id=None, extension_id=extension_id)
+
+    def test_sdxl_manifest_exposes_optional_style_reference_without_multi_init_language(self) -> None:
+        manifest = self._extension_manifest_data("sdxl-base")
+        nodes = {node["id"]: node for node in manifest["nodes"]}
+        image_node = nodes["image-to-image"]
+        params_schema = {schema["id"]: schema for schema in image_node["params_schema"]}
+
+        self.assertEqual(image_node["style_reference"], {"label": "Style reference", "optional": True, "role": "style"})
+        self.assertEqual(
+            image_node["inputs"],
+            [
+                {"name": "front", "label": "Primary image", "type": "image", "required": True},
+                {"name": "left", "label": "Style reference", "type": "image", "required": False},
+            ],
+        )
+        self.assertEqual(
+            params_schema["reference_strength"],
+            {
+                "id": "reference_strength",
+                "label": "Reference Strength",
+                "type": "float",
+                "default": 0.6,
+                "min": 0,
+                "max": 1,
+                "tooltip": "Controls optional SDXL IP-Adapter style reference guidance; the primary image remains the init image.",
+            },
+        )
+        manifest_text = self._extension_manifest("sdxl-base").casefold()
+        self.assertNotIn("image 2", manifest_text)
+        self.assertNotIn("multi-init", manifest_text)
+        self.assertNotIn("batch", manifest_text)
+        self.assertNotIn("controlnet", manifest_text)
+
+    def test_sd15_manifest_keeps_style_reference_ux_gated_until_verified(self) -> None:
+        manifest = self._extension_manifest_data("sd15")
+        nodes = {node["id"]: node for node in manifest["nodes"]}
+        image_node = nodes["image-to-image"]
+        params_schema = {schema["id"]: schema for schema in image_node["params_schema"]}
+        manifest_text = self._extension_manifest("sd15").casefold()
+
+        self.assertNotIn("style_reference", image_node)
+        self.assertNotIn("inputs", image_node)
+        self.assertNotIn("reference_strength", params_schema)
+        self.assertNotIn("style reference", manifest_text)
+        self.assertNotIn("image 2", manifest_text)
+        self.assertNotIn("image 3", manifest_text)
+
+    def test_sd15_style_reference_request_is_rejected_as_unverified_while_sdxl_is_accepted(self) -> None:
+        workspace_dir = Path(tempfile.mkdtemp(prefix="sd15-style-gate-"))
+        source_path = workspace_dir / "primary-source.png"
+        reference_path = workspace_dir / "style-reference.png"
+        source_path.write_bytes(b"primary")
+        reference_path.write_bytes(b"style")
+        sd15_request = pipeline.ExecutionRequest(
+            node_id="image-to-image",
+            input={"filePath": str(source_path), "Style reference": str(reference_path)},
+            params={"prompt": "variation", "strength": 0.55, "steps": 4, "reference_strength": 0.4},
+            workspace_dir=str(workspace_dir),
+        )
+        sdxl_request = pipeline.ExecutionRequest(
+            node_id="image-to-image",
+            input={"filePath": str(source_path), "Style reference": str(reference_path)},
+            params={"prompt": "variation", "strength": 0.55, "steps": 4, "reference_strength": 0.4},
+            workspace_dir=str(workspace_dir),
+        )
+
+        with self.assertRaisesRegex(
+            pipeline.RequestValidationError,
+            "SD1.5.*style reference.*not supported.*not verified",
+        ):
+            pipeline._validate_node_payload(sd15_request, legacy_model_id=None, extension_id="sd15")
+
+        validated = pipeline._validate_node_payload(sdxl_request, legacy_model_id=None, extension_id="sdxl-base")
+        self.assertIsNotNone(validated.conditioning)
+        self.assertEqual(validated.numeric_params["reference_strength"], 0.4)
+
+    def test_sd15_optional_ip_adapter_readiness_is_explicitly_unsupported_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sd15-models-") as temp_dir:
+            models_dir = Path(temp_dir)
+            for node_id in ("text-to-image", "image-to-image"):
+                base_check = models_dir / "sd15" / node_id / "model_index.json"
+                base_check.parent.mkdir(parents=True, exist_ok=True)
+                base_check.write_text("{}\n", encoding="utf-8")
+            readiness = weights.evaluate_extension_weights("sd15", models_dir=models_dir)
+
+        self.assertEqual(readiness["status"], "ready")
+        optional = readiness["optional_features"]["sd15_ip_adapter_style"]
+        self.assertEqual(optional["status"], "unsupported")
+        self.assertFalse(optional["ready"])
+        self.assertEqual(optional["missing_files"], ())
+        diagnostics_text = " ".join(optional["diagnostics"])
+        self.assertIn("SD1.5", diagnostics_text)
+        self.assertIn("not verified", diagnostics_text)
+        self.assertIn("smoke", diagnostics_text)
+
+    def test_sd15_setup_contract_does_not_download_unsupported_ip_adapter_assets(self) -> None:
+        runtime_root = self._make_runtime_root("sd15")
+        attempted_downloads: list[dict[str, object]] = []
+
+        def fail_if_optional_feature_downloaded(extension_id, feature_id, models_dir, *, downloader=None):
+            attempted_downloads.append({"extension_id": extension_id, "feature_id": feature_id, "models_dir": Path(models_dir)})
+            raise AssertionError("SD1.5 unsupported IP-Adapter assets must not be acquired by install/repair")
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)}, clear=False))
+            stack.enter_context(patch("local_image_runtime.install_contract.detect_platform", return_value=SUPPORTED_PLATFORM))
+            stack.enter_context(patch("local_image_runtime.install_contract.resolve_dependency_plan", return_value=self._fake_plan("sd15")))
+            stack.enter_context(patch("local_image_runtime.install_contract._run_checked", side_effect=self._run_checked_side_effect))
+            stack.enter_context(patch("local_image_runtime.install_contract._install_dependency_step", return_value=None))
+            stack.enter_context(patch("local_image_runtime.bootstrap._smoke_test_runtime_imports", return_value=(True, "stubbed imports")))
+            stack.enter_context(
+                patch(
+                    "local_image_runtime.install_contract.acquire_optional_feature_weights",
+                    side_effect=fail_if_optional_feature_downloaded,
+                )
+            )
+
+            result = install_contract.run_install_setup_contract(
+                extension_id="sd15",
+                stdin_text=self._payload(runtime_root),
+            )
+
+        self.assertEqual(result.status, bootstrap.SETUP_STATUS_READY)
+        self.assertEqual(attempted_downloads, [])
+
+    def test_base_image_to_image_manifests_do_not_expose_controlnet_params_or_anonymous_images(self) -> None:
+        forbidden_param_fragments = (
+            "controlnet",
+            "control_image",
+            "control image",
+            "control_type",
+            "control strength",
+            "control_strength",
+            "canny",
+            "depth",
+            "normal",
+            "pose",
+        )
+
+        for extension_id in ("sdxl-base", "sd15"):
+            with self.subTest(extension_id=extension_id):
+                manifest = self._extension_manifest_data(extension_id)
+                nodes = {node["id"]: node for node in manifest["nodes"]}
+                image_node = nodes["image-to-image"]
+                params_schema = image_node["params_schema"]
+                self.assertGreater(len(params_schema), 0)
+
+                searchable_param_text = json.dumps(params_schema, sort_keys=True).casefold()
+                for fragment in forbidden_param_fragments:
+                    self.assertNotIn(fragment, searchable_param_text)
+
+                input_slots = image_node.get("inputs", [])
+                self.assertNotIn("Image 2", json.dumps(input_slots, sort_keys=True))
+                self.assertNotIn("Image 3", json.dumps(input_slots, sort_keys=True))
+                self.assertNotIn("Image 4", json.dumps(input_slots, sort_keys=True))
+
+    def test_controlnet_manifest_exposure_is_explicit_separate_and_non_baseline_if_added(self) -> None:
+        for extension_id in ("sdxl-base", "sd15"):
+            with self.subTest(extension_id=extension_id):
+                manifest = self._extension_manifest_data(extension_id)
+                nodes = manifest["nodes"]
+                base_image_node = next(node for node in nodes if node["id"] == "image-to-image")
+                base_text = json.dumps(base_image_node, sort_keys=True).casefold()
+                self.assertNotIn("controlnet", base_text)
+                self.assertNotIn("control image", base_text)
+                self.assertNotIn("control_image", base_text)
+
+                control_nodes = [
+                    node
+                    for node in nodes
+                    if "controlnet" in json.dumps(node, sort_keys=True).casefold()
+                    or "structural control" in json.dumps(node, sort_keys=True).casefold()
+                ]
+                for control_node in control_nodes:
+                    label_text = " ".join(
+                        str(control_node.get(key, "")) for key in ("id", "name", "description")
+                    ).casefold()
+                    self.assertNotEqual(control_node["id"], "image-to-image")
+                    self.assertRegex(label_text, r"controlnet|structural control|canny|depth")
+                    self.assertNotIn("Image 2", json.dumps(control_node, sort_keys=True))
+                    self.assertNotEqual(control_node.get("readiness"), "ready")
+
+    def test_baseline_dependency_plans_exclude_controlnet_preprocessors_and_keep_them_optional(self) -> None:
+        forbidden_packages = ("controlnet_aux", "opencv-python", "opencv-python-headless", "cv2")
+
+        for extension_id in ("sdxl-base", "sd15"):
+            with self.subTest(extension_id=extension_id):
+                descriptor = descriptors.get_extension_descriptor(extension_id)
+                self.assertIsNotNone(descriptor)
+                assert descriptor is not None
+                plan = dependencies.resolve_dependency_plan(
+                    extension_id=extension_id,
+                    dependency_family=descriptor.dependency_family,
+                    readiness_imports=descriptor.readiness_imports,
+                    platform_info=SUPPORTED_PLATFORM,
+                    python_tag="cp311",
+                    cuda_version="12.4",
+                )
+                baseline_packages = tuple(
+                    package.casefold()
+                    for step in (*plan.shared_steps, *plan.family_steps)
+                    for package in step.packages
+                )
+                baseline_imports = tuple(module.casefold() for module in plan.readiness_imports)
+                optional_groups = dependencies.get_optional_dependency_groups(extension_id)
+
+                for forbidden in forbidden_packages:
+                    self.assertFalse(any(forbidden in package for package in baseline_packages))
+                    self.assertNotIn(forbidden, baseline_imports)
+                self.assertIn(f"{extension_id}_controlnet_preprocessors", optional_groups)
+                controlnet_group = optional_groups[f"{extension_id}_controlnet_preprocessors"]
+                self.assertFalse(controlnet_group["baseline"])
+                self.assertEqual(controlnet_group["state"], dependencies.PLAN_STATE_UNSUPPORTED)
+                self.assertIn("controlnet_aux", controlnet_group["packages"])
+                self.assertTrue(any(package.startswith("opencv-python") for package in controlnet_group["packages"]))
+
+    def test_controlnet_readiness_metadata_is_planned_unsupported_and_separate_from_base_nodes(self) -> None:
+        expected_feature_ids = {
+            "sdxl-base": "sdxl_controlnet_canny",
+            "sd15": "sd15_controlnet_canny",
+        }
+
+        with tempfile.TemporaryDirectory(prefix="controlnet-readiness-") as temp_dir:
+            models_dir = Path(temp_dir)
+            for extension_id in ("sdxl-base", "sd15"):
+                for node_id in ("text-to-image", "image-to-image"):
+                    base_check = models_dir / extension_id / node_id / "model_index.json"
+                    base_check.parent.mkdir(parents=True, exist_ok=True)
+                    base_check.write_text("{}\n", encoding="utf-8")
+
+            for extension_id, feature_id in expected_feature_ids.items():
+                with self.subTest(extension_id=extension_id):
+                    specs = descriptors.get_optional_feature_specs(extension_id)
+                    self.assertIn(feature_id, specs)
+                    feature = specs[feature_id]
+                    self.assertFalse(feature["supported"])
+                    self.assertTrue(feature["explicit_node_required"])
+                    self.assertNotEqual(feature["node_id"], "image-to-image")
+                    self.assertIn("ControlNet", feature["label"])
+                    self.assertIn("per-control", feature["node_strategy"])
+
+                    readiness = weights.evaluate_extension_weights(extension_id, models_dir=models_dir)
+                    self.assertEqual(readiness["status"], "ready")
+                    controlnet_readiness = readiness["optional_features"][feature_id]
+                    self.assertEqual(controlnet_readiness["status"], "unsupported")
+                    self.assertFalse(controlnet_readiness["ready"])
+                    diagnostics_text = " ".join(controlnet_readiness["diagnostics"])
+                    self.assertIn("ControlNet", diagnostics_text)
+                    self.assertIn("separate", diagnostics_text.casefold())
+                    self.assertIn("smoke", diagnostics_text.casefold())
+
+    def test_sdxl_ip_adapter_readiness_is_optional_and_separate_from_base_weights(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sdxl-models-") as temp_dir:
+            models_dir = Path(temp_dir)
+            for node_id in ("text-to-image", "image-to-image"):
+                base_check = models_dir / "sdxl-base" / node_id / "model_index.json"
+                base_check.parent.mkdir(parents=True, exist_ok=True)
+                base_check.write_text("{}\n", encoding="utf-8")
+            readiness = weights.evaluate_extension_weights("sdxl-base", models_dir=models_dir)
+
+        image_node = readiness["nodes"]["image-to-image"]
+        optional = readiness["optional_features"]["sdxl_ip_adapter_style"]
+        self.assertEqual(readiness["status"], "ready")
+        self.assertEqual(image_node["status"], "ready")
+        self.assertEqual(optional["status"], "missing")
+        self.assertFalse(optional["ready"])
+        self.assertIn("optional", " ".join(optional["diagnostics"]).casefold())
+        self.assertIn("IP-Adapter", " ".join(optional["diagnostics"]))
+
+    def test_sdxl_ip_adapter_descriptor_requires_adapter_and_image_encoder_assets(self) -> None:
+        specs = descriptors.get_optional_feature_specs("sdxl-base")
+
+        feature = specs["sdxl_ip_adapter_style"]
+
+        self.assertEqual(feature["download_check"], "sdxl_models/ip-adapter_sdxl.bin")
+        self.assertEqual(
+            feature["required_files"],
+            (
+                "sdxl_models/ip-adapter_sdxl.bin",
+                "sdxl_models/image_encoder/config.json",
+                "sdxl_models/image_encoder/model.safetensors",
+            ),
+        )
+        self.assertEqual(feature["allow_patterns"], feature["required_files"])
+        self.assertNotIn("sdxl_models/image_encoder/pytorch_model.bin", feature["allow_patterns"])
+
+    def test_sdxl_optional_feature_weight_acquisition_uses_descriptor_target(self) -> None:
+        class FakeDownloader:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def snapshot_download(
+                self,
+                *,
+                repo_id: str,
+                local_dir: Path,
+                allow_patterns: tuple[str, ...] | None = None,
+            ) -> Path:
+                self.calls.append({"repo_id": repo_id, "local_dir": local_dir, "allow_patterns": allow_patterns})
+                for relative_path in allow_patterns or ():
+                    target = local_dir / relative_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(b"asset")
+                return local_dir
+
+        with tempfile.TemporaryDirectory(prefix="sdxl-models-") as temp_dir:
+            models_dir = Path(temp_dir)
+            downloader = FakeDownloader()
+
+            result = weights.acquire_optional_feature_weights(
+                "sdxl-base",
+                "sdxl_ip_adapter_style",
+                models_dir,
+                downloader=downloader,
+            )
+
+        expected_target = models_dir / "sdxl-base" / "optional" / "sdxl_ip_adapter_style"
+        self.assertEqual(
+            downloader.calls,
+            [
+                {
+                    "repo_id": "h94/IP-Adapter",
+                    "local_dir": expected_target,
+                    "allow_patterns": (
+                        "sdxl_models/ip-adapter_sdxl.bin",
+                        "sdxl_models/image_encoder/config.json",
+                        "sdxl_models/image_encoder/model.safetensors",
+                    ),
+                }
+            ],
+        )
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["feature_id"], "sdxl_ip_adapter_style")
+        self.assertEqual(result["model_dir"], str(expected_target))
+        self.assertEqual(result["check_path"], str(expected_target / "sdxl_models" / "ip-adapter_sdxl.bin"))
+        self.assertEqual(
+            result["required_files"],
+            (
+                "sdxl_models/ip-adapter_sdxl.bin",
+                "sdxl_models/image_encoder/config.json",
+                "sdxl_models/image_encoder/model.safetensors",
+            ),
+        )
+
+    def test_sdxl_optional_feature_weight_acquisition_limits_snapshot_to_download_check(self) -> None:
+        class FakeDownloader:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def snapshot_download(
+                self,
+                *,
+                repo_id: str,
+                local_dir: Path,
+                allow_patterns: tuple[str, ...] | None = None,
+            ) -> Path:
+                self.calls.append(
+                    {"repo_id": repo_id, "local_dir": local_dir, "allow_patterns": allow_patterns}
+                )
+                for relative_path in allow_patterns or ():
+                    target = local_dir / relative_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(b"asset")
+                return local_dir
+
+        with tempfile.TemporaryDirectory(prefix="sdxl-models-") as temp_dir:
+            models_dir = Path(temp_dir)
+            downloader = FakeDownloader()
+
+            weights.acquire_optional_feature_weights(
+                "sdxl-base",
+                "sdxl_ip_adapter_style",
+                models_dir,
+                downloader=downloader,
+            )
+
+        expected_target = models_dir / "sdxl-base" / "optional" / "sdxl_ip_adapter_style"
+        self.assertEqual(
+            downloader.calls,
+            [
+                {
+                    "repo_id": "h94/IP-Adapter",
+                    "local_dir": expected_target,
+                    "allow_patterns": (
+                        "sdxl_models/ip-adapter_sdxl.bin",
+                        "sdxl_models/image_encoder/config.json",
+                        "sdxl_models/image_encoder/model.safetensors",
+                    ),
+                }
+            ],
+        )
+
+    def test_sdxl_optional_feature_weight_acquisition_requests_minimal_required_asset_bundle(self) -> None:
+        class FakeDownloader:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def snapshot_download(
+                self,
+                *,
+                repo_id: str,
+                local_dir: Path,
+                allow_patterns: tuple[str, ...] | None = None,
+            ) -> Path:
+                self.calls.append({"repo_id": repo_id, "local_dir": local_dir, "allow_patterns": allow_patterns})
+                for relative_path in allow_patterns or ():
+                    target = local_dir / relative_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(b"asset")
+                return local_dir
+
+        with tempfile.TemporaryDirectory(prefix="sdxl-models-") as temp_dir:
+            models_dir = Path(temp_dir)
+            downloader = FakeDownloader()
+
+            result = weights.acquire_optional_feature_weights(
+                "sdxl-base",
+                "sdxl_ip_adapter_style",
+                models_dir,
+                downloader=downloader,
+            )
+
+        expected_required_files = (
+            "sdxl_models/ip-adapter_sdxl.bin",
+            "sdxl_models/image_encoder/config.json",
+            "sdxl_models/image_encoder/model.safetensors",
+        )
+        self.assertEqual(downloader.calls[0]["allow_patterns"], expected_required_files)
+        self.assertEqual(result["required_files"], expected_required_files)
+        self.assertEqual(result["missing_files"], ())
+
+    def test_sdxl_optional_feature_readiness_requires_adapter_and_image_encoder_assets(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sdxl-models-") as temp_dir:
+            models_dir = Path(temp_dir)
+            feature_root = models_dir / "sdxl-base" / "optional" / "sdxl_ip_adapter_style"
+            adapter_file = feature_root / "sdxl_models" / "ip-adapter_sdxl.bin"
+            adapter_file.parent.mkdir(parents=True, exist_ok=True)
+            adapter_file.write_bytes(b"adapter")
+
+            readiness = weights.evaluate_extension_weights("sdxl-base", models_dir=models_dir)
+
+            (feature_root / "sdxl_models" / "image_encoder" / "config.json").parent.mkdir(parents=True, exist_ok=True)
+            (feature_root / "sdxl_models" / "image_encoder" / "config.json").write_text("{}\n", encoding="utf-8")
+            (feature_root / "sdxl_models" / "image_encoder" / "model.safetensors").write_bytes(b"encoder")
+            ready_readiness = weights.evaluate_extension_weights("sdxl-base", models_dir=models_dir)
+
+        optional = readiness["optional_features"]["sdxl_ip_adapter_style"]
+        self.assertEqual(optional["status"], "missing")
+        self.assertFalse(optional["ready"])
+        self.assertEqual(
+            optional["missing_files"],
+            (
+                "sdxl_models/image_encoder/config.json",
+                "sdxl_models/image_encoder/model.safetensors",
+            ),
+        )
+        self.assertIn("image_encoder/config.json", " ".join(optional["diagnostics"]))
+        self.assertEqual(ready_readiness["optional_features"]["sdxl_ip_adapter_style"]["status"], "ready")
+
+    def test_parse_setup_payload_accepts_models_dir_aliases(self) -> None:
+        snake_payload = install_contract.parse_setup_payload(
+            stdin_text=json.dumps(
+                {
+                    "python_exe": sys.executable,
+                    "ext_dir": "/tmp/ext",
+                    "models_dir": "/tmp/global-models",
+                }
+            )
+        )
+        camel_payload = install_contract.parse_setup_payload(
+            stdin_text=json.dumps(
+                {
+                    "python_exe": sys.executable,
+                    "ext_dir": "/tmp/ext",
+                    "modelsDir": "/tmp/global-models-camel",
+                }
+            )
+        )
+
+        self.assertEqual(snake_payload.models_dir, "/tmp/global-models")
+        self.assertEqual(camel_payload.models_dir, "/tmp/global-models-camel")
+
+    def test_sdxl_setup_contract_acquires_optional_ip_adapter_assets(self) -> None:
+        runtime_root = self._make_runtime_root("sdxl-base")
+        acquired: list[dict[str, object]] = []
+
+        def fake_acquire_optional_feature_weights(extension_id, feature_id, models_dir, *, downloader=None):
+            acquired.append({"extension_id": extension_id, "feature_id": feature_id, "models_dir": Path(models_dir)})
+            target_dir = Path(models_dir) / extension_id / "optional" / feature_id
+            required_files = (
+                "sdxl_models/ip-adapter_sdxl.bin",
+                "sdxl_models/image_encoder/config.json",
+                "sdxl_models/image_encoder/model.safetensors",
+            )
+            for relative_path in required_files:
+                target = target_dir / relative_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"asset")
+            check_path = target_dir / "sdxl_models" / "ip-adapter_sdxl.bin"
+            return {
+                "status": "ready",
+                "extension_id": extension_id,
+                "feature_id": feature_id,
+                "model_dir": str(target_dir),
+                "check_path": str(check_path),
+                "required_files": required_files,
+                "missing_files": (),
+                "downloaded": True,
+            }
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)}, clear=False))
+            stack.enter_context(patch("local_image_runtime.install_contract.detect_platform", return_value=SUPPORTED_PLATFORM))
+            stack.enter_context(patch("local_image_runtime.install_contract.resolve_dependency_plan", return_value=self._fake_plan("sdxl-base")))
+            stack.enter_context(patch("local_image_runtime.install_contract._run_checked", side_effect=self._run_checked_side_effect))
+            stack.enter_context(patch("local_image_runtime.install_contract._install_dependency_step", return_value=None))
+            stack.enter_context(patch("local_image_runtime.bootstrap._smoke_test_runtime_imports", return_value=(True, "stubbed imports")))
+            stack.enter_context(
+                patch(
+                    "local_image_runtime.install_contract.acquire_optional_feature_weights",
+                    side_effect=fake_acquire_optional_feature_weights,
+                )
+            )
+
+            result = install_contract.run_install_setup_contract(
+                extension_id="sdxl-base",
+                stdin_text=self._payload(runtime_root),
+            )
+
+        runtime_models_dir = runtime_root / ".local-image-runtime" / "models"
+        self.assertEqual(result.status, bootstrap.SETUP_STATUS_READY)
+        self.assertEqual(
+            acquired,
+            [
+                {
+                    "extension_id": "sdxl-base",
+                    "feature_id": "sdxl_ip_adapter_style",
+                    "models_dir": runtime_models_dir,
+                }
+            ],
+        )
+        readiness = weights.evaluate_extension_weights("sdxl-base", models_dir=runtime_models_dir)
+        self.assertEqual(readiness["optional_features"]["sdxl_ip_adapter_style"]["status"], "ready")
+
+    def test_sdxl_setup_contract_uses_explicit_models_dir_for_optional_assets(self) -> None:
+        runtime_root = self._make_runtime_root("sdxl-base")
+        explicit_models_dir = Path(tempfile.mkdtemp(prefix="modly-models-"))
+        acquired: list[dict[str, object]] = []
+
+        def fake_acquire_optional_feature_weights(extension_id, feature_id, models_dir, *, downloader=None):
+            acquired.append({"extension_id": extension_id, "feature_id": feature_id, "models_dir": Path(models_dir)})
+            target_dir = Path(models_dir) / extension_id / "optional" / feature_id
+            required_files = (
+                "sdxl_models/ip-adapter_sdxl.bin",
+                "sdxl_models/image_encoder/config.json",
+                "sdxl_models/image_encoder/model.safetensors",
+            )
+            for relative_path in required_files:
+                target = target_dir / relative_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"asset")
+            check_path = target_dir / "sdxl_models" / "ip-adapter_sdxl.bin"
+            return {
+                "status": "ready",
+                "extension_id": extension_id,
+                "feature_id": feature_id,
+                "model_dir": str(target_dir),
+                "check_path": str(check_path),
+                "required_files": required_files,
+                "missing_files": (),
+                "downloaded": True,
+            }
+
+        payload = json.loads(self._payload(runtime_root))
+        payload["models_dir"] = str(explicit_models_dir)
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)}, clear=False))
+            stack.enter_context(patch("local_image_runtime.install_contract.detect_platform", return_value=SUPPORTED_PLATFORM))
+            stack.enter_context(patch("local_image_runtime.install_contract.resolve_dependency_plan", return_value=self._fake_plan("sdxl-base")))
+            stack.enter_context(patch("local_image_runtime.install_contract._run_checked", side_effect=self._run_checked_side_effect))
+            stack.enter_context(patch("local_image_runtime.install_contract._install_dependency_step", return_value=None))
+            stack.enter_context(patch("local_image_runtime.bootstrap._smoke_test_runtime_imports", return_value=(True, "stubbed imports")))
+            stack.enter_context(
+                patch(
+                    "local_image_runtime.install_contract.acquire_optional_feature_weights",
+                    side_effect=fake_acquire_optional_feature_weights,
+                )
+            )
+
+            result = install_contract.run_install_setup_contract(
+                extension_id="sdxl-base",
+                stdin_text=json.dumps(payload),
+            )
+
+        self.assertEqual(result.status, bootstrap.SETUP_STATUS_READY)
+        self.assertEqual(
+            acquired,
+            [
+                {
+                    "extension_id": "sdxl-base",
+                    "feature_id": "sdxl_ip_adapter_style",
+                    "models_dir": explicit_models_dir,
+                }
+            ],
+        )
+
+    def test_inference_runner_adds_ip_adapter_kwargs_and_scale_only_for_sdxl_style_reference(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="runner-sdxl-style-"))
+        source_image_token = object()
+        reference_image_token = object()
+        job = {
+            "extension_id": "sdxl-base",
+            "family": "sdxl",
+            "node_id": "image-to-image",
+            "model_dir": str(workspace_dir / "model"),
+            "workspace_dir": str(workspace_dir),
+            "output_path": str(workspace_dir / "result.png"),
+            "prompt": "test prompt",
+            "source_image_path": "/tmp/source.png",
+            "params": {"steps": 4, "strength": 0.55, "reference_strength": 0.35},
+            "conditioning": {"references": [{"role": "style", "filePath": "/tmp/style.png"}]},
+        }
+
+        with patch.object(inference_runner, "_open_source_image", side_effect=[source_image_token, reference_image_token]) as open_image:
+            runner_kwargs = inference_runner._build_pipeline_kwargs(job, execution_device="cpu")
+
+        self.assertEqual([call.args[0] for call in open_image.call_args_list], ["/tmp/source.png", "/tmp/style.png"])
+        self.assertIs(runner_kwargs["image"], source_image_token)
+        self.assertIs(runner_kwargs["ip_adapter_image"], reference_image_token)
+        self.assertNotIn("cross_attention_kwargs", runner_kwargs)
+
+    def test_inference_runner_lazily_configures_ip_adapter_only_when_style_reference_exists(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        class FakePipeline:
+            def __init__(self) -> None:
+                self.loaded_adapters: list[dict[str, object]] = []
+                self.scales: list[float] = []
+
+            def load_ip_adapter(self, asset_dir: str, **kwargs: object) -> None:
+                self.loaded_adapters.append({"asset_dir": asset_dir, "kwargs": kwargs})
+
+            def set_ip_adapter_scale(self, scale: float) -> None:
+                self.scales.append(scale)
+
+        model_dir = Path(tempfile.mkdtemp(prefix="sdxl-model-dir-"))
+        for relative_path in (
+            "sdxl_models/ip-adapter_sdxl.bin",
+            "sdxl_models/image_encoder/config.json",
+            "sdxl_models/image_encoder/model.safetensors",
+        ):
+            asset_file = model_dir / "optional" / "sdxl_ip_adapter_style" / relative_path
+            asset_file.parent.mkdir(parents=True, exist_ok=True)
+            asset_file.write_bytes(b"asset")
+        style_job = {
+            "family": "sdxl",
+            "node_id": "image-to-image",
+            "model_dir": str(model_dir),
+            "params": {"reference_strength": 0.45},
+            "conditioning": {"references": [{"role": "style", "filePath": "/tmp/style.png"}]},
+        }
+        baseline_job = {"family": "sdxl", "node_id": "image-to-image", "model_dir": str(model_dir), "params": {}}
+        style_pipeline = FakePipeline()
+        baseline_pipeline = FakePipeline()
+
+        inference_runner._configure_ip_adapter_if_present(style_pipeline, style_job)
+        inference_runner._configure_ip_adapter_if_present(baseline_pipeline, baseline_job)
+
+        self.assertEqual(
+            style_pipeline.loaded_adapters,
+            [
+                {
+                    "asset_dir": str(model_dir / "optional" / "sdxl_ip_adapter_style"),
+                    "kwargs": {
+                        "subfolder": "sdxl_models",
+                        "weight_name": "ip-adapter_sdxl.bin",
+                        "image_encoder_folder": "sdxl_models/image_encoder",
+                        "local_files_only": True,
+                    },
+                }
+            ],
+        )
+        self.assertEqual(style_pipeline.scales, [0.45])
+        self.assertEqual(baseline_pipeline.loaded_adapters, [])
+        self.assertEqual(baseline_pipeline.scales, [])
+
+    def test_inference_runner_resolves_ip_adapter_assets_from_node_scoped_model_dir(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        class FakePipeline:
+            def __init__(self) -> None:
+                self.loaded_adapters: list[dict[str, object]] = []
+
+            def load_ip_adapter(self, asset_dir: str, **kwargs: object) -> None:
+                self.loaded_adapters.append({"asset_dir": asset_dir, "kwargs": kwargs})
+
+        extension_model_dir = Path(tempfile.mkdtemp(prefix="sdxl-extension-model-dir-")) / "sdxl-base"
+        node_model_dir = extension_model_dir / "image-to-image"
+        node_model_dir.mkdir(parents=True, exist_ok=True)
+        for relative_path in (
+            "sdxl_models/ip-adapter_sdxl.bin",
+            "sdxl_models/image_encoder/config.json",
+            "sdxl_models/image_encoder/model.safetensors",
+        ):
+            asset_file = extension_model_dir / "optional" / "sdxl_ip_adapter_style" / relative_path
+            asset_file.parent.mkdir(parents=True, exist_ok=True)
+            asset_file.write_bytes(b"asset")
+        job = {
+            "family": "sdxl",
+            "node_id": "image-to-image",
+            "model_dir": str(node_model_dir),
+            "params": {"reference_strength": 0.45},
+            "conditioning": {"references": [{"role": "style", "filePath": "/tmp/style.png"}]},
+        }
+        pipeline = FakePipeline()
+
+        inference_runner._configure_ip_adapter_if_present(pipeline, job)
+
+        self.assertEqual(
+            pipeline.loaded_adapters,
+            [
+                {
+                    "asset_dir": str(extension_model_dir / "optional" / "sdxl_ip_adapter_style"),
+                    "kwargs": {
+                        "subfolder": "sdxl_models",
+                        "weight_name": "ip-adapter_sdxl.bin",
+                        "image_encoder_folder": "sdxl_models/image_encoder",
+                        "local_files_only": True,
+                    },
+                }
+            ],
+        )
+
+    def test_inference_runner_resolves_ip_adapter_assets_from_extension_scoped_model_dir(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        class FakePipeline:
+            def __init__(self) -> None:
+                self.loaded_adapters: list[dict[str, object]] = []
+
+            def load_ip_adapter(self, asset_dir: str, **kwargs: object) -> None:
+                self.loaded_adapters.append({"asset_dir": asset_dir, "kwargs": kwargs})
+
+        extension_model_dir = Path(tempfile.mkdtemp(prefix="sdxl-extension-model-dir-")) / "sdxl-base"
+        for relative_path in (
+            "sdxl_models/ip-adapter_sdxl.bin",
+            "sdxl_models/image_encoder/config.json",
+            "sdxl_models/image_encoder/model.safetensors",
+        ):
+            asset_file = extension_model_dir / "optional" / "sdxl_ip_adapter_style" / relative_path
+            asset_file.parent.mkdir(parents=True, exist_ok=True)
+            asset_file.write_bytes(b"asset")
+        job = {
+            "family": "sdxl",
+            "node_id": "image-to-image",
+            "model_dir": str(extension_model_dir),
+            "params": {"reference_strength": 0.45},
+            "conditioning": {"references": [{"role": "style", "filePath": "/tmp/style.png"}]},
+        }
+        pipeline = FakePipeline()
+
+        inference_runner._configure_ip_adapter_if_present(pipeline, job)
+
+        self.assertEqual(
+            pipeline.loaded_adapters,
+            [
+                {
+                    "asset_dir": str(extension_model_dir / "optional" / "sdxl_ip_adapter_style"),
+                    "kwargs": {
+                        "subfolder": "sdxl_models",
+                        "weight_name": "ip-adapter_sdxl.bin",
+                        "image_encoder_folder": "sdxl_models/image_encoder",
+                        "local_files_only": True,
+                    },
+                }
+            ],
+        )
+
+    def test_inference_runner_fails_locally_before_loading_missing_ip_adapter_image_encoder_assets(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        class FailingIfLoadedPipeline:
+            def load_ip_adapter(self, asset_dir: str, **kwargs: object) -> None:
+                raise AssertionError("generation must precheck the full local IP-Adapter bundle")
+
+        model_dir = Path(tempfile.mkdtemp(prefix="sdxl-missing-encoder-"))
+        node_model_dir = model_dir / "image-to-image"
+        node_model_dir.mkdir(parents=True, exist_ok=True)
+        adapter_file = model_dir / "optional" / "sdxl_ip_adapter_style" / "sdxl_models" / "ip-adapter_sdxl.bin"
+        adapter_file.parent.mkdir(parents=True, exist_ok=True)
+        adapter_file.write_bytes(b"adapter")
+        expected_encoder_file = model_dir / "optional" / "sdxl_ip_adapter_style" / "sdxl_models" / "image_encoder" / "config.json"
+        job = {
+            "family": "sdxl",
+            "node_id": "image-to-image",
+            "model_dir": str(node_model_dir),
+            "params": {"reference_strength": 0.6},
+            "conditioning": {"references": [{"role": "style", "filePath": "/tmp/style.png"}]},
+        }
+
+        with self.assertRaisesRegex(inference_runner.InferenceRunnerError, str(expected_encoder_file)):
+            inference_runner._configure_ip_adapter_if_present(FailingIfLoadedPipeline(), job)
+
+    def test_inference_runner_fails_locally_before_loading_missing_ip_adapter_asset(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        class FailingIfLoadedPipeline:
+            def load_ip_adapter(self, asset_dir: str, **kwargs: object) -> None:
+                raise AssertionError("generation must not ask Diffusers to download missing IP-Adapter assets")
+
+        model_dir = Path(tempfile.mkdtemp(prefix="sdxl-missing-adapter-"))
+        node_model_dir = model_dir / "image-to-image"
+        node_model_dir.mkdir(parents=True, exist_ok=True)
+        expected_adapter_file = model_dir / "optional" / "sdxl_ip_adapter_style" / "sdxl_models" / "ip-adapter_sdxl.bin"
+        job = {
+            "family": "sdxl",
+            "node_id": "image-to-image",
+            "model_dir": str(node_model_dir),
+            "params": {"reference_strength": 0.6},
+            "conditioning": {"references": [{"role": "style", "filePath": "/tmp/style.png"}]},
+        }
+
+        with self.assertRaisesRegex(inference_runner.InferenceRunnerError, str(expected_adapter_file)):
+            inference_runner._configure_ip_adapter_if_present(FailingIfLoadedPipeline(), job)
 
     def test_extension_generator_generate_accepts_output_path_within_outputs_dir(self) -> None:
         generator_class = self._load_generator_class("sd15")
@@ -4916,6 +6112,82 @@ class RuntimeHarnessTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(self._parse_ndjson_events(stdout.getvalue())[-1]["type"], "done")
+
+    def test_sdxl_style_reference_preserves_vae_slicing_but_skips_attention_slicing(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="runner-sdxl-style-memory-"))
+        model_dir = workspace_dir / "models" / "sdxl-base" / "image-to-image"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        for relative_path in (
+            "sdxl_models/ip-adapter_sdxl.bin",
+            "sdxl_models/image_encoder/config.json",
+            "sdxl_models/image_encoder/model.safetensors",
+        ):
+            asset_file = model_dir.parent / "optional" / "sdxl_ip_adapter_style" / relative_path
+            asset_file.parent.mkdir(parents=True, exist_ok=True)
+            asset_file.write_bytes(b"asset")
+        source_image_token = object()
+        reference_image_token = object()
+        pipeline_calls: list[dict[str, object]] = []
+        optimization_calls: list[str] = []
+        scale_calls: list[float] = []
+
+        class FakeImage:
+            def save(self, target_path: str) -> None:
+                Path(target_path).write_text("generated", encoding="utf-8")
+
+        class FakePipeline:
+            def to(self, device: str) -> "FakePipeline":
+                return self
+
+            def load_ip_adapter(self, asset_dir: str, **kwargs: object) -> None:
+                return None
+
+            def set_ip_adapter_scale(self, scale: float) -> None:
+                scale_calls.append(scale)
+
+            def enable_attention_slicing(self, mode: str) -> None:
+                optimization_calls.append(f"attention:{mode}")
+
+            def enable_vae_slicing(self) -> None:
+                optimization_calls.append("vae")
+
+            def __call__(self, **kwargs):
+                pipeline_calls.append(kwargs)
+                return SimpleNamespace(images=[FakeImage()])
+
+        job = {
+            "extension_id": "sdxl-base",
+            "family": "sdxl",
+            "node_id": "image-to-image",
+            "model_dir": str(model_dir),
+            "workspace_dir": str(workspace_dir),
+            "output_path": str(workspace_dir / "style.png"),
+            "prompt": "style reference without sliced attention",
+            "source_image_path": "/tmp/source.png",
+            "params": {"steps": 4, "strength": 0.55, "reference_strength": 0.72},
+            "conditioning": {"references": [{"role": "style", "filePath": "/tmp/style.png"}]},
+        }
+
+        stdout = StringIO()
+        with patch.dict(
+            inference_runner._PIPELINE_LOADERS,
+            {("sdxl", "image-to-image"): SimpleNamespace(from_pretrained=lambda model_dir, **kwargs: FakePipeline())},
+            clear=True,
+        ), patch.object(inference_runner, "_resolve_execution_device", return_value="cpu"), patch.object(
+            inference_runner,
+            "_open_source_image",
+            side_effect=[source_image_token, reference_image_token],
+        ):
+            exit_code = inference_runner.run_child_main(stdin=StringIO(json.dumps(job) + "\n"), stdout=stdout)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(scale_calls, [0.72])
+        self.assertEqual(optimization_calls, ["vae"])
+        self.assertEqual(len(pipeline_calls), 1)
+        self.assertIs(pipeline_calls[0]["ip_adapter_image"], reference_image_token)
+        self.assertNotIn("cross_attention_kwargs", pipeline_calls[0])
 
     def test_inference_runner_emits_running_inference_heartbeat_logs_while_pipeline_is_busy(self) -> None:
         import local_image_runtime.inference_runner as inference_runner

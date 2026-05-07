@@ -33,6 +33,34 @@ _TORCH_EXTRA_INDEX_URLS = {
     "cu124": "https://download.pytorch.org/whl/cu124",
     "cu128": "https://download.pytorch.org/whl/cu128",
 }
+_OPTIONAL_DEPENDENCY_GROUPS: dict[str, dict[str, dict[str, object]]] = {
+    "sd15": {
+        "sd15_controlnet_preprocessors": {
+            "label": "SD1.5 ControlNet preprocessors",
+            "packages": ("controlnet_aux", "opencv-python-headless"),
+            "readiness_imports": ("controlnet_aux", "cv2"),
+            "baseline": False,
+            "state": PLAN_STATE_UNSUPPORTED,
+            "reason": (
+                "Planned only for future explicit ControlNet nodes after Linux ARM64/Windows "
+                "preprocessor install evidence, model assets, and smoke tests exist."
+            ),
+        },
+    },
+    "sdxl-base": {
+        "sdxl-base_controlnet_preprocessors": {
+            "label": "SDXL ControlNet preprocessors",
+            "packages": ("controlnet_aux", "opencv-python-headless"),
+            "readiness_imports": ("controlnet_aux", "cv2"),
+            "baseline": False,
+            "state": PLAN_STATE_UNSUPPORTED,
+            "reason": (
+                "Planned only for future explicit ControlNet nodes after Linux ARM64/Windows "
+                "preprocessor install evidence, model assets, and smoke tests exist."
+            ),
+        },
+    },
+}
 
 _SD15_WINDOWS_REQUIRED_EVIDENCE_FIELDS = (
     "extension_id",
@@ -582,6 +610,25 @@ def _family_steps(dependency_family: str) -> tuple[DependencyInstallStep, ...]:
             f"Unknown dependency family '{dependency_family}'. Supported families: {supported}."
         )
     return steps
+
+
+def get_optional_dependency_groups(extension_id: str) -> dict[str, dict[str, object]]:
+    """Return optional dependency groups that are intentionally outside baseline plans."""
+
+    groups = _OPTIONAL_DEPENDENCY_GROUPS.get(extension_id, {})
+    return {
+        group_id: {
+            "label": str(group.get("label", "")),
+            "packages": tuple(str(package) for package in group.get("packages", ()) if isinstance(package, str)),
+            "readiness_imports": tuple(
+                str(module) for module in group.get("readiness_imports", ()) if isinstance(module, str)
+            ),
+            "baseline": bool(group.get("baseline", False)),
+            "state": str(group.get("state", PLAN_STATE_UNSUPPORTED)),
+            "reason": str(group.get("reason", "")),
+        }
+        for group_id, group in groups.items()
+    }
 
 
 def resolve_dependency_plan(

@@ -36,6 +36,8 @@ except ImportError:  # pragma: no cover - local fallback for tests/direct use
 
 
 GeneratorEventEmitter = Callable[[str, dict[str, Any]], None]
+STYLE_REFERENCE_INPUT_KEYS = ("Style reference", "style_reference")
+MODLY_STYLE_REFERENCE_PARAM_KEY = "left_image_path"
 
 
 @dataclass(frozen=True)
@@ -314,6 +316,18 @@ def _nested_input_payload(params: dict[str, Any]) -> dict[str, Any]:
     return dict(input_payload)
 
 
+def _image_to_image_role_inputs(input_payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: input_payload[key] for key in STYLE_REFERENCE_INPUT_KEYS if key in input_payload}
+
+
+def _merge_modly_left_image_path(input_payload: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+    role_inputs = _image_to_image_role_inputs(input_payload)
+    left_image_path = params.pop(MODLY_STYLE_REFERENCE_PARAM_KEY, None)
+    if left_image_path and not any(key in role_inputs for key in STYLE_REFERENCE_INPUT_KEYS):
+        role_inputs["style_reference"] = left_image_path
+    return role_inputs
+
+
 def _resolve_output_path(result: dict[str, Any], *, outputs_dir: Path) -> Path:
     output_path = result.get("output_path")
     if not isinstance(output_path, str) or not output_path.strip():
@@ -409,9 +423,11 @@ class BaseGeneratorRuntimeAdapter(ImportedBaseGenerator):
 
         if self.node_id == "image-to-image":
             materialized_input = self._materialize_image_input(image_bytes)
+            input_payload = _merge_modly_left_image_path(request_input, request_params)
+            input_payload["filePath"] = str(materialized_input)
             return ExecutionRequest(
                 node_id=self.node_id,
-                input={"filePath": str(materialized_input)},
+                input=input_payload,
                 params=request_params,
                 workspace_dir=str(self.outputs_dir),
                 model_dir_override=model_dir_override,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -13,6 +14,7 @@ from uuid import uuid4
 
 from .bootstrap import RuntimeSnapshot, extension_is_installed, get_extension_record
 from .descriptors import get_extension_descriptor, registered_extension_ids
+from .denoising import validate_image_to_image_effective_denoising_steps
 from . import lifecycle
 from .quality_policy import resolve_effective_params
 
@@ -38,6 +40,9 @@ DEFAULT_OUTPUT_FORMAT = "png"
 JPEG_OUTPUT_EXTENSION = ".jpg"
 FLUX_SCHNELL_MAX_STEPS = 30
 FLUX_SCHNELL_MAX_GUIDANCE_SCALE = 50.0
+ANONYMOUS_IMAGE_INPUT_PATTERN = re.compile(r"^image(?:[\s_-]*[2-9]\d*)$", re.IGNORECASE)
+SDXL_STYLE_REFERENCE_INPUT_KEYS = ("Style reference", "style_reference")
+DEFAULT_REFERENCE_STRENGTH = 0.6
 
 
 @dataclass(frozen=True)
@@ -51,11 +56,26 @@ class ExecutionRequest:
 
 
 @dataclass(frozen=True)
+class ConditioningPayload:
+    references: tuple[dict[str, str], ...] = ()
+    controls: tuple[dict[str, str], ...] = ()
+
+    def to_backend_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if self.references:
+            payload["references"] = [dict(reference) for reference in self.references]
+        if self.controls:
+            payload["controls"] = [dict(control) for control in self.controls]
+        return payload
+
+
+@dataclass(frozen=True)
 class ValidatedPayload:
     prompt: str | None
     source_image_path: str | None
     numeric_params: dict[str, float | int]
     legacy_model_id: str | None
+    conditioning: ConditioningPayload | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +138,160 @@ def _validate_numeric_param(
     if maximum is not None and numeric_value > maximum:
         raise RequestValidationError(f"Parameter '{name}' must be <= {maximum}.")
     return numeric_value
+
+
+def _reject_anonymous_image_inputs(input_payload: dict[str, Any]) -> None:
+    for key in input_payload:
+        if isinstance(key, str) and ANONYMOUS_IMAGE_INPUT_PATTERN.match(key.strip()):
+            raise RequestValidationError(
+                f"Anonymous image input '{key}' is not supported. Use an explicit role-based conditioning field instead."
+            )
+
+
+def _resolve_conditioning_file_path(request: ExecutionRequest, raw_path: Any, *, field_name: str) -> str:
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise RequestValidationError(f"Conditioning {field_name} must include a non-empty filePath.")
+    normalized_path = raw_path.strip()
+    if normalized_path.endswith(("/", "\\")):
+        raise RequestValidationError(f"Conditioning {field_name} filePath must point to a file, not a directory.")
+
+    for candidate in _request_path_candidates(request, normalized_path):
+        if candidate.exists() and candidate.is_file():
+            return str(candidate.resolve())
+    raise RequestValidationError(f"Conditioning {field_name} filePath must point to an existing local file.")
+
+
+def _validate_conditioning_entry(
+    request: ExecutionRequest,
+    entry: Any,
+    *,
+    collection_name: str,
+    required_fields: tuple[str, ...],
+) -> dict[str, str]:
+    if not isinstance(entry, dict):
+        raise RequestValidationError(f"Conditioning {collection_name} entries must be objects.")
+    role = entry.get("role")
+    if not isinstance(role, str) or not role.strip():
+        raise RequestValidationError(f"Conditioning {collection_name} entries require a non-empty role.")
+    normalized_entry: dict[str, str] = {"role": role.strip()}
+    normalized_entry["filePath"] = _resolve_conditioning_file_path(
+        request,
+        entry.get("filePath"),
+        field_name=f"{collection_name} '{normalized_entry['role']}'",
+    )
+    for field_name in required_fields:
+        value = entry.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            raise RequestValidationError(
+                f"Conditioning {collection_name} entries require a non-empty {field_name}."
+            )
+        normalized_entry[field_name] = value.strip()
+    return normalized_entry
+
+
+def _validate_conditioning_collection(raw_conditioning: dict[str, Any], name: str) -> list[Any]:
+    value = raw_conditioning.get(name, [])
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise RequestValidationError(f"Conditioning field '{name}' must be a list when provided.")
+    return value
+
+
+def _validate_conditioning_payload(request: ExecutionRequest) -> ConditioningPayload | None:
+    raw_conditioning = request.input.get("conditioning")
+    if raw_conditioning is None:
+        raw_conditioning = request.params.get("conditioning")
+    if raw_conditioning is None:
+        return None
+    if not isinstance(raw_conditioning, dict):
+        raise RequestValidationError("Conditioning must be an object when provided.")
+
+    references = _validate_conditioning_collection(raw_conditioning, "references")
+    controls = _validate_conditioning_collection(raw_conditioning, "controls")
+    if not references and not controls:
+        return None
+    if controls and request.node_id == "image-to-image":
+        raise RequestValidationError(
+            "ControlNet control conditioning is not supported on base image-to-image. "
+            "Use explicit ControlNet nodes once they are available."
+        )
+
+    validated_references = tuple(
+        _validate_conditioning_entry(
+            request,
+            entry,
+            collection_name="references",
+            required_fields=(),
+        )
+        for entry in references
+    )
+    validated_controls = tuple(
+        _validate_conditioning_entry(
+            request,
+            entry,
+            collection_name="controls",
+            required_fields=("control_type",),
+        )
+        for entry in controls
+    )
+    return ConditioningPayload(references=validated_references, controls=validated_controls)
+
+
+def _style_reference_paths_from_role_inputs(request: ExecutionRequest) -> tuple[str, ...]:
+    paths: list[str] = []
+    for key in SDXL_STYLE_REFERENCE_INPUT_KEYS:
+        raw_path = request.input.get(key)
+        if raw_path is None:
+            continue
+        paths.append(_resolve_conditioning_file_path(request, raw_path, field_name="style reference"))
+    return tuple(dict.fromkeys(paths))
+
+
+def _merge_sdxl_style_reference_conditioning(
+    request: ExecutionRequest,
+    conditioning: ConditioningPayload | None,
+    *,
+    extension_id: str | None,
+) -> tuple[ConditioningPayload | None, float | None]:
+    role_input_paths = _style_reference_paths_from_role_inputs(request)
+    existing_references = list(conditioning.references if conditioning is not None else ())
+    style_references = [reference for reference in existing_references if reference.get("role") == "style"]
+    for path in role_input_paths:
+        style_references.append({"role": "style", "filePath": path})
+
+    has_style_reference = bool(style_references)
+    if not has_style_reference:
+        if "reference_strength" in request.params:
+            _validate_numeric_param(request.params, "reference_strength", expected_type=float, minimum=0.0, maximum=1.0)
+        return conditioning, None
+
+    if extension_id != "sdxl-base":
+        if extension_id == "sd15":
+            raise RequestValidationError(
+                "SD1.5 style reference is not supported because compatible IP-Adapter adapter, "
+                "image encoder assets, and target-platform smoke evidence are not verified yet."
+            )
+        raise RequestValidationError("Style reference is supported only for SDXL Base image-to-image in this batch.")
+    if request.node_id != "image-to-image":
+        raise RequestValidationError("Style reference is supported only on SDXL Base image-to-image.")
+    if len(style_references) != 1:
+        raise RequestValidationError("SDXL Base image-to-image supports exactly one style reference.")
+
+    reference_strength = _validate_numeric_param(
+        request.params,
+        "reference_strength",
+        expected_type=float,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    if reference_strength is None:
+        reference_strength = DEFAULT_REFERENCE_STRENGTH
+
+    non_style_references = [reference for reference in existing_references if reference.get("role") != "style"]
+    merged_references = tuple([*non_style_references, style_references[0]])
+    controls = conditioning.controls if conditioning is not None else ()
+    return ConditioningPayload(references=merged_references, controls=controls), float(reference_strength)
 
 
 def _validate_output_params(params: dict[str, Any]) -> tuple[str, int | None]:
@@ -196,6 +370,13 @@ def _validate_text_prompt(value: Any, *, field_name: str) -> str:
 def _validate_node_payload(
     request: ExecutionRequest, legacy_model_id: str | None, extension_id: str | None = None
 ) -> ValidatedPayload:
+    _reject_anonymous_image_inputs(request.input)
+    conditioning = _validate_conditioning_payload(request)
+    conditioning, reference_strength = _merge_sdxl_style_reference_conditioning(
+        request,
+        conditioning,
+        extension_id=extension_id,
+    )
     flux_text_to_image = _is_flux_text_to_image(extension_id, request.node_id)
     numeric_validators: dict[str, int | float | None] = {
         "steps": _validate_numeric_param(
@@ -238,6 +419,8 @@ def _validate_node_payload(
         for name, value in numeric_validators.items()
         if value is not None
     }
+    if reference_strength is not None:
+        numeric_params["reference_strength"] = reference_strength
 
     if request.node_id == "text-to-image":
         prompt = request.params.get("prompt")
@@ -248,6 +431,7 @@ def _validate_node_payload(
             source_image_path=None,
             numeric_params=numeric_params,
             legacy_model_id=legacy_model_id,
+            conditioning=conditioning,
         )
 
     source_image_path = request.input.get("filePath")
@@ -282,12 +466,17 @@ def _validate_node_payload(
         raise RequestValidationError(
             "image-to-image requires params.strength between 0.0 and 1.0."
         )
+    validate_image_to_image_effective_denoising_steps(
+        numeric_params,
+        error_type=RequestValidationError,
+    )
 
     return ValidatedPayload(
         prompt=validated_prompt,
         source_image_path=resolved_source_path,
         numeric_params=numeric_params,
         legacy_model_id=legacy_model_id,
+        conditioning=conditioning,
     )
 
 
@@ -386,6 +575,8 @@ def _build_backend_job(
         f"generated-{extension_id}-{request.node_id}-{uuid4().hex}{_extension_for_output_format(output_format)}"
     )
     params = dict(request.params)
+    if "reference_strength" in payload_details.numeric_params:
+        params["reference_strength"] = payload_details.numeric_params["reference_strength"]
     if output_format == "png":
         params.pop("output_quality", None)
     if descriptor.family == "flux":
@@ -410,6 +601,8 @@ def _build_backend_job(
         "source_image_path": payload_details.source_image_path,
         "params": params,
     }
+    if payload_details.conditioning is not None:
+        payload["conditioning"] = payload_details.conditioning.to_backend_payload()
     if descriptor.family != "flux":
         payload["negative_prompt"] = negative_prompt
     venv_python = _require_executable_venv_python(extension_record, extension_id=extension_id)

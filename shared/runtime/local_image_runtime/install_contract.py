@@ -32,7 +32,8 @@ from .dependencies import (
     python_tag_from_interpreter,
     resolve_dependency_plan,
 )
-from .descriptors import get_extension_descriptor
+from .descriptors import get_extension_descriptor, get_optional_feature_specs
+from .weights import acquire_optional_feature_weights
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class SetupPayload:
     ext_dir: str
     gpu_sm: str | None = None
     cuda_version: str | None = None
+    models_dir: str | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,15 @@ def _coerce_optional_string(payload: dict[str, Any], field_name: str) -> str | N
         )
     stripped = value.strip()
     return stripped or None
+
+
+def _coerce_optional_string_alias(
+    payload: dict[str, Any], field_names: Sequence[str]
+) -> str | None:
+    for field_name in field_names:
+        if field_name in payload:
+            return _coerce_optional_string(payload, field_name)
+    return None
 
 
 def _step(name: str, status: str, detail: str | None) -> dict[str, str | None]:
@@ -262,6 +273,7 @@ def parse_setup_payload(
         ext_dir=_coerce_required_string(payload, "ext_dir"),
         gpu_sm=_coerce_optional_string(payload, "gpu_sm"),
         cuda_version=_coerce_optional_string(payload, "cuda_version"),
+        models_dir=_coerce_optional_string_alias(payload, ("models_dir", "modelsDir")),
     )
 
 
@@ -484,6 +496,28 @@ def run_install_setup_contract(
                     f"Installed {', '.join(install_step.packages)}.",
                 )
             )
+
+        if extension_id == "sdxl-base":
+            for feature_id, feature_spec in get_optional_feature_specs(extension_id).items():
+                if not feature_spec.get("supported", True):
+                    continue
+                step_name = f"acquire_optional_feature_{feature_id}"
+                try:
+                    optional_models_dir = payload.models_dir or installing_snapshot.paths.models_dir
+                    result = acquire_optional_feature_weights(
+                        extension_id,
+                        feature_id,
+                        optional_models_dir,
+                    )
+                except Exception as exc:
+                    raise SetupExecutionError(step_name=step_name, detail=str(exc)) from exc
+                execution_steps.append(
+                    _step(
+                        step_name,
+                        "ok",
+                        f"Acquired optional feature assets at '{result['check_path']}'.",
+                    )
+                )
 
     except SetupExecutionError as exc:
         execution_steps.append(_step(exc.step_name, "failed", exc.detail))

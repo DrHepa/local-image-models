@@ -14,6 +14,8 @@ from .diffusers_memory import (
     should_emit_memory_events,
 )
 from . import lifecycle
+from .denoising import validate_image_to_image_effective_denoising_steps
+from .descriptors import get_optional_feature_specs
 
 
 class InferenceRunnerError(RuntimeError):
@@ -47,6 +49,10 @@ _PIPELINE_LOADERS: dict[tuple[str, str], Any] = {
 }
 
 _RUNNING_INFERENCE_HEARTBEAT_SECONDS = 15.0
+_SDXL_IP_ADAPTER_FEATURE_ID = "sdxl_ip_adapter_style"
+_SDXL_IP_ADAPTER_SUBFOLDER = "sdxl_models"
+_SDXL_IP_ADAPTER_WEIGHT_NAME = "ip-adapter_sdxl.bin"
+_SDXL_IP_ADAPTER_IMAGE_ENCODER_FOLDER = "sdxl_models/image_encoder"
 
 
 def emit_event(event_type: str, *, stdout: TextIO | None = None, **payload: Any) -> None:
@@ -192,12 +198,42 @@ def _open_source_image(source_image_path: str):
     return Image.open(source_image_path)
 
 
+def _style_reference_from_job(job: dict[str, Any]) -> dict[str, str] | None:
+    conditioning = job.get("conditioning")
+    if not isinstance(conditioning, dict):
+        return None
+    references = conditioning.get("references")
+    if not isinstance(references, list):
+        return None
+    style_references = [reference for reference in references if isinstance(reference, dict) and reference.get("role") == "style"]
+    if not style_references:
+        return None
+    if len(style_references) != 1:
+        raise InferenceRunnerError("Inference runner expected exactly one style reference when IP-Adapter conditioning is present.")
+    file_path = style_references[0].get("filePath")
+    if not isinstance(file_path, str) or not file_path.strip():
+        raise InferenceRunnerError("IP-Adapter style reference must include a non-empty filePath.")
+    return {"role": "style", "filePath": file_path.strip()}
+
+
+def _derive_extension_model_dir(*, model_dir: str, node_id: str) -> Path:
+    resolved_model_dir = Path(model_dir)
+    if resolved_model_dir.name == node_id and resolved_model_dir.parent != resolved_model_dir:
+        return resolved_model_dir.parent
+    return resolved_model_dir
+
+
 def _build_pipeline_kwargs(job: dict[str, Any], *, execution_device: str) -> dict[str, Any]:
     params = job.get("params")
     if not isinstance(params, dict):
         raise InferenceRunnerError("Inference runner job field 'params' must be an object.")
 
     family = _require_string_field(job, "family")
+    if _require_string_field(job, "node_id") == "image-to-image" and job.get("source_image_path") is not None:
+        validate_image_to_image_effective_denoising_steps(
+            params,
+            error_type=InferenceRunnerError,
+        )
     kwargs: dict[str, Any] = {"prompt": job.get("prompt")}
     if family != "flux" and "negative_prompt" in job:
         kwargs["negative_prompt"] = job.get("negative_prompt")
@@ -229,7 +265,48 @@ def _build_pipeline_kwargs(job: dict[str, Any], *, execution_device: str) -> dic
         if "strength" in params:
             kwargs["strength"] = params["strength"]
 
+    style_reference = _style_reference_from_job(job)
+    if style_reference is not None:
+        if family != "sdxl" or _require_string_field(job, "node_id") != "image-to-image":
+            raise InferenceRunnerError("IP-Adapter style reference is supported only for SDXL image-to-image.")
+        kwargs["ip_adapter_image"] = _open_source_image(style_reference["filePath"])
+
     return kwargs
+
+
+def _configure_ip_adapter_if_present(pipeline: Any, job: dict[str, Any]) -> None:
+    style_reference = _style_reference_from_job(job)
+    if style_reference is None:
+        return
+    family = _require_string_field(job, "family")
+    node_id = _require_string_field(job, "node_id")
+    if family != "sdxl" or node_id != "image-to-image":
+        raise InferenceRunnerError("IP-Adapter style reference is supported only for SDXL image-to-image.")
+    model_dir = _require_string_field(job, "model_dir")
+    extension_model_dir = _derive_extension_model_dir(model_dir=model_dir, node_id=node_id)
+    asset_dir = extension_model_dir / "optional" / _SDXL_IP_ADAPTER_FEATURE_ID
+    feature_spec = get_optional_feature_specs("sdxl-base")[_SDXL_IP_ADAPTER_FEATURE_ID]
+    required_files = tuple(feature_spec.get("required_files", (f"{_SDXL_IP_ADAPTER_SUBFOLDER}/{_SDXL_IP_ADAPTER_WEIGHT_NAME}",)))
+    missing_files = tuple(asset_dir / relative_path for relative_path in required_files if not (asset_dir / relative_path).exists())
+    if missing_files:
+        raise InferenceRunnerError(
+            "Missing local SDXL IP-Adapter Style reference assets. Run Install/Repair for SDXL "
+            f"IP-Adapter Style reference assets before generation. Expected '{missing_files[0]}'."
+        )
+    load_adapter = getattr(pipeline, "load_ip_adapter", None)
+    if callable(load_adapter):
+        load_adapter(
+            str(asset_dir),
+            subfolder=_SDXL_IP_ADAPTER_SUBFOLDER,
+            weight_name=_SDXL_IP_ADAPTER_WEIGHT_NAME,
+            image_encoder_folder=_SDXL_IP_ADAPTER_IMAGE_ENCODER_FOLDER,
+            local_files_only=True,
+        )
+    params = job.get("params") if isinstance(job.get("params"), dict) else {}
+    reference_strength = params.get("reference_strength", 0.6)
+    set_scale = getattr(pipeline, "set_ip_adapter_scale", None)
+    if callable(set_scale):
+        set_scale(reference_strength)
 
 
 def _derive_numbered_output_path(primary_output_file: Path, image_index: int) -> Path:
@@ -295,6 +372,14 @@ def run_child_job(job: dict[str, Any], *, stdout: TextIO | None = None) -> dict[
     family = _require_string_field(job, "family")
     node_id = _require_string_field(job, "node_id")
     extension_id = job.get("extension_id") if isinstance(job.get("extension_id"), str) else ""
+    if node_id == "image-to-image" and job.get("source_image_path") is not None:
+        params = job.get("params")
+        if not isinstance(params, dict):
+            raise InferenceRunnerError("Inference runner job field 'params' must be an object.")
+        validate_image_to_image_effective_denoising_steps(
+            params,
+            error_type=InferenceRunnerError,
+        )
     loader = _resolve_loader(job)
     torch_module = _load_torch()
     execution_device = _resolve_execution_device()
@@ -308,7 +393,13 @@ def run_child_job(job: dict[str, Any], *, stdout: TextIO | None = None) -> dict[
         _instantiate_pipeline(loader, job=job, torch_module=torch_module),
         execution_device=execution_device,
     )
-    apply_post_load_memory_optimizations(pipeline=pipeline, extension_id=extension_id)
+    has_style_reference = _style_reference_from_job(job) is not None
+    _configure_ip_adapter_if_present(pipeline, job)
+    apply_post_load_memory_optimizations(
+        pipeline=pipeline,
+        extension_id=extension_id,
+        enable_attention_slicing=not has_style_reference,
+    )
     _emit_memory_event_for_stage(
         loading_label,
         extension_id=extension_id,
