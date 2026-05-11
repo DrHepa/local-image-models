@@ -231,6 +231,14 @@ def _candidate_install_allowed(plan: DependencyPlan) -> bool:
     )
 
 
+def _optional_feature_acquisition_failure_is_non_fatal(plan: DependencyPlan | None) -> bool:
+    return (
+        plan is not None
+        and plan.plan_state == PLAN_STATE_CANDIDATE_INSTALL
+        and plan.platform_key == "windows-amd64"
+    )
+
+
 def _torch_failure_diagnostic(*, exc: SetupExecutionError, plan: DependencyPlan | None) -> str | None:
     if exc.step_name != "install_shared_torch" or plan is None:
         return None
@@ -627,6 +635,17 @@ def run_install_setup_contract(
                     optional_models_dir,
                 )
             except Exception as exc:
+                if _optional_feature_acquisition_failure_is_non_fatal(plan):
+                    execution_steps.append(
+                        _step(
+                            step_name,
+                            "warning",
+                            "Optional feature acquisition failed during Windows candidate install; "
+                            "continuing baseline setup/import readiness without marking the optional "
+                            f"feature ready: {exc}",
+                        )
+                    )
+                    continue
                 raise SetupExecutionError(step_name=step_name, detail=str(exc)) from exc
             execution_steps.append(
                 _step(

@@ -512,6 +512,10 @@ def _normalize_setup_state(extension_id: str, current: Any, timestamp: str) -> d
         steps = _normalize_setup_steps(payload.get("steps")) or evaluated["steps"]
         diagnostics = _normalize_string_list(payload.get("diagnostics")) or evaluated["diagnostics"]
         venv_python = _normalize_string(payload.get("venv_python")) or evaluated["venv_python"]
+    elif status == SETUP_STATUS_READY and evaluated["status"] == SETUP_STATUS_READY:
+        steps = _normalize_setup_steps(payload.get("steps")) or evaluated["steps"]
+        diagnostics = _normalize_string_list(payload.get("diagnostics")) or evaluated["diagnostics"]
+        venv_python = _normalize_string(payload.get("venv_python")) or evaluated["venv_python"]
     else:
         status = evaluated["status"]
         steps = evaluated["steps"]

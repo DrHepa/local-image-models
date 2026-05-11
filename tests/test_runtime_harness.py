@@ -2700,6 +2700,143 @@ class RuntimeHarnessTests(unittest.TestCase):
         self.assertEqual(record["dependency_plan_state"], dependencies.PLAN_STATE_CANDIDATE_INSTALL)
         self.assertFalse(record["platform_supported"])
 
+    def test_sd15_windows_candidate_setup_continues_when_optional_acquisition_fails(self) -> None:
+        runtime_root = self._make_runtime_root("sd15")
+        self._make_windows_executable_python(runtime_root)
+        install_calls: list[str] = []
+        acquisition_calls: list[tuple[str, str, Path]] = []
+
+        def fake_run_checked(*, command, step_name, cwd=None):
+            if step_name == "create_venv":
+                return None
+            if step_name == "upgrade_pip":
+                install_calls.append(step_name)
+                return None
+            raise AssertionError(f"unexpected command execution: {step_name}")
+
+        def fake_install_step(*, venv_python, install_step, cwd):
+            install_calls.append(install_step.name)
+            return None
+
+        def fail_optional_acquisition(extension_id, feature_id, models_dir, *, downloader=None):
+            acquisition_calls.append((extension_id, feature_id, Path(models_dir)))
+            raise RuntimeError("simulated unauthenticated Hugging Face rate limit for SD15 image encoder")
+
+        windows_venv_python = runtime_root / "venv" / "Scripts" / "python.exe"
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.dict(
+                    os.environ,
+                    {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)},
+                    clear=False,
+                )
+            )
+            stack.enter_context(patch("local_image_runtime.install_contract.detect_platform", return_value=WINDOWS_PLATFORM))
+            stack.enter_context(
+                patch(
+                    "local_image_runtime.install_contract.expected_venv_python",
+                    side_effect=lambda ext_dir: Path(ext_dir) / "venv" / "Scripts" / "python.exe",
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "local_image_runtime.bootstrap.expected_venv_python",
+                    side_effect=lambda ext_dir: Path(ext_dir) / "venv" / "Scripts" / "python.exe",
+                )
+            )
+            stack.enter_context(patch("local_image_runtime.install_contract.python_tag_from_interpreter", return_value="cp312"))
+            stack.enter_context(patch("local_image_runtime.install_contract._run_checked", side_effect=fake_run_checked))
+            stack.enter_context(patch("local_image_runtime.install_contract._install_dependency_step", side_effect=fake_install_step))
+            stack.enter_context(
+                patch(
+                    "local_image_runtime.install_contract.acquire_optional_feature_weights",
+                    side_effect=fail_optional_acquisition,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "local_image_runtime.weights.HuggingFaceSnapshotDownloader.snapshot_download",
+                    side_effect=AssertionError("unit tests must not download Hugging Face weights"),
+                )
+            )
+            smoke_imports = stack.enter_context(
+                patch("local_image_runtime.bootstrap._smoke_test_runtime_imports", return_value=(True, "stubbed imports"))
+            )
+
+            result = install_contract.run_install_setup_contract(
+                extension_id="sd15",
+                stdin_text=self._windows_payload(runtime_root),
+            )
+
+        self.assertEqual(result.status, bootstrap.SETUP_STATUS_READY)
+        self.assertEqual(
+            install_calls,
+            ["upgrade_pip", "install_shared_torch", "install_shared_runtime", "install_family_dependencies"],
+        )
+        self.assertEqual(
+            acquisition_calls,
+            [("sd15", "sd15_ip_adapter_style", runtime_root / ".local-image-runtime" / "models")],
+        )
+        warning_steps = [step for step in result.steps if step.name == "acquire_optional_feature_sd15_ip_adapter_style"]
+        self.assertEqual(len(warning_steps), 1)
+        self.assertEqual(warning_steps[0].status, "warning")
+        warning_detail = warning_steps[0].detail or ""
+        self.assertIn("optional feature", warning_detail)
+        self.assertIn("candidate", warning_detail)
+        self.assertIn("rate limit", warning_detail)
+        smoke_imports.assert_any_call(windows_venv_python, descriptors.get_extension_descriptor("sd15").readiness_imports)
+
+        with patch.dict(os.environ, {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)}, clear=False), patch(
+            "local_image_runtime.bootstrap.expected_venv_python",
+            side_effect=lambda ext_dir: Path(ext_dir) / "venv" / "Scripts" / "python.exe",
+        ), patch("local_image_runtime.bootstrap._smoke_test_runtime_imports", return_value=(True, "stubbed imports")):
+            snapshot = bootstrap.bootstrap_runtime(extension_id="sd15")
+        record = bootstrap.get_extension_record(snapshot, "sd15")
+        self.assertEqual(record["setup"]["status"], bootstrap.SETUP_STATUS_READY)
+        self.assertEqual(record["status"], bootstrap.EXTENSION_STATUS_INSTALLED)
+        self.assertEqual(record["setup_state"], dependencies.PLAN_STATE_CANDIDATE_INSTALL)
+        self.assertEqual(record["dependency_plan_state"], dependencies.PLAN_STATE_CANDIDATE_INSTALL)
+        self.assertFalse(record["platform_supported"])
+        optional = record["weights"]["optional_features"]["sd15_ip_adapter_style"]
+        self.assertEqual(optional["status"], "missing")
+        self.assertFalse(optional["ready"])
+
+    def test_sd15_linux_verified_setup_fails_when_optional_acquisition_fails(self) -> None:
+        runtime_root = self._make_runtime_root("sd15")
+
+        def fail_optional_acquisition(extension_id, feature_id, models_dir, *, downloader=None):
+            raise RuntimeError("simulated required Linux ARM64 optional acquisition failure")
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.dict(
+                    os.environ,
+                    {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)},
+                    clear=False,
+                )
+            )
+            stack.enter_context(patch("local_image_runtime.install_contract.detect_platform", return_value=SUPPORTED_PLATFORM))
+            stack.enter_context(patch("local_image_runtime.install_contract.resolve_dependency_plan", return_value=self._fake_plan("sd15")))
+            stack.enter_context(patch("local_image_runtime.install_contract._run_checked", side_effect=self._run_checked_side_effect))
+            stack.enter_context(patch("local_image_runtime.install_contract._install_dependency_step", return_value=None))
+            stack.enter_context(
+                patch(
+                    "local_image_runtime.install_contract.acquire_optional_feature_weights",
+                    side_effect=fail_optional_acquisition,
+                )
+            )
+            stack.enter_context(patch("local_image_runtime.bootstrap._smoke_test_runtime_imports", return_value=(True, "stubbed imports")))
+
+            result = install_contract.run_install_setup_contract(
+                extension_id="sd15",
+                stdin_text=self._payload(runtime_root),
+            )
+
+        self.assertEqual(result.status, bootstrap.SETUP_STATUS_FAILED)
+        failed_steps = {step.name: step for step in result.steps}
+        self.assertEqual(failed_steps["acquire_optional_feature_sd15_ip_adapter_style"].status, "failed")
+        self.assertIn("simulated required Linux ARM64 optional acquisition failure", result.diagnostics)
+
     def test_sdxl_windows_candidate_setup_attempts_fake_install_and_persists_failure(self) -> None:
         runtime_root = self._make_runtime_root("sdxl-base")
         self._make_windows_executable_python(runtime_root)
