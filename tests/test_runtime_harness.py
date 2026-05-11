@@ -117,6 +117,96 @@ class RuntimeHarnessTests(unittest.TestCase):
             )
         )
 
+    def _make_bootstrapped_runtime_snapshot(self, root: Path) -> bootstrap.RuntimeSnapshot:
+        runtime_root = root / "runtime-root"
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        (runtime_root / "manifest.json").write_text(self._extension_manifest("sd15"), encoding="utf-8")
+        with patch.dict(os.environ, {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)}):
+            return bootstrap.bootstrap_runtime("sd15")
+
+    def _make_valid_extension_source(self, root: Path, extension_id: str = "sd15") -> Path:
+        source_dir = root / f"{extension_id}-source"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        descriptor = descriptors.get_extension_descriptor(extension_id)
+        self.assertIsNotNone(descriptor)
+        for required_path in descriptor.required_paths:
+            target = source_dir / required_path
+            if "." in target.name:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("{}\n", encoding="utf-8")
+            else:
+                target.mkdir(parents=True, exist_ok=True)
+        return source_dir
+
+    def _assert_no_runtime_install_scratch_dirs(self, models_dir: Path) -> None:
+        leftovers = [
+            path.name
+            for path in models_dir.iterdir()
+            if path.name.startswith(".") and ".tmp-" in path.name
+        ]
+        backup_like = [path.name for path in models_dir.iterdir() if "backup" in path.name.lower()]
+        self.assertEqual([], leftovers)
+        self.assertEqual([], backup_like)
+
+    def test_install_extension_refuses_existing_destination_without_deleting_it(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="install-existing-destination-") as temp_dir:
+            root = Path(temp_dir)
+            snapshot = self._make_bootstrapped_runtime_snapshot(root)
+            source_dir = self._make_valid_extension_source(root)
+            destination_dir = snapshot.paths.models_dir / "sd15"
+            destination_dir.mkdir(parents=True, exist_ok=True)
+            sentinel = destination_dir / "existing-model.bin"
+            sentinel.write_text("do-not-delete\n", encoding="utf-8")
+
+            with self.assertRaises(bootstrap.RuntimeOperationError) as raised:
+                bootstrap.install_extension_from_local_dir(snapshot, "sd15", source_dir)
+
+            self.assertIn("refuses to overwrite", str(raised.exception))
+            self.assertTrue(sentinel.exists())
+            self.assertEqual("do-not-delete\n", sentinel.read_text(encoding="utf-8"))
+            self._assert_no_runtime_install_scratch_dirs(snapshot.paths.models_dir)
+
+    def test_install_extension_copy_failure_preserves_existing_destination(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="install-copy-failure-existing-") as temp_dir:
+            root = Path(temp_dir)
+            snapshot = self._make_bootstrapped_runtime_snapshot(root)
+            source_dir = self._make_valid_extension_source(root)
+            destination_dir = snapshot.paths.models_dir / "sd15"
+            sentinel = destination_dir / "existing-model.bin"
+
+            def fail_after_temp_created(_source: Path, temp_dir: Path) -> None:
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                (temp_dir / "partial-copy").write_text("partial\n", encoding="utf-8")
+                destination_dir.mkdir(parents=True, exist_ok=True)
+                sentinel.write_text("still-here\n", encoding="utf-8")
+                raise OSError("simulated copy failure")
+
+            with patch.object(bootstrap.shutil, "copytree", side_effect=fail_after_temp_created):
+                with self.assertRaises(bootstrap.RuntimeOperationError) as raised:
+                    bootstrap.install_extension_from_local_dir(snapshot, "sd15", source_dir)
+
+            self.assertIn("simulated copy failure", str(raised.exception))
+            self.assertTrue(sentinel.exists())
+            self.assertEqual("still-here\n", sentinel.read_text(encoding="utf-8"))
+            self._assert_no_runtime_install_scratch_dirs(snapshot.paths.models_dir)
+
+    def test_install_extension_failure_leaves_no_temp_or_backup_like_dirs(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="install-failure-cleanup-") as temp_dir:
+            root = Path(temp_dir)
+            snapshot = self._make_bootstrapped_runtime_snapshot(root)
+            source_dir = self._make_valid_extension_source(root)
+
+            def fail_after_temp_created(_source: Path, temp_dir: Path) -> None:
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                (temp_dir / "partial-copy").write_text("partial\n", encoding="utf-8")
+                raise OSError("simulated copy failure")
+
+            with patch.object(bootstrap.shutil, "copytree", side_effect=fail_after_temp_created):
+                with self.assertRaises(bootstrap.RuntimeOperationError):
+                    bootstrap.install_extension_from_local_dir(snapshot, "sd15", source_dir)
+
+            self._assert_no_runtime_install_scratch_dirs(snapshot.paths.models_dir)
+
     def _make_executable_python(self, root: Path) -> Path:
         python_path = root / "venv" / "bin" / "python"
         python_path.parent.mkdir(parents=True, exist_ok=True)

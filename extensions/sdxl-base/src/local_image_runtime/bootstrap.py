@@ -1086,13 +1086,24 @@ def install_extension_from_local_dir(
         )
 
     destination_dir = snapshot.paths.models_dir / extension_id
+    if destination_dir.exists():
+        raise RuntimeOperationError(
+            f"Non-destructive install refuses to overwrite existing data for extension "
+            f"'{extension_id}' at '{destination_dir}'. Remove or move the existing directory "
+            "before installing from a local source."
+        )
+
     temp_dir = snapshot.paths.models_dir / f".{extension_id}.tmp-{uuid.uuid4().hex}"
     installing_snapshot = mark_extension_installing(snapshot, extension_id)
 
     try:
         shutil.copytree(source_path, temp_dir)
         if destination_dir.exists():
-            shutil.rmtree(destination_dir)
+            raise RuntimeOperationError(
+                f"Non-destructive install refuses to overwrite existing data for extension "
+                f"'{extension_id}' at '{destination_dir}'. Remove or move the existing directory "
+                "before installing from a local source."
+            )
         temp_dir.replace(destination_dir)
         installed_snapshot = mark_extension_installed(installing_snapshot, extension_id)
     except Exception as exc:
