@@ -3,7 +3,7 @@
   "name": "Stable Diffusion 1.5",
   "type": "model",
   "description": "Self-contained SD15 model extension scaffold for local text-to-image and image-to-image workflows.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "DrHepa",
   "generator_class": "SD15Generator",
   "tags": [
@@ -109,6 +109,25 @@
       "name": "Image to Image",
       "input": "image",
       "output": "image",
+      "inputs": [
+        {
+          "name": "front",
+          "label": "Primary image",
+          "type": "image",
+          "required": true
+        },
+        {
+          "name": "left",
+          "label": "Style reference",
+          "type": "image",
+          "required": false
+        }
+      ],
+      "style_reference": {
+        "label": "Style reference",
+        "optional": true,
+        "role": "style"
+      },
       "hf_repo": "runwayml/stable-diffusion-v1-5",
       "download_check": "model_index.json",
       "params_schema": [
@@ -167,6 +186,15 @@
           "min": 0,
           "max": 50,
           "tooltip": "How strongly generation follows the prompt."
+        },
+        {
+          "id": "reference_strength",
+          "label": "Reference Strength",
+          "type": "float",
+          "default": 0.6,
+          "min": 0,
+          "max": 1,
+          "tooltip": "Controls optional SD1.5 IP-Adapter style reference guidance; the primary image remains the init image."
         },
         {
           "id": "seed",

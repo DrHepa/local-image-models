@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import subprocess
@@ -24,12 +25,15 @@ if str(RUNTIME_ROOT) not in sys.path:
     sys.path.insert(0, str(RUNTIME_ROOT))
 
 from local_image_runtime import (  # noqa: E402
+    bundle_metadata,
     bootstrap,
     dependencies,
     descriptors,
     install_contract,
     pipeline,
+    release_gates,
     runtime_adapter,
+    smoke_evidence,
     weights,
 )
 from local_image_runtime.dependencies import DependencyInstallStep, DependencyPlan  # noqa: E402
@@ -146,6 +150,986 @@ class RuntimeHarnessTests(unittest.TestCase):
             cwd=workspace_dir,
             env={"PYTHONPATH": str(workspace_dir)},
         )
+
+    def test_release_preflight_blocks_wrong_repo_and_excludes_gitignore(self) -> None:
+        expected_root = Path("/home/drhepa/shiro-stack/repos/Tools/local-image-models")
+
+        wrong_repo = release_gates.evaluate_workspace_preflight(
+            repo_root=Path("/home/drhepa/shiro-stack/repos/Tools/modly-Codex-image-extension"),
+            expected_repo_root=expected_root,
+            branch="main",
+            ahead_count=1,
+            staged_files=(),
+            unstaged_files=(".gitignore",),
+            untracked_files=(),
+        )
+        self.assertFalse(wrong_repo.ready)
+        self.assertIn("outside expected repository", " ".join(wrong_repo.diagnostics))
+
+        correct_repo = release_gates.evaluate_workspace_preflight(
+            repo_root=expected_root,
+            expected_repo_root=expected_root,
+            branch="main",
+            ahead_count=1,
+            staged_files=("README.md", "extensions/sd15/manifest.json"),
+            unstaged_files=(".gitignore",),
+            untracked_files=("docs/release-smoke.md",),
+        )
+        self.assertTrue(correct_repo.ready)
+        self.assertEqual(
+            correct_repo.release_evidence_files,
+            ("README.md", "docs/release-smoke.md", "extensions/sd15/manifest.json"),
+        )
+        self.assertNotIn(".gitignore", correct_repo.release_evidence_files)
+        self.assertIn(".gitignore preserved as unrelated", " ".join(correct_repo.diagnostics))
+
+    def test_previous_release_ref_must_point_to_archived_commit_before_promotion(self) -> None:
+        missing_ref = release_gates.evaluate_previous_release_ref(
+            ref_name="release/previous-0.1.x",
+            target_commit="8f1eb6b",
+            refs={"refs/heads/main": "HEAD"},
+        )
+        self.assertFalse(missing_ref.ready)
+        self.assertIn("release/previous-0.1.x", " ".join(missing_ref.diagnostics))
+        self.assertIn("8f1eb6b", " ".join(missing_ref.diagnostics))
+
+        matching_ref = release_gates.evaluate_previous_release_ref(
+            ref_name="release/previous-0.1.x",
+            target_commit="8f1eb6b",
+            refs={"refs/heads/release/previous-0.1.x": "8f1eb6b"},
+        )
+        self.assertTrue(matching_ref.ready)
+        self.assertEqual(matching_ref.ref_name, "release/previous-0.1.x")
+        self.assertEqual(matching_ref.commit, "8f1eb6b")
+
+    def test_bundle_version_policy_rejects_manifest_drift_or_missing_next_policy(self) -> None:
+        drift = bundle_metadata.evaluate_bundle_version_policy(
+            manifest_versions={"sd15": "0.1.0", "sdxl-base": "0.1.1", "flux-schnell": "0.1.0"},
+            package_versions={"local-image-runtime": "0.1.1"},
+            next_version_policy=None,
+        )
+        self.assertFalse(drift.ready)
+        self.assertIn("version drift", " ".join(drift.diagnostics))
+        self.assertIn("missing next-version policy", " ".join(drift.diagnostics))
+
+        policy = bundle_metadata.evaluate_bundle_version_policy(
+            manifest_versions={"sd15": "0.1.1", "sdxl-base": "0.1.1", "flux-schnell": "0.1.1"},
+            package_versions={"local-image-runtime": "0.1.1"},
+            next_version_policy="next patch version 0.1.2 after smoke gates pass",
+        )
+        self.assertTrue(policy.ready)
+        self.assertEqual(policy.current_version, "0.1.1")
+        self.assertEqual(policy.next_version_policy, "next patch version 0.1.2 after smoke gates pass")
+
+    def test_bundle_metadata_prepares_next_ip_adapter_patch_version(self) -> None:
+        manifest_paths = {
+            extension_id: REPO_ROOT / "extensions" / extension_id / "manifest.json"
+            for extension_id in EXTENSION_IDS
+        }
+        manifest_versions = bundle_metadata.load_manifest_versions(manifest_paths)
+
+        policy = bundle_metadata.evaluate_bundle_version_policy(
+            manifest_versions=manifest_versions,
+            package_versions={"local-image-runtime": bundle_metadata.BUNDLE_VERSION},
+            next_version_policy="prepared IP-Adapter patch version 0.1.1; Windows remains candidate/unverified",
+        )
+
+        self.assertTrue(policy.ready, policy.diagnostics)
+        self.assertEqual(policy.current_version, "0.1.1")
+        self.assertEqual(set(manifest_versions.values()), {"0.1.1"})
+
+    def test_smoke_evidence_requires_fields_and_validation_only_is_not_promotion_ready(self) -> None:
+        incomplete = smoke_evidence.validate_smoke_evidence(
+            {
+                "kind": "validation",
+                "feature": "sd15_ip_adapter",
+                "platform": "linux/arm64",
+                "ref": "8f1eb6b",
+                "version": "0.1.0",
+                "result": "pass",
+            }
+        )
+        self.assertFalse(incomplete.valid)
+        self.assertIn("commands", incomplete.missing_fields)
+        self.assertIn("assets", incomplete.missing_fields)
+        self.assertIn("packages", incomplete.missing_fields)
+        self.assertIn("logs", incomplete.missing_fields)
+        self.assertIn("outputs", incomplete.missing_fields)
+
+        validation_only = smoke_evidence.validate_smoke_evidence(
+            {
+                "kind": "validation",
+                "feature": "sd15_ip_adapter",
+                "platform": "linux/arm64",
+                "ref": "8f1eb6b",
+                "version": "0.1.0",
+                "commands": ["python3 -m unittest discover tests -v"],
+                "assets": [],
+                "packages": {"python": "3.12"},
+                "outputs": [],
+                "logs": ["168 tests passed"],
+                "result": "pass",
+            }
+        )
+        self.assertTrue(validation_only.valid)
+
+        gate = smoke_evidence.evaluate_feature_promotion_evidence([validation_only.payload], feature="sd15_ip_adapter")
+        self.assertFalse(gate.ready)
+        self.assertIn("install_repair", gate.missing_kinds)
+        self.assertIn("gpu_generation", gate.missing_kinds)
+
+    def test_sdxl_style_local_smoke_evidence_is_separate_from_validation_only_evidence(self) -> None:
+        validation_only = {
+            "kind": "validation",
+            "feature": "sdxl_ip_adapter_style",
+            "platform": "linux/arm64",
+            "ref": "local-smoke-release-gates",
+            "version": "0.1.1",
+            "commands": ["python3 -m unittest discover tests -v"],
+            "assets": [],
+            "packages": {"python": "3.12", "cuda": "12.4", "torch": "2.7.0", "diffusers": "0.35.1"},
+            "outputs": [],
+            "logs": ["validation-only schema checks passed"],
+            "result": "pass",
+        }
+
+        validation_gate = smoke_evidence.evaluate_sdxl_style_reference_local_smoke_evidence([validation_only])
+
+        self.assertFalse(validation_gate.ready)
+        validation_diagnostics = " ".join(validation_gate.diagnostics)
+        self.assertIn("validation-only", validation_diagnostics)
+        self.assertIn("install/repair", validation_diagnostics)
+        self.assertIn("GPU generation", validation_diagnostics)
+        self.assertIn("readiness", validation_diagnostics)
+        self.assertIn("local asset", validation_diagnostics)
+
+        install_repair = {
+            "kind": "install_repair",
+            "feature": "sdxl_ip_adapter_style",
+            "platform": "linux/arm64",
+            "ref": "local-smoke-release-gates",
+            "version": "0.1.1",
+            "commands": ["python3 extensions/sdxl-base/setup.py < install-payload.json"],
+            "assets": [
+                {
+                    "id": "sdxl_ip_adapter_style",
+                    "path": "/models/sdxl-base/optional/sdxl_ip_adapter_style/sdxl_models/ip-adapter_sdxl.bin",
+                    "sha256": "adapter-sha",
+                }
+            ],
+            "packages": {"python": "3.12", "cuda": "12.4", "torch": "2.7.0", "diffusers": "0.35.1"},
+            "outputs": [],
+            "logs": ["Install/Repair completed and runtime imports passed"],
+            "result": "pass",
+            "readiness": "ready",
+            "local_assets": [
+                "/models/sdxl-base/optional/sdxl_ip_adapter_style/sdxl_models/ip-adapter_sdxl.bin",
+                "/models/sdxl-base/optional/sdxl_ip_adapter_style/sdxl_models/image_encoder/config.json",
+            ],
+        }
+        incomplete_gpu_generation = {
+            "kind": "gpu_generation",
+            "feature": "sdxl_ip_adapter_style",
+            "platform": "linux/arm64",
+            "ref": "local-smoke-release-gates",
+            "version": "0.1.1",
+            "commands": ["modly generate sdxl-base image-to-image --style-reference local.png"],
+            "assets": install_repair["assets"],
+            "packages": install_repair["packages"],
+            "outputs": [],
+            "logs": [],
+            "result": "pass",
+            "local_files_only": True,
+        }
+
+        incomplete_generation_gate = smoke_evidence.evaluate_sdxl_style_reference_local_smoke_evidence(
+            [install_repair, incomplete_gpu_generation]
+        )
+
+        self.assertFalse(incomplete_generation_gate.ready)
+        incomplete_diagnostics = " ".join(incomplete_generation_gate.diagnostics)
+        self.assertIn("GPU generation", incomplete_diagnostics)
+        self.assertIn("output", incomplete_diagnostics)
+        self.assertIn("log", incomplete_diagnostics)
+
+        complete_gpu_generation = {
+            **incomplete_gpu_generation,
+            "outputs": ["/outputs/sdxl-style-local-smoke.png"],
+            "logs": ["Generated SDXL style-reference output using local_files_only=True"],
+        }
+        installed_parity = {
+            "kind": "installed_parity",
+            "feature": "sdxl_ip_adapter_style",
+            "platform": "linux/arm64",
+            "ref": "local-smoke-release-gates",
+            "version": "0.1.1",
+            "commands": ["python3 tools/sync_extension_runtime.py --check"],
+            "assets": install_repair["assets"],
+            "packages": install_repair["packages"],
+            "outputs": [],
+            "logs": ["installed runtime parity passed"],
+            "result": "pass",
+            "parity": "fresh",
+        }
+
+        ready_gate = smoke_evidence.evaluate_sdxl_style_reference_local_smoke_evidence(
+            [validation_only, install_repair, complete_gpu_generation, installed_parity]
+        )
+
+        self.assertTrue(ready_gate.ready)
+        self.assertEqual(ready_gate.feature, "sdxl_ip_adapter_style")
+        self.assertEqual(ready_gate.missing_kinds, ())
+
+        generic_gate = smoke_evidence.evaluate_feature_promotion_evidence(
+            [validation_only, install_repair, complete_gpu_generation], feature="sdxl_ip_adapter_style"
+        )
+        self.assertTrue(generic_gate.ready)
+
+    def test_sdxl_style_evidence_persists_without_gpu_smoke_but_is_not_promotion_ready(self) -> None:
+        evidence_path = Path(tempfile.mkdtemp(prefix="sdxl-style-evidence-missing-gpu-")) / "evidence.json"
+        install_repair = {
+            "kind": "install_repair",
+            "feature": "sdxl_ip_adapter_style",
+            "platform": "linux/arm64",
+            "ref": "local-smoke-release-gates",
+            "version": "0.1.1",
+            "commands": ["python3 extensions/sdxl-base/setup.py < install-payload.json"],
+            "assets": [
+                {
+                    "id": "sdxl_ip_adapter_style",
+                    "path": "/models/sdxl-base/optional/sdxl_ip_adapter_style/sdxl_models/ip-adapter_sdxl.bin",
+                    "sha256": "adapter-sha",
+                }
+            ],
+            "packages": {"python": "3.12", "cuda": "12.4", "torch": "2.7.0", "diffusers": "0.35.1"},
+            "outputs": [],
+            "logs": ["Install/Repair completed and runtime imports passed"],
+            "result": "pass",
+            "readiness": "ready",
+            "local_assets": [
+                "/models/sdxl-base/optional/sdxl_ip_adapter_style/sdxl_models/ip-adapter_sdxl.bin",
+                "/models/sdxl-base/optional/sdxl_ip_adapter_style/sdxl_models/image_encoder/config.json",
+            ],
+        }
+
+        gate = smoke_evidence.write_sdxl_style_reference_smoke_evidence(
+            evidence_path,
+            install_repair=install_repair,
+        )
+        stored_records = smoke_evidence.read_smoke_evidence(evidence_path)
+
+        self.assertFalse(gate.ready)
+        self.assertEqual(gate.missing_kinds, ("model_load", "generate_no_download", "gpu_generation", "installed_parity"))
+        diagnostics = " ".join(gate.diagnostics)
+        self.assertIn("GPU generation", diagnostics)
+        self.assertIn("output", diagnostics)
+        self.assertIn("log", diagnostics)
+        self.assertEqual(stored_records, [install_repair])
+        self.assertEqual(stored_records[0]["readiness"], "ready")
+        self.assertEqual(stored_records[0]["local_assets"], install_repair["local_assets"])
+
+    def test_complete_sdxl_style_evidence_promotes_sdxl_only_not_sd15_or_controlnet(self) -> None:
+        evidence_path = Path(tempfile.mkdtemp(prefix="sdxl-style-evidence-complete-")) / "evidence.json"
+        install_repair = {
+            "kind": "install_repair",
+            "feature": "sdxl_ip_adapter_style",
+            "platform": "linux/arm64",
+            "ref": "local-smoke-release-gates",
+            "version": "0.1.1",
+            "commands": ["python3 extensions/sdxl-base/setup.py < install-payload.json"],
+            "assets": [
+                {
+                    "id": "sdxl_ip_adapter_style",
+                    "path": "/models/sdxl-base/optional/sdxl_ip_adapter_style/sdxl_models/ip-adapter_sdxl.bin",
+                    "sha256": "adapter-sha",
+                }
+            ],
+            "packages": {"python": "3.12", "cuda": "12.4", "torch": "2.7.0", "diffusers": "0.35.1"},
+            "outputs": [],
+            "logs": ["Install/Repair completed and runtime imports passed"],
+            "result": "pass",
+            "readiness": "ready",
+            "local_assets": [
+                "/models/sdxl-base/optional/sdxl_ip_adapter_style/sdxl_models/ip-adapter_sdxl.bin",
+                "/models/sdxl-base/optional/sdxl_ip_adapter_style/sdxl_models/image_encoder/config.json",
+            ],
+        }
+        gpu_generation = {
+            "kind": "gpu_generation",
+            "feature": "sdxl_ip_adapter_style",
+            "platform": "linux/arm64",
+            "ref": "local-smoke-release-gates",
+            "version": "0.1.1",
+            "commands": ["modly generate sdxl-base image-to-image --style-reference local.png"],
+            "assets": install_repair["assets"],
+            "packages": install_repair["packages"],
+            "outputs": ["/outputs/sdxl-style-local-smoke.png"],
+            "logs": ["Generated SDXL style-reference output using local_files_only=True"],
+            "result": "pass",
+            "local_files_only": True,
+        }
+        installed_parity = {
+            "kind": "installed_parity",
+            "feature": "sdxl_ip_adapter_style",
+            "platform": "linux/arm64",
+            "ref": "local-smoke-release-gates",
+            "version": "0.1.1",
+            "commands": ["python3 tools/sync_extension_runtime.py --check"],
+            "assets": install_repair["assets"],
+            "packages": install_repair["packages"],
+            "outputs": [],
+            "logs": ["installed runtime parity passed"],
+            "result": "pass",
+            "parity": "fresh",
+        }
+
+        sdxl_gate = smoke_evidence.write_sdxl_style_reference_smoke_evidence(
+            evidence_path,
+            install_repair=install_repair,
+            gpu_generation=gpu_generation,
+        )
+        smoke_evidence.write_smoke_evidence(evidence_path, [install_repair, gpu_generation, installed_parity])
+        sdxl_gate = smoke_evidence.evaluate_sdxl_style_reference_local_smoke_evidence(
+            smoke_evidence.read_smoke_evidence(evidence_path)
+        )
+        stored_records = smoke_evidence.read_smoke_evidence(evidence_path)
+        sd15_gate = smoke_evidence.evaluate_feature_promotion_evidence(stored_records, feature="sd15_ip_adapter")
+        controlnet_gate = smoke_evidence.evaluate_feature_promotion_evidence(stored_records, feature="controlnet")
+
+        self.assertTrue(sdxl_gate.ready)
+        self.assertEqual(stored_records, [install_repair, gpu_generation, installed_parity])
+        self.assertEqual(stored_records[1]["outputs"], ["/outputs/sdxl-style-local-smoke.png"])
+        self.assertEqual(stored_records[1]["logs"], ["Generated SDXL style-reference output using local_files_only=True"])
+        self.assertFalse(sd15_gate.ready)
+        self.assertEqual(sd15_gate.missing_kinds, ("install_repair", "gpu_generation"))
+        self.assertFalse(controlnet_gate.ready)
+        self.assertEqual(controlnet_gate.missing_kinds, ("install_repair", "gpu_generation"))
+
+    def test_sdxl_style_asset_identity_records_local_paths_hashes_repo_and_unknown_revision(self) -> None:
+        models_dir = Path(tempfile.mkdtemp(prefix="sdxl-style-assets-"))
+        feature_root = models_dir / "sdxl-base" / "optional" / "sdxl_ip_adapter_style"
+        payloads = {
+            "sdxl_models/ip-adapter_sdxl.bin": b"adapter-bytes",
+            "sdxl_models/image_encoder/config.json": b'{"architectures":["CLIPVisionModelWithProjection"]}',
+            "sdxl_models/image_encoder/model.safetensors": b"encoder-bytes",
+        }
+        for relative_path, content in payloads.items():
+            target = feature_root / relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+
+        ledger = weights.collect_optional_feature_asset_identity(
+            "sdxl-base",
+            "sdxl_ip_adapter_style",
+            models_dir=models_dir,
+        )
+
+        self.assertEqual(ledger["status"], "ready")
+        self.assertEqual(ledger["extension_id"], "sdxl-base")
+        self.assertEqual(ledger["feature_id"], "sdxl_ip_adapter_style")
+        self.assertEqual(ledger["repo"], "h94/IP-Adapter")
+        self.assertEqual(ledger["revision"], "unknown")
+        self.assertEqual(ledger["model_dir"], str(feature_root))
+        self.assertEqual(ledger["missing_files"], ())
+        by_relative_path = {asset["relative_path"]: asset for asset in ledger["assets"]}
+        self.assertEqual(tuple(by_relative_path), tuple(payloads))
+        for relative_path, content in payloads.items():
+            asset = by_relative_path[relative_path]
+            self.assertEqual(asset["path"], str(feature_root / relative_path))
+            self.assertEqual(asset["size"], len(content))
+            self.assertEqual(asset["sha256"], hashlib.sha256(content).hexdigest())
+            self.assertEqual(asset["repo"], "h94/IP-Adapter")
+            self.assertEqual(asset["revision"], "unknown")
+
+    def test_sdxl_style_asset_identity_missing_assets_is_actionable_and_local_only(self) -> None:
+        models_dir = Path(tempfile.mkdtemp(prefix="sdxl-style-missing-assets-"))
+        feature_root = models_dir / "sdxl-base" / "optional" / "sdxl_ip_adapter_style"
+        adapter_path = feature_root / "sdxl_models" / "ip-adapter_sdxl.bin"
+        adapter_path.parent.mkdir(parents=True, exist_ok=True)
+        adapter_path.write_bytes(b"adapter-only")
+
+        ledger = weights.collect_optional_feature_asset_identity(
+            "sdxl-base",
+            "sdxl_ip_adapter_style",
+            models_dir=models_dir,
+            revision="main",
+        )
+
+        self.assertEqual(ledger["status"], "missing")
+        self.assertEqual(ledger["revision"], "main")
+        self.assertEqual(
+            ledger["missing_files"],
+            (
+                "sdxl_models/image_encoder/config.json",
+                "sdxl_models/image_encoder/model.safetensors",
+            ),
+        )
+        diagnostics = " ".join(ledger["diagnostics"])
+        self.assertIn("Run Install/Repair", diagnostics)
+        self.assertIn("no download was attempted", diagnostics)
+        self.assertIn(str(feature_root / "sdxl_models" / "image_encoder" / "config.json"), diagnostics)
+
+    def test_sd15_style_asset_identity_reports_discovered_missing_bundle_without_download(self) -> None:
+        models_dir = Path(tempfile.mkdtemp(prefix="sd15-style-discovered-assets-"))
+
+        ledger = weights.collect_optional_feature_asset_identity(
+            "sd15",
+            "sd15_ip_adapter_style",
+            models_dir=models_dir,
+        )
+
+        self.assertEqual(ledger["status"], "missing")
+        self.assertEqual(ledger["extension_id"], "sd15")
+        self.assertEqual(ledger["feature_id"], "sd15_ip_adapter_style")
+        self.assertEqual(ledger["repo"], "h94/IP-Adapter")
+        self.assertEqual(ledger["revision"], "018e402774aeeddd60609b4ecdb7e298259dc729")
+        self.assertEqual(
+            ledger["required_files"],
+            (
+                "models/ip-adapter_sd15.safetensors",
+                "models/image_encoder/config.json",
+                "models/image_encoder/model.safetensors",
+            ),
+        )
+        self.assertEqual(ledger["allow_patterns"], ledger["required_files"])
+        self.assertEqual(ledger["assets"], ())
+        self.assertTrue(ledger["local_files_only"])
+        diagnostics = " ".join(ledger["diagnostics"])
+        self.assertIn("Install/Repair", diagnostics)
+        self.assertIn("no download was attempted", diagnostics)
+        self.assertIn("models/ip-adapter_sd15.safetensors", diagnostics)
+
+    def test_sdxl_style_promotion_requires_all_installed_local_only_gates_not_repo_only(self) -> None:
+        packages = {"python": "3.12", "cuda": "12.4", "torch": "2.7.0", "diffusers": "0.35.1"}
+        asset = {
+            "id": "sdxl_ip_adapter_style",
+            "path": "/models/sdxl-base/optional/sdxl_ip_adapter_style/sdxl_models/ip-adapter_sdxl.bin",
+            "sha256": "adapter-sha",
+            "repo": "h94/IP-Adapter",
+            "revision": "unknown",
+        }
+        repo_only_records = [
+            {
+                "kind": "asset_identity",
+                "feature": "sdxl_ip_adapter_style",
+                "platform": "linux/arm64",
+                "ref": "repo-working-tree",
+                "version": "0.1.1",
+                "commands": ["python3 -m unittest tests.test_runtime_harness -v"],
+                "assets": [asset],
+                "packages": packages,
+                "outputs": [],
+                "logs": ["repo asset ledger passed"],
+                "result": "pass",
+                "scope": "repo-runtime",
+            },
+            {
+                "kind": "model_load",
+                "feature": "sdxl_ip_adapter_style",
+                "platform": "linux/arm64",
+                "ref": "repo-working-tree",
+                "version": "0.1.1",
+                "commands": ["python3 local-only-load.py"],
+                "assets": [asset],
+                "packages": packages,
+                "outputs": [],
+                "logs": ["load_ip_adapter used local_files_only=True"],
+                "result": "pass",
+                "local_files_only": True,
+                "scope": "repo-runtime",
+            },
+            {
+                "kind": "generate_no_download",
+                "feature": "sdxl_ip_adapter_style",
+                "platform": "linux/arm64",
+                "ref": "repo-working-tree",
+                "version": "0.1.1",
+                "commands": ["python3 generate-no-download-guard.py"],
+                "assets": [asset],
+                "packages": packages,
+                "outputs": [],
+                "logs": ["no acquisition helpers called"],
+                "result": "pass",
+                "local_files_only": True,
+                "forbidden_calls": [],
+                "scope": "repo-runtime",
+            },
+        ]
+
+        repo_gate = smoke_evidence.evaluate_sdxl_style_reference_local_smoke_evidence(repo_only_records)
+
+        self.assertFalse(repo_gate.ready)
+        self.assertEqual(repo_gate.status, "partial")
+        repo_diagnostics = " ".join(repo_gate.diagnostics)
+        self.assertIn("repo-runtime", repo_diagnostics)
+        self.assertIn("installed parity", repo_diagnostics)
+        self.assertIn("GPU generation", repo_diagnostics)
+
+        installed_records = repo_only_records + [
+            {
+                "kind": "install_repair",
+                "feature": "sdxl_ip_adapter_style",
+                "platform": "linux/arm64",
+                "ref": "installed-runtime-ref",
+                "version": "0.1.1",
+                "commands": ["python3 extensions/sdxl-base/setup.py < install-payload.json"],
+                "assets": [asset],
+                "packages": packages,
+                "outputs": [],
+                "logs": ["Install/Repair ready"],
+                "result": "pass",
+                "readiness": "ready",
+                "local_assets": [asset["path"]],
+                "scope": "installed-runtime",
+            },
+            {
+                "kind": "installed_parity",
+                "feature": "sdxl_ip_adapter_style",
+                "platform": "linux/arm64",
+                "ref": "installed-runtime-ref",
+                "version": "0.1.1",
+                "commands": ["python3 tools/sync_extension_runtime.py --check"],
+                "assets": [asset],
+                "packages": packages,
+                "outputs": [],
+                "logs": ["installed runtime parity passed"],
+                "result": "pass",
+                "parity": "fresh",
+                "scope": "installed-runtime",
+            },
+            {
+                "kind": "gpu_generation",
+                "feature": "sdxl_ip_adapter_style",
+                "platform": "linux/arm64",
+                "ref": "installed-runtime-ref",
+                "version": "0.1.1",
+                "commands": ["modly generate sdxl-base image-to-image --style-reference local.png"],
+                "assets": [asset],
+                "packages": packages,
+                "outputs": ["/outputs/sdxl-style-local-smoke.png"],
+                "logs": ["Generated SDXL style-reference output using local_files_only=True"],
+                "result": "pass",
+                "local_files_only": True,
+                "scope": "installed-runtime",
+            },
+        ]
+
+        installed_gate = smoke_evidence.evaluate_sdxl_style_reference_local_smoke_evidence(installed_records)
+
+        self.assertTrue(installed_gate.ready)
+        self.assertEqual(installed_gate.status, "ready")
+        self.assertEqual(installed_gate.missing_kinds, ())
+
+    def test_sd15_style_promotion_blocks_unknown_revision_and_missing_assets_before_load(self) -> None:
+        packages = {"python": "3.12", "cuda": "13.0", "torch": "2.11.0+cu130", "diffusers": "0.35.1"}
+        incomplete_asset_identity = {
+            "kind": "asset_identity",
+            "feature": "sd15_ip_adapter_style",
+            "platform": "linux/arm64",
+            "ref": "repo-working-tree",
+            "version": "0.1.1",
+            "commands": ["python3 -m unittest tests.test_runtime_harness -v"],
+            "assets": [
+                {
+                    "id": "sd15_ip_adapter_style",
+                    "path": "/models/sd15/optional/sd15_ip_adapter_style/models/ip-adapter_sd15.bin",
+                    "repo": "unknown",
+                    "revision": "unknown",
+                    "size": 1024,
+                    "sha256": "adapter-sha",
+                }
+            ],
+            "packages": packages,
+            "outputs": [],
+            "logs": ["candidate SD1.5 adapter without verified image encoder"],
+            "result": "pass",
+            "scope": "repo-runtime",
+        }
+        blocked_model_load = {
+            **incomplete_asset_identity,
+            "kind": "model_load",
+            "logs": ["model load must not run until exact SD1.5 adapter and image encoder metadata are known"],
+            "local_files_only": True,
+        }
+
+        gate = smoke_evidence.evaluate_sd15_style_reference_discovery_evidence(
+            [incomplete_asset_identity, blocked_model_load]
+        )
+
+        self.assertFalse(gate.ready)
+        self.assertEqual(gate.status, "blocked")
+        self.assertIn("install_repair", gate.missing_kinds)
+        self.assertIn("generate_no_download", gate.missing_kinds)
+        diagnostics = " ".join(gate.diagnostics)
+        self.assertIn("unknown revision", diagnostics)
+        self.assertIn("image encoder", diagnostics)
+        self.assertIn("before model load", diagnostics)
+
+    def test_sd15_repair_readiness_alone_is_partial_not_manifest_or_promotion_ready(self) -> None:
+        packages = {"python": "3.12", "cuda": "13.0", "torch": "2.11.0+cu130", "diffusers": "0.35.1"}
+        revision = "018e402774aeeddd60609b4ecdb7e298259dc729"
+        assets = [
+            {
+                "id": "sd15_ip_adapter_style",
+                "relative_path": "models/ip-adapter_sd15.safetensors",
+                "path": "/models/sd15/optional/sd15_ip_adapter_style/models/ip-adapter_sd15.safetensors",
+                "repo": "h94/IP-Adapter",
+                "revision": revision,
+                "size": 44642768,
+                "sha256": "7a8b1bbda0d1379df61b4dd8e8fad2e82578e0c52450a871f443da338f385cf1",
+            },
+            {
+                "id": "sd15_ip_adapter_style",
+                "relative_path": "models/image_encoder/config.json",
+                "path": "/models/sd15/optional/sd15_ip_adapter_style/models/image_encoder/config.json",
+                "repo": "h94/IP-Adapter",
+                "revision": revision,
+                "size": 560,
+                "sha256": "config-local-sha256",
+            },
+            {
+                "id": "sd15_ip_adapter_style",
+                "relative_path": "models/image_encoder/model.safetensors",
+                "path": "/models/sd15/optional/sd15_ip_adapter_style/models/image_encoder/model.safetensors",
+                "repo": "h94/IP-Adapter",
+                "revision": revision,
+                "size": 2528373448,
+                "sha256": "1686fef5ab13a4c8dcc32876ef7b557b296cb78ec2f1ec259360ae9135044209",
+            },
+        ]
+        install_repair = {
+            "kind": "install_repair",
+            "feature": "sd15_ip_adapter_style",
+            "platform": "linux/arm64",
+            "ref": "authorized-repair",
+            "version": "0.1.1",
+            "commands": ["python3 extensions/sd15/setup.py < repair-payload.json"],
+            "assets": assets,
+            "packages": packages,
+            "outputs": [],
+            "logs": ["Repair acquired SD1.5 optional assets"],
+            "result": "pass",
+            "readiness": "ready",
+            "local_assets": [asset["path"] for asset in assets],
+            "scope": "installed-runtime",
+        }
+
+        gate = smoke_evidence.evaluate_sd15_style_reference_discovery_evidence([install_repair])
+
+        self.assertFalse(gate.ready)
+        self.assertEqual(gate.status, "partial")
+        self.assertIn("asset_identity", gate.missing_kinds)
+        self.assertIn("model_load", gate.missing_kinds)
+        self.assertIn("generate_no_download", gate.missing_kinds)
+        self.assertIn("gpu_generation", gate.missing_kinds)
+        self.assertIn("installed_parity", gate.missing_kinds)
+
+    def test_complete_sd15_style_evidence_promotes_sd15_only_not_windows_public_sdxl_or_controlnet(self) -> None:
+        packages = {"python": "3.12", "cuda": "13.0", "torch": "2.11.0+cu130", "diffusers": "0.35.1"}
+        revision = "018e402774aeeddd60609b4ecdb7e298259dc729"
+        assets = [
+            {
+                "id": "sd15_ip_adapter_style",
+                "relative_path": "models/ip-adapter_sd15.safetensors",
+                "path": "/models/sd15/optional/sd15_ip_adapter_style/models/ip-adapter_sd15.safetensors",
+                "repo": "h94/IP-Adapter",
+                "revision": revision,
+                "size": 44642768,
+                "sha256": "adapter-local-sha256",
+            },
+            {
+                "id": "sd15_ip_adapter_style",
+                "relative_path": "models/image_encoder/config.json",
+                "path": "/models/sd15/optional/sd15_ip_adapter_style/models/image_encoder/config.json",
+                "repo": "h94/IP-Adapter",
+                "revision": revision,
+                "size": 560,
+                "sha256": "config-local-sha256",
+            },
+            {
+                "id": "sd15_ip_adapter_style",
+                "relative_path": "models/image_encoder/model.safetensors",
+                "path": "/models/sd15/optional/sd15_ip_adapter_style/models/image_encoder/model.safetensors",
+                "repo": "h94/IP-Adapter",
+                "revision": revision,
+                "size": 2528373448,
+                "sha256": "encoder-local-sha256",
+            },
+        ]
+
+        def record(kind: str, **overrides: object) -> dict[str, object]:
+            payload: dict[str, object] = {
+                "kind": kind,
+                "feature": "sd15_ip_adapter_style",
+                "platform": "linux/arm64",
+                "ref": "authorized-manifest-promotion",
+                "version": "0.1.1",
+                "commands": [f"collect {kind}"],
+                "assets": assets,
+                "packages": packages,
+                "outputs": ["/outputs/sd15-style.png"] if kind == "gpu_generation" else [],
+                "logs": [f"{kind} passed"],
+                "result": "pass",
+                "scope": "installed-runtime",
+            }
+            payload.update(overrides)
+            return payload
+
+        complete_sd15 = [
+            record("asset_identity"),
+            record("install_repair", readiness="ready", local_assets=[asset["path"] for asset in assets]),
+            record("model_load", local_files_only=True),
+            record("generate_no_download", local_files_only=True),
+            record("gpu_generation", local_files_only=True),
+            record("installed_parity", parity="fresh"),
+        ]
+        windows_records = [dict(item, platform="windows-amd64") for item in complete_sd15]
+        public_release_records = [dict(item, scope="public-release") for item in complete_sd15]
+        sdxl_records = [dict(item, feature="sdxl_ip_adapter_style") for item in complete_sd15]
+        controlnet_records = [dict(item, feature="sd15_controlnet_canny") for item in complete_sd15]
+
+        sd15_gate = smoke_evidence.evaluate_sd15_style_reference_discovery_evidence(complete_sd15)
+        windows_gate = smoke_evidence.evaluate_sd15_style_reference_discovery_evidence(windows_records)
+        public_gate = smoke_evidence.evaluate_sd15_style_reference_discovery_evidence(public_release_records)
+        sdxl_gate = smoke_evidence.evaluate_sd15_style_reference_discovery_evidence(sdxl_records)
+        controlnet_gate = smoke_evidence.evaluate_sd15_style_reference_discovery_evidence(controlnet_records)
+
+        self.assertTrue(sd15_gate.ready)
+        self.assertEqual(sd15_gate.status, "ready")
+        self.assertEqual(sd15_gate.missing_kinds, ())
+        self.assertFalse(windows_gate.ready)
+        self.assertFalse(public_gate.ready)
+        self.assertFalse(sdxl_gate.ready)
+        self.assertFalse(controlnet_gate.ready)
+        self.assertIn("Windows", " ".join(windows_gate.diagnostics))
+        self.assertIn("public release", " ".join(public_gate.diagnostics))
+        self.assertIn("SDXL", " ".join(sdxl_gate.diagnostics))
+        self.assertIn("ControlNet", " ".join(controlnet_gate.diagnostics))
+
+    def test_sdxl_style_promotion_diagnostics_reject_non_sdxl_windows_and_public_release_scope(self) -> None:
+        records = []
+        for feature, platform, scope in (
+            ("sd15_ip_adapter_style", "linux/arm64", "installed-runtime"),
+            ("sdxl_controlnet_canny", "linux/arm64", "installed-runtime"),
+            ("ip_adapter", "linux/arm64", "installed-runtime"),
+            ("sdxl_ip_adapter_style", "windows-amd64", "installed-runtime"),
+            ("sdxl_ip_adapter_style", "linux/arm64", "public-release"),
+        ):
+            records.append(
+                {
+                    "kind": "gpu_generation",
+                    "feature": feature,
+                    "platform": platform,
+                    "ref": "out-of-scope",
+                    "version": "0.1.1",
+                    "commands": ["not-promoted"],
+                    "assets": [{"path": "/tmp/asset", "sha256": "sha"}],
+                    "packages": {"python": "3.12", "cuda": "12.4", "torch": "2.7.0", "diffusers": "0.35.1"},
+                    "outputs": ["/tmp/out.png"],
+                    "logs": ["out of scope"],
+                    "result": "pass",
+                    "local_files_only": True,
+                    "scope": scope,
+                }
+            )
+
+        gate = smoke_evidence.evaluate_sdxl_style_reference_local_smoke_evidence(records)
+
+        self.assertFalse(gate.ready)
+        self.assertEqual(gate.status, "blocked")
+        diagnostics = " ".join(gate.diagnostics)
+        self.assertIn("sd15_ip_adapter_style", diagnostics)
+        self.assertIn("ControlNet", diagnostics)
+        self.assertIn("generic IP-Adapter", diagnostics)
+        self.assertIn("Windows", diagnostics)
+        self.assertIn("public release", diagnostics)
+
+    def test_generate_missing_sdxl_style_assets_reports_local_readiness_without_download(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        class LocalOnlyPipeline:
+            def load_ip_adapter(self, *args: object, **kwargs: object) -> None:
+                raise AssertionError("missing local assets must be detected before IP-Adapter loading")
+
+            def __call__(self, **kwargs: object) -> object:
+                raise AssertionError("generation must not run when local style assets are missing")
+
+        class LocalOnlyLoader:
+            def from_pretrained(self, model_dir: str, **kwargs: object) -> LocalOnlyPipeline:
+                return LocalOnlyPipeline()
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="generate-missing-sdxl-style-"))
+        extension_model_dir = workspace_dir / "models" / "sdxl-base"
+        source_path = workspace_dir / "source.png"
+        reference_path = workspace_dir / "style-reference.png"
+        source_path.write_bytes(b"source")
+        reference_path.write_bytes(b"style")
+        job = {
+            "extension_id": "sdxl-base",
+            "family": "sdxl",
+            "node_id": "image-to-image",
+            "model_dir": str(extension_model_dir / "image-to-image"),
+            "workspace_dir": str(workspace_dir),
+            "output_path": str(workspace_dir / "result.png"),
+            "prompt": "variation",
+            "source_image_path": str(source_path),
+            "params": {"steps": 4, "strength": 0.55, "reference_strength": 0.4},
+            "conditioning": {"references": [{"role": "style", "filePath": str(reference_path)}]},
+        }
+
+        with patch.dict(
+            inference_runner._PIPELINE_LOADERS,
+            {("sdxl", "image-to-image"): LocalOnlyLoader()},
+            clear=True,
+        ), patch(
+            "local_image_runtime.weights.acquire_optional_feature_weights",
+            side_effect=AssertionError("Generate must not acquire optional feature assets"),
+        ) as acquire_optional, patch(
+            "local_image_runtime.weights.HuggingFaceSnapshotDownloader.snapshot_download",
+            side_effect=AssertionError("Generate must not download optional feature assets"),
+        ) as snapshot_download:
+            stdout = StringIO()
+            exit_code = inference_runner.run_child_main(stdin=StringIO(json.dumps(job) + "\n"), stdout=stdout)
+
+        self.assertEqual(exit_code, 1)
+        events = self._parse_ndjson_events(stdout.getvalue())
+        self.assertEqual(events[-1]["type"], "error")
+        message = str(events[-1]["message"])
+        self.assertIn("local-readiness", message)
+        self.assertIn("local", message)
+        self.assertIn("assets", message)
+        self.assertNotIn("downloaded", message.casefold())
+        self.assertNotIn("attempted to download", message.casefold())
+        acquire_optional.assert_not_called()
+        snapshot_download.assert_not_called()
+
+    def test_install_repair_may_acquire_supported_sdxl_style_assets_without_real_download(self) -> None:
+        runtime_root = self._make_runtime_root("sdxl-base")
+        acquired: list[dict[str, object]] = []
+
+        def record_optional_feature_acquisition(extension_id, feature_id, models_dir, *, downloader=None):
+            acquired.append({"extension_id": extension_id, "feature_id": feature_id, "models_dir": Path(models_dir)})
+            return self._fake_optional_feature_acquisition(extension_id, feature_id, models_dir, downloader=downloader)
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)}, clear=False))
+            stack.enter_context(patch("local_image_runtime.install_contract.detect_platform", return_value=SUPPORTED_PLATFORM))
+            stack.enter_context(patch("local_image_runtime.install_contract.resolve_dependency_plan", return_value=self._fake_plan("sdxl-base")))
+            stack.enter_context(patch("local_image_runtime.install_contract._run_checked", side_effect=self._run_checked_side_effect))
+            stack.enter_context(patch("local_image_runtime.install_contract._install_dependency_step", return_value=None))
+            stack.enter_context(patch("local_image_runtime.bootstrap._smoke_test_runtime_imports", return_value=(True, "stubbed imports")))
+            stack.enter_context(
+                patch(
+                    "local_image_runtime.install_contract.acquire_optional_feature_weights",
+                    side_effect=record_optional_feature_acquisition,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "local_image_runtime.weights.HuggingFaceSnapshotDownloader.snapshot_download",
+                    side_effect=AssertionError("mocked Install/Repair acquisition must not perform a real download"),
+                )
+            )
+
+            result = install_contract.run_install_setup_contract(
+                extension_id="sdxl-base",
+                stdin_text=self._payload(runtime_root),
+            )
+
+        self.assertEqual(result.status, bootstrap.SETUP_STATUS_READY)
+        self.assertEqual(len(acquired), 1)
+        self.assertEqual(acquired[0]["extension_id"], "sdxl-base")
+        self.assertEqual(acquired[0]["feature_id"], "sdxl_ip_adapter_style")
+
+    def test_generate_accepts_sdxl_style_reference_when_local_assets_are_present(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        class FakeImage:
+            def save(self, output_path: str, **kwargs: object) -> None:
+                Path(output_path).write_bytes(b"generated")
+
+        class LocalStylePipeline:
+            def __init__(self) -> None:
+                self.loaded_adapter: dict[str, object] | None = None
+                self.reference_strength: object | None = None
+                self.invocations: list[dict[str, object]] = []
+
+            def load_ip_adapter(self, model_dir: str, **kwargs: object) -> None:
+                self.loaded_adapter = {"model_dir": model_dir, **kwargs}
+
+            def set_ip_adapter_scale(self, value: object) -> None:
+                self.reference_strength = value
+
+            def __call__(self, **kwargs: object) -> object:
+                self.invocations.append(kwargs)
+                return SimpleNamespace(images=[FakeImage()])
+
+        class LocalStyleLoader:
+            def __init__(self, pipeline_instance: LocalStylePipeline) -> None:
+                self.pipeline_instance = pipeline_instance
+
+            def from_pretrained(self, model_dir: str, **kwargs: object) -> LocalStylePipeline:
+                return self.pipeline_instance
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="generate-ready-sdxl-style-"))
+        extension_model_dir = workspace_dir / "models" / "sdxl-base"
+        asset_dir = extension_model_dir / "optional" / "sdxl_ip_adapter_style"
+        for relative_path in (
+            "sdxl_models/ip-adapter_sdxl.bin",
+            "sdxl_models/image_encoder/config.json",
+            "sdxl_models/image_encoder/model.safetensors",
+        ):
+            asset_path = asset_dir / relative_path
+            asset_path.parent.mkdir(parents=True, exist_ok=True)
+            asset_path.write_bytes(b"asset")
+        source_path = workspace_dir / "source.png"
+        reference_path = workspace_dir / "style-reference.png"
+        source_path.write_bytes(b"source")
+        reference_path.write_bytes(b"style")
+        pipeline_instance = LocalStylePipeline()
+        source_image_token = object()
+        reference_image_token = object()
+        opened_images: list[str] = []
+
+        def open_image(path: str) -> object:
+            opened_images.append(path)
+            if path == str(source_path):
+                return source_image_token
+            if path == str(reference_path):
+                return reference_image_token
+            raise AssertionError(f"unexpected image path {path}")
+
+        job = {
+            "extension_id": "sdxl-base",
+            "family": "sdxl",
+            "node_id": "image-to-image",
+            "model_dir": str(extension_model_dir / "image-to-image"),
+            "workspace_dir": str(workspace_dir),
+            "output_path": str(workspace_dir / "result.png"),
+            "prompt": "variation",
+            "source_image_path": str(source_path),
+            "params": {"steps": 4, "strength": 0.55, "reference_strength": 0.4},
+            "conditioning": {"references": [{"role": "style", "filePath": str(reference_path)}]},
+        }
+
+        with patch.dict(
+            inference_runner._PIPELINE_LOADERS,
+            {("sdxl", "image-to-image"): LocalStyleLoader(pipeline_instance)},
+            clear=True,
+        ), patch("local_image_runtime.inference_runner._open_source_image", side_effect=open_image), patch(
+            "local_image_runtime.weights.HuggingFaceSnapshotDownloader.snapshot_download",
+            side_effect=AssertionError("Generate must use present local assets without download"),
+        ) as snapshot_download:
+            result = inference_runner.run_child_job(job)
+
+        self.assertEqual(result["output_path"], str(workspace_dir / "result.png"))
+        self.assertEqual(pipeline_instance.loaded_adapter["model_dir"], str(asset_dir))
+        self.assertTrue(pipeline_instance.loaded_adapter["local_files_only"])
+        self.assertEqual(pipeline_instance.reference_strength, 0.4)
+        self.assertEqual(pipeline_instance.invocations[0]["image"], source_image_token)
+        self.assertEqual(pipeline_instance.invocations[0]["ip_adapter_image"], reference_image_token)
+        self.assertEqual(opened_images, [str(source_path), str(reference_path)])
+        snapshot_download.assert_not_called()
 
     class _FakePipeStream:
         def __init__(self, owner: "RuntimeHarnessTests._FakePopen", name: str, lines: list[str]) -> None:
@@ -941,6 +1925,324 @@ class RuntimeHarnessTests(unittest.TestCase):
             ],
         )
         self.assertEqual(plan.diagnostics, ())
+
+    def test_gb10_sm121_does_not_inherit_verified_linux_arm64_cu124_plan(self) -> None:
+        plan = dependencies.resolve_dependency_plan(
+            extension_id="sdxl-base",
+            dependency_family="sdxl-base",
+            readiness_imports=("torch", "diffusers"),
+            platform_info=SUPPORTED_PLATFORM,
+            python_tag="cp312",
+            cuda_version="12.4",
+            gpu_sm="121",
+            torch_arch_list=("sm_50", "sm_80", "sm_86", "sm_89", "sm_90", "sm_90a"),
+            torch_version="2.5.1+cu124",
+        )
+
+        self.assertEqual(plan.plan_state, dependencies.PLAN_STATE_UNSUPPORTED)
+        self.assertFalse(plan.platform_supported)
+        self.assertEqual(plan.shared_steps, ())
+        self.assertEqual(plan.family_steps, ())
+        diagnostics_text = " ".join(plan.diagnostics)
+        self.assertIn("sm_121", diagnostics_text)
+        self.assertIn("2.5.1+cu124", diagnostics_text)
+        self.assertIn("torch/CUDA", diagnostics_text)
+        self.assertIn("dependency/runtime compatibility", diagnostics_text)
+        self.assertIn("no kernel image", diagnostics_text)
+        self.assertIn("not as an IP-Adapter", diagnostics_text)
+        self.assertIn("ControlNet", diagnostics_text)
+        self.assertIn("local asset", diagnostics_text)
+
+    def test_gb10_sm121_does_not_inherit_verified_linux_arm64_cu128_plan_without_runtime_proof(self) -> None:
+        plan = dependencies.resolve_dependency_plan(
+            extension_id="sd15",
+            dependency_family="sd15",
+            readiness_imports=("torch",),
+            platform_info=SUPPORTED_PLATFORM,
+            python_tag="cp312",
+            cuda_version="12.8",
+            gpu_sm="121",
+            torch_arch_list=("sm_50", "sm_80", "sm_86", "sm_89", "sm_90", "sm_90a"),
+            torch_version="2.7.0+cu128",
+        )
+
+        self.assertEqual(plan.cuda_variant, "cu128")
+        self.assertEqual(plan.plan_state, dependencies.PLAN_STATE_UNSUPPORTED)
+        self.assertFalse(plan.platform_supported)
+        diagnostics_text = " ".join(plan.diagnostics)
+        self.assertIn("sm_121", diagnostics_text)
+        self.assertIn("cu128", diagnostics_text)
+        self.assertIn("runtime proof", diagnostics_text)
+
+    def test_linux_arm64_non_gb10_plan_remains_verified_when_gpu_sm_is_supported_or_unknown(self) -> None:
+        supported_sm_plan = dependencies.resolve_dependency_plan(
+            extension_id="sd15",
+            dependency_family="sd15",
+            readiness_imports=("torch",),
+            platform_info=SUPPORTED_PLATFORM,
+            python_tag="cp312",
+            cuda_version="12.8",
+            gpu_sm="90",
+            torch_arch_list=("sm_80", "sm_90", "sm_90a"),
+            torch_version="2.7.0+cu128",
+        )
+        unknown_sm_plan = dependencies.resolve_dependency_plan(
+            extension_id="sd15",
+            dependency_family="sd15",
+            readiness_imports=("torch",),
+            platform_info=SUPPORTED_PLATFORM,
+            python_tag="cp312",
+            cuda_version="12.8",
+            gpu_sm=None,
+        )
+
+        self.assertEqual(supported_sm_plan.plan_state, dependencies.PLAN_STATE_VERIFIED)
+        self.assertTrue(supported_sm_plan.platform_supported)
+        self.assertEqual(supported_sm_plan.diagnostics, ())
+        self.assertEqual(unknown_sm_plan.plan_state, dependencies.PLAN_STATE_VERIFIED)
+        self.assertTrue(unknown_sm_plan.platform_supported)
+        self.assertEqual(unknown_sm_plan.shared_steps[0].packages, dependencies._shared_runtime_steps("cu128", "cp312")[0].packages)
+
+    def test_gb10_sm121_runtime_proof_selects_runtime_proven_cu130_not_native_sm121(self) -> None:
+        plan = dependencies.resolve_dependency_plan(
+            extension_id="sdxl-base",
+            dependency_family="sdxl-base",
+            readiness_imports=("torch", "diffusers"),
+            platform_info=SUPPORTED_PLATFORM,
+            python_tag="cp312",
+            cuda_version="13.0",
+            gpu_sm="121",
+            torch_arch_list=("sm_80", "sm_90", "sm_100", "sm_110", "sm_120"),
+            torch_version="2.11.0+cu130",
+            gb10_runtime_evidence={
+                "source_index": "https://download.pytorch.org/whl/cu130",
+                "torch_version": "2.11.0+cu130",
+                "torchvision_version": "0.26.0+cu130",
+                "python_tag": "cp312",
+                "platform_tag": "manylinux_2_28_aarch64",
+                "cuda_variant": "cu130",
+                "torch_cuda": "13.0",
+                "driver": "580.142",
+                "gpu_name": "NVIDIA GB10",
+                "capability": [12, 1],
+                "cuda_available": True,
+                "matmul_passed": True,
+                "synchronize_passed": True,
+                "dependency_imports": {
+                    "diffusers": "0.35.1",
+                    "transformers": "4.57.6",
+                    "accelerate": "1.13.0",
+                    "safetensors": "0.7.0",
+                    "sentencepiece": "0.2.1",
+                    "scipy": "1.17.1",
+                    "local_image_runtime": "ok",
+                },
+            },
+        )
+
+        self.assertEqual(plan.plan_state, dependencies.PLAN_STATE_VERIFIED)
+        self.assertTrue(plan.platform_supported)
+        self.assertEqual(plan.cuda_variant, "cu130")
+        torch_step = plan.shared_steps[0]
+        self.assertEqual(torch_step.name, "install_shared_torch")
+        self.assertEqual(torch_step.extra_args[3], "https://download.pytorch.org/whl/cu130")
+        self.assertEqual(
+            torch_step.packages,
+            (
+                dependencies._TORCH_WHEELS["cu130"]["cp312"]["torch"],
+                dependencies._TORCH_WHEELS["cu130"]["cp312"]["torchvision"],
+            ),
+        )
+        diagnostics_text = " ".join(plan.diagnostics)
+        self.assertIn("runtime-proven GB10 (12,1)", diagnostics_text)
+        self.assertIn("not native sm_121 arch-list support", diagnostics_text)
+        self.assertNotIn("public release", diagnostics_text.lower())
+        self.assertNotIn("Windows", diagnostics_text)
+
+    def test_gb10_sm121_cu130_index_availability_without_runtime_evidence_is_rejected(self) -> None:
+        plan = dependencies.resolve_dependency_plan(
+            extension_id="sdxl-base",
+            dependency_family="sdxl-base",
+            readiness_imports=("torch", "diffusers"),
+            platform_info=SUPPORTED_PLATFORM,
+            python_tag="cp312",
+            cuda_version="13.0",
+            gpu_sm="121",
+            torch_arch_list=("sm_80", "sm_90", "sm_100", "sm_110", "sm_120"),
+            torch_version="2.11.0+cu130",
+            gb10_runtime_evidence={
+                "source_index": "https://download.pytorch.org/whl/cu130",
+                "torch_version": "2.11.0+cu130",
+                "torchvision_version": "0.26.0+cu130",
+                "python_tag": "cp312",
+                "platform_tag": "manylinux_2_28_aarch64",
+                "cuda_variant": "cu130",
+            },
+        )
+
+        self.assertEqual(plan.plan_state, dependencies.PLAN_STATE_UNSUPPORTED)
+        self.assertFalse(plan.platform_supported)
+        self.assertEqual(plan.shared_steps, ())
+        diagnostics_text = " ".join(plan.diagnostics)
+        self.assertIn("index availability", diagnostics_text)
+        self.assertIn("runtime/dependency evidence", diagnostics_text)
+        self.assertIn("matmul", diagnostics_text)
+        self.assertIn("synchronize", diagnostics_text)
+
+    def test_gb10_sm121_cu130_runtime_evidence_without_matmul_synchronize_is_rejected(self) -> None:
+        plan = dependencies.resolve_dependency_plan(
+            extension_id="sdxl-base",
+            dependency_family="sdxl-base",
+            readiness_imports=("torch", "diffusers"),
+            platform_info=SUPPORTED_PLATFORM,
+            python_tag="cp312",
+            cuda_version="13.0",
+            gpu_sm="121",
+            torch_arch_list=("sm_80", "sm_90", "sm_100", "sm_110", "sm_120"),
+            torch_version="2.11.0+cu130",
+            gb10_runtime_evidence={
+                "source_index": "https://download.pytorch.org/whl/cu130",
+                "torch_version": "2.11.0+cu130",
+                "torchvision_version": "0.26.0+cu130",
+                "python_tag": "cp312",
+                "platform_tag": "manylinux_2_28_aarch64",
+                "cuda_variant": "cu130",
+                "torch_cuda": "13.0",
+                "driver": "580.142",
+                "gpu_name": "NVIDIA GB10",
+                "capability": [12, 1],
+                "cuda_available": True,
+                "matmul_passed": False,
+                "synchronize_passed": False,
+                "dependency_imports": {
+                    "diffusers": "0.35.1",
+                    "transformers": "4.57.6",
+                    "accelerate": "1.13.0",
+                    "safetensors": "0.7.0",
+                    "sentencepiece": "0.2.1",
+                    "scipy": "1.17.1",
+                    "local_image_runtime": "ok",
+                },
+            },
+        )
+
+        self.assertEqual(plan.plan_state, dependencies.PLAN_STATE_UNSUPPORTED)
+        self.assertFalse(plan.platform_supported)
+        diagnostics_text = " ".join(plan.diagnostics)
+        self.assertIn("matmul", diagnostics_text)
+        self.assertIn("synchronize", diagnostics_text)
+        self.assertIn("runtime proof", diagnostics_text)
+
+    def test_install_contract_forwards_gpu_sm_to_dependency_planning(self) -> None:
+        runtime_root = self._make_runtime_root("sd15")
+        unsupported_plan = DependencyPlan(
+            extension_id="sd15",
+            dependency_family="sd15",
+            platform_system="linux",
+            platform_machine="aarch64",
+            python_tag="cp312",
+            cuda_variant="cu124",
+            shared_steps=(),
+            family_steps=(),
+            plan_state=dependencies.PLAN_STATE_UNSUPPORTED,
+            platform_key="linux-aarch64",
+            platform_supported=False,
+            diagnostics=("sm_121 requires torch/CUDA runtime proof before dependency install.",),
+        )
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)}, clear=False))
+            stack.enter_context(patch("local_image_runtime.install_contract.detect_platform", return_value=SUPPORTED_PLATFORM))
+            stack.enter_context(patch("local_image_runtime.install_contract.python_tag_from_interpreter", return_value="cp312"))
+            resolve_plan = stack.enter_context(
+                patch("local_image_runtime.install_contract.resolve_dependency_plan", return_value=unsupported_plan)
+            )
+
+            result = install_contract.run_install_setup_contract(
+                extension_id="sd15",
+                stdin_text=json.dumps(
+                    {
+                        "python_exe": sys.executable,
+                        "ext_dir": str(runtime_root),
+                        "gpu_sm": "121",
+                        "cuda_version": "12.4",
+                    }
+                ),
+            )
+
+        self.assertEqual(result.status, bootstrap.SETUP_STATUS_FAILED)
+        self.assertEqual(resolve_plan.call_args.kwargs["gpu_sm"], "121")
+
+    def test_install_contract_forwards_installed_gb10_runtime_evidence_to_dependency_planning(self) -> None:
+        runtime_root = self._make_runtime_root("sdxl-base")
+        gb10_runtime_evidence = {
+            "source_index": "https://download.pytorch.org/whl/cu130",
+            "torch_version": "2.11.0+cu130",
+            "torchvision_version": "0.26.0+cu130",
+            "python_tag": "cp312",
+            "platform_tag": "manylinux_2_28_aarch64",
+            "cuda_variant": "cu130",
+            "torch_cuda": "13.0",
+            "driver": "580.142",
+            "gpu_name": "NVIDIA GB10",
+            "capability": [12, 1],
+            "cuda_available": True,
+            "matmul_passed": True,
+            "synchronize_passed": True,
+            "dependency_imports": {
+                "diffusers": "0.35.1",
+                "transformers": "4.57.6",
+                "accelerate": "1.13.0",
+                "safetensors": "0.7.0",
+                "sentencepiece": "0.2.1",
+                "scipy": "1.17.1",
+                "local_image_runtime": "ok",
+            },
+        }
+        unsupported_plan = DependencyPlan(
+            extension_id="sdxl-base",
+            dependency_family="sdxl-base",
+            platform_system="linux",
+            platform_machine="aarch64",
+            python_tag="cp312",
+            cuda_variant="cu130",
+            shared_steps=(),
+            family_steps=(),
+            plan_state=dependencies.PLAN_STATE_UNSUPPORTED,
+            platform_key="linux-aarch64",
+            platform_supported=False,
+            diagnostics=("probe-only test plan",),
+        )
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)}, clear=False))
+            stack.enter_context(patch("local_image_runtime.install_contract.detect_platform", return_value=SUPPORTED_PLATFORM))
+            stack.enter_context(patch("local_image_runtime.install_contract.python_tag_from_interpreter", return_value="cp312"))
+            stack.enter_context(
+                patch(
+                    "local_image_runtime.install_contract._gb10_runtime_evidence_from_installed_venv",
+                    return_value=gb10_runtime_evidence,
+                )
+            )
+            resolve_plan = stack.enter_context(
+                patch("local_image_runtime.install_contract.resolve_dependency_plan", return_value=unsupported_plan)
+            )
+
+            result = install_contract.run_install_setup_contract(
+                extension_id="sdxl-base",
+                stdin_text=json.dumps(
+                    {
+                        "python_exe": sys.executable,
+                        "ext_dir": str(runtime_root),
+                        "gpu_sm": "121",
+                        "cuda_version": "13.0",
+                    }
+                ),
+            )
+
+        self.assertEqual(result.status, bootstrap.SETUP_STATUS_FAILED)
+        self.assertEqual(resolve_plan.call_args.kwargs["gpu_sm"], "121")
+        self.assertEqual(resolve_plan.call_args.kwargs["gb10_runtime_evidence"], gb10_runtime_evidence)
 
     def test_sd15_windows_candidate_matrix_is_visible_without_verified_evidence(self) -> None:
         plan = dependencies.resolve_dependency_plan(
@@ -2745,10 +4047,10 @@ class RuntimeHarnessTests(unittest.TestCase):
                 "one style reference",
             ),
             (
-                "sd15",
+                "flux-schnell",
                 {"filePath": str(source_path), "Style reference": str(reference_path)},
                 {"prompt": "variation", "strength": 0.55},
-                "SD1.5.*not supported.*not verified",
+                "Style reference.*only for SDXL Base or SD1.5",
             ),
         )
         for extension_id, input_payload, params, expected_message in invalid_cases:
@@ -2794,21 +4096,42 @@ class RuntimeHarnessTests(unittest.TestCase):
         self.assertNotIn("batch", manifest_text)
         self.assertNotIn("controlnet", manifest_text)
 
-    def test_sd15_manifest_keeps_style_reference_ux_gated_until_verified(self) -> None:
+    def test_sd15_manifest_exposes_style_reference_after_authorized_promotion(self) -> None:
         manifest = self._extension_manifest_data("sd15")
         nodes = {node["id"]: node for node in manifest["nodes"]}
+        text_node = nodes["text-to-image"]
         image_node = nodes["image-to-image"]
         params_schema = {schema["id"]: schema for schema in image_node["params_schema"]}
         manifest_text = self._extension_manifest("sd15").casefold()
 
-        self.assertNotIn("style_reference", image_node)
-        self.assertNotIn("inputs", image_node)
-        self.assertNotIn("reference_strength", params_schema)
-        self.assertNotIn("style reference", manifest_text)
+        self.assertNotIn("style_reference", text_node)
+        self.assertNotIn("inputs", text_node)
+        self.assertEqual(image_node["style_reference"], {"label": "Style reference", "optional": True, "role": "style"})
+        self.assertEqual(
+            image_node["inputs"],
+            [
+                {"name": "front", "label": "Primary image", "type": "image", "required": True},
+                {"name": "left", "label": "Style reference", "type": "image", "required": False},
+            ],
+        )
+        self.assertEqual(
+            params_schema["reference_strength"],
+            {
+                "id": "reference_strength",
+                "label": "Reference Strength",
+                "type": "float",
+                "default": 0.6,
+                "min": 0,
+                "max": 1,
+                "tooltip": "Controls optional SD1.5 IP-Adapter style reference guidance; the primary image remains the init image.",
+            },
+        )
+        self.assertIn("style reference", manifest_text)
         self.assertNotIn("image 2", manifest_text)
         self.assertNotIn("image 3", manifest_text)
+        self.assertNotIn("controlnet", manifest_text)
 
-    def test_sd15_style_reference_request_is_rejected_as_unverified_while_sdxl_is_accepted(self) -> None:
+    def test_sd15_style_reference_request_is_accepted_after_authorized_promotion(self) -> None:
         workspace_dir = Path(tempfile.mkdtemp(prefix="sd15-style-gate-"))
         source_path = workspace_dir / "primary-source.png"
         reference_path = workspace_dir / "style-reference.png"
@@ -2820,24 +4143,16 @@ class RuntimeHarnessTests(unittest.TestCase):
             params={"prompt": "variation", "strength": 0.55, "steps": 4, "reference_strength": 0.4},
             workspace_dir=str(workspace_dir),
         )
-        sdxl_request = pipeline.ExecutionRequest(
-            node_id="image-to-image",
-            input={"filePath": str(source_path), "Style reference": str(reference_path)},
-            params={"prompt": "variation", "strength": 0.55, "steps": 4, "reference_strength": 0.4},
-            workspace_dir=str(workspace_dir),
-        )
 
-        with self.assertRaisesRegex(
-            pipeline.RequestValidationError,
-            "SD1.5.*style reference.*not supported.*not verified",
-        ):
-            pipeline._validate_node_payload(sd15_request, legacy_model_id=None, extension_id="sd15")
-
-        validated = pipeline._validate_node_payload(sdxl_request, legacy_model_id=None, extension_id="sdxl-base")
+        validated = pipeline._validate_node_payload(sd15_request, legacy_model_id=None, extension_id="sd15")
         self.assertIsNotNone(validated.conditioning)
         self.assertEqual(validated.numeric_params["reference_strength"], 0.4)
+        self.assertEqual(
+            validated.conditioning.to_backend_payload(),
+            {"references": [{"role": "style", "filePath": str(reference_path.resolve())}]},
+        )
 
-    def test_sd15_optional_ip_adapter_readiness_is_explicitly_unsupported_not_ready(self) -> None:
+    def test_sd15_optional_ip_adapter_readiness_reports_missing_or_ready_after_promotion(self) -> None:
         with tempfile.TemporaryDirectory(prefix="sd15-models-") as temp_dir:
             models_dir = Path(temp_dir)
             for node_id in ("text-to-image", "image-to-image"):
@@ -2846,23 +4161,67 @@ class RuntimeHarnessTests(unittest.TestCase):
                 base_check.write_text("{}\n", encoding="utf-8")
             readiness = weights.evaluate_extension_weights("sd15", models_dir=models_dir)
 
+            feature_root = models_dir / "sd15" / "optional" / "sd15_ip_adapter_style"
+            for relative_path in (
+                "models/ip-adapter_sd15.safetensors",
+                "models/image_encoder/config.json",
+                "models/image_encoder/model.safetensors",
+            ):
+                asset_file = feature_root / relative_path
+                asset_file.parent.mkdir(parents=True, exist_ok=True)
+                asset_file.write_bytes(b"asset")
+            ready_readiness = weights.evaluate_extension_weights("sd15", models_dir=models_dir)
+
         self.assertEqual(readiness["status"], "ready")
         optional = readiness["optional_features"]["sd15_ip_adapter_style"]
-        self.assertEqual(optional["status"], "unsupported")
+        self.assertEqual(optional["status"], "missing")
         self.assertFalse(optional["ready"])
-        self.assertEqual(optional["missing_files"], ())
+        self.assertEqual(
+            optional["missing_files"],
+            (
+                "models/ip-adapter_sd15.safetensors",
+                "models/image_encoder/config.json",
+                "models/image_encoder/model.safetensors",
+            ),
+        )
         diagnostics_text = " ".join(optional["diagnostics"])
         self.assertIn("SD1.5", diagnostics_text)
-        self.assertIn("not verified", diagnostics_text)
-        self.assertIn("smoke", diagnostics_text)
+        self.assertIn("Install/Repair", diagnostics_text)
+        self.assertEqual(ready_readiness["optional_features"]["sd15_ip_adapter_style"]["status"], "ready")
+        self.assertIn("Style reference", self._extension_manifest("sd15"))
 
-    def test_sd15_setup_contract_does_not_download_unsupported_ip_adapter_assets(self) -> None:
+    def test_sd15_setup_contract_acquires_only_scoped_ip_adapter_assets_for_install_repair(self) -> None:
         runtime_root = self._make_runtime_root("sd15")
-        attempted_downloads: list[dict[str, object]] = []
+        explicit_models_dir = Path(tempfile.mkdtemp(prefix="sd15-repair-models-"))
+        acquired: list[dict[str, object]] = []
 
-        def fail_if_optional_feature_downloaded(extension_id, feature_id, models_dir, *, downloader=None):
-            attempted_downloads.append({"extension_id": extension_id, "feature_id": feature_id, "models_dir": Path(models_dir)})
-            raise AssertionError("SD1.5 unsupported IP-Adapter assets must not be acquired by install/repair")
+        def fake_acquire_optional_feature_weights(extension_id, feature_id, models_dir, *, downloader=None):
+            acquired.append({"extension_id": extension_id, "feature_id": feature_id, "models_dir": Path(models_dir)})
+            self.assertEqual(extension_id, "sd15")
+            self.assertEqual(feature_id, "sd15_ip_adapter_style")
+            target_dir = Path(models_dir) / extension_id / "optional" / feature_id
+            required_files = (
+                "models/ip-adapter_sd15.safetensors",
+                "models/image_encoder/config.json",
+                "models/image_encoder/model.safetensors",
+            )
+            for relative_path in required_files:
+                target = target_dir / relative_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"asset")
+            return {
+                "status": "ready",
+                "extension_id": extension_id,
+                "feature_id": feature_id,
+                "model_dir": str(target_dir),
+                "check_path": str(target_dir / "models" / "ip-adapter_sd15.safetensors"),
+                "required_files": required_files,
+                "missing_files": (),
+                "downloaded": True,
+            }
+
+        payload = json.loads(self._payload(runtime_root))
+        payload["modelsDir"] = str(explicit_models_dir)
 
         with ExitStack() as stack:
             stack.enter_context(patch.dict(os.environ, {bootstrap.EXTENSION_ROOT_OVERRIDE_ENV: str(runtime_root)}, clear=False))
@@ -2874,17 +4233,80 @@ class RuntimeHarnessTests(unittest.TestCase):
             stack.enter_context(
                 patch(
                     "local_image_runtime.install_contract.acquire_optional_feature_weights",
-                    side_effect=fail_if_optional_feature_downloaded,
+                    side_effect=fake_acquire_optional_feature_weights,
                 )
             )
 
             result = install_contract.run_install_setup_contract(
                 extension_id="sd15",
-                stdin_text=self._payload(runtime_root),
+                stdin_text=json.dumps(payload),
             )
 
         self.assertEqual(result.status, bootstrap.SETUP_STATUS_READY)
-        self.assertEqual(attempted_downloads, [])
+        self.assertEqual(
+            acquired,
+            [{"extension_id": "sd15", "feature_id": "sd15_ip_adapter_style", "models_dir": explicit_models_dir}],
+        )
+        persisted_state = json.loads(
+            (runtime_root / ".local-image-runtime" / "state" / "models-state.json").read_text(encoding="utf-8")
+        )
+        sd15_optional = persisted_state["extensions"]["sd15"]["weights"]["optional_features"]["sd15_ip_adapter_style"]
+        self.assertEqual(sd15_optional["status"], "ready")
+        self.assertNotIn("sdxl_models", json.dumps(sd15_optional, sort_keys=True))
+
+    def test_sd15_optional_feature_weight_acquisition_uses_discovered_pinned_bundle_not_sdxl_paths(self) -> None:
+        class FakeDownloader:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def snapshot_download(
+                self,
+                *,
+                repo_id: str,
+                local_dir: Path,
+                allow_patterns: tuple[str, ...] | None = None,
+                revision: str | None = None,
+            ) -> Path:
+                self.calls.append(
+                    {"repo_id": repo_id, "local_dir": local_dir, "allow_patterns": allow_patterns, "revision": revision}
+                )
+                for relative_path in allow_patterns or ():
+                    target = local_dir / relative_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(b"asset")
+                return local_dir
+
+        with tempfile.TemporaryDirectory(prefix="sd15-models-") as temp_dir:
+            models_dir = Path(temp_dir)
+            downloader = FakeDownloader()
+
+            result = weights.acquire_optional_feature_weights(
+                "sd15",
+                "sd15_ip_adapter_style",
+                models_dir,
+                downloader=downloader,
+            )
+
+        expected_target = models_dir / "sd15" / "optional" / "sd15_ip_adapter_style"
+        expected_files = (
+            "models/ip-adapter_sd15.safetensors",
+            "models/image_encoder/config.json",
+            "models/image_encoder/model.safetensors",
+        )
+        self.assertEqual(
+            downloader.calls,
+            [
+                {
+                    "repo_id": "h94/IP-Adapter",
+                    "local_dir": expected_target,
+                    "allow_patterns": expected_files,
+                    "revision": "018e402774aeeddd60609b4ecdb7e298259dc729",
+                }
+            ],
+        )
+        self.assertEqual(result["required_files"], expected_files)
+        self.assertEqual(result["revision"], "018e402774aeeddd60609b4ecdb7e298259dc729")
+        self.assertNotIn("sdxl_models", json.dumps(result, sort_keys=True))
 
     def test_base_image_to_image_manifests_do_not_expose_controlnet_params_or_anonymous_images(self) -> None:
         forbidden_param_fragments = (
@@ -3304,6 +4726,18 @@ class RuntimeHarnessTests(unittest.TestCase):
         )
         readiness = weights.evaluate_extension_weights("sdxl-base", models_dir=runtime_models_dir)
         self.assertEqual(readiness["optional_features"]["sdxl_ip_adapter_style"]["status"], "ready")
+        persisted_state = json.loads(
+            (runtime_root / ".local-image-runtime" / "state" / "models-state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        sdxl_weights = persisted_state["extensions"]["sdxl-base"]["weights"]
+        self.assertEqual(sdxl_weights["models_dir"], str(runtime_models_dir.resolve()))
+        self.assertEqual(sdxl_weights["source"], "argument")
+        self.assertEqual(
+            sdxl_weights["optional_features"]["sdxl_ip_adapter_style"]["status"],
+            "ready",
+        )
 
     def test_sdxl_setup_contract_uses_explicit_models_dir_for_optional_assets(self) -> None:
         runtime_root = self._make_runtime_root("sdxl-base")
@@ -3365,6 +4799,27 @@ class RuntimeHarnessTests(unittest.TestCase):
                     "models_dir": explicit_models_dir,
                 }
             ],
+        )
+        persisted_state = json.loads(
+            (runtime_root / ".local-image-runtime" / "state" / "models-state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        sdxl_weights = persisted_state["extensions"]["sdxl-base"]["weights"]
+        self.assertEqual(sdxl_weights["models_dir"], str(explicit_models_dir.resolve()))
+        self.assertEqual(sdxl_weights["source"], "setup_payload")
+        self.assertEqual(
+            sdxl_weights["optional_features"]["sdxl_ip_adapter_style"]["status"],
+            "ready",
+        )
+        self.assertEqual(
+            sdxl_weights["optional_features"]["sdxl_ip_adapter_style"]["model_dir"],
+            str(
+                explicit_models_dir.resolve()
+                / "sdxl-base"
+                / "optional"
+                / "sdxl_ip_adapter_style"
+            ),
         )
 
     def test_inference_runner_adds_ip_adapter_kwargs_and_scale_only_for_sdxl_style_reference(self) -> None:
@@ -3540,6 +4995,84 @@ class RuntimeHarnessTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_inference_runner_sd15_ip_adapter_loader_config_is_feature_specific_or_blocked(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        extension_model_dir = Path(tempfile.mkdtemp(prefix="sd15-loader-config-")) / "sd15"
+
+        sd15_config = inference_runner.resolve_ip_adapter_loader_config(
+            extension_id="sd15",
+            family="stable-diffusion",
+            node_id="image-to-image",
+            feature_id="sd15_ip_adapter_style",
+            extension_model_dir=extension_model_dir,
+        )
+
+        self.assertTrue(sd15_config.ready)
+        self.assertEqual(sd15_config.status, "ready")
+        self.assertTrue(sd15_config.local_files_only)
+        self.assertEqual(sd15_config.subfolder, "models")
+        self.assertEqual(sd15_config.weight_name, "ip-adapter_sd15.safetensors")
+        self.assertEqual(sd15_config.image_encoder_folder, "models/image_encoder")
+        self.assertNotEqual(sd15_config.subfolder, "sdxl_models")
+        self.assertNotEqual(sd15_config.weight_name, "ip-adapter_sdxl.bin")
+        self.assertNotEqual(sd15_config.image_encoder_folder, "sdxl_models/image_encoder")
+
+        sdxl_config = inference_runner.resolve_ip_adapter_loader_config(
+            extension_id="sdxl-base",
+            family="sdxl",
+            node_id="image-to-image",
+            feature_id="sdxl_ip_adapter_style",
+            extension_model_dir=extension_model_dir.parent / "sdxl-base",
+        )
+        self.assertTrue(sdxl_config.ready)
+        self.assertEqual(sdxl_config.subfolder, "sdxl_models")
+        self.assertEqual(sdxl_config.weight_name, "ip-adapter_sdxl.bin")
+        self.assertEqual(sdxl_config.image_encoder_folder, "sdxl_models/image_encoder")
+        self.assertTrue(sdxl_config.local_files_only)
+
+    def test_generate_missing_sd15_style_assets_fails_locally_without_acquisition_or_sdxl_paths(self) -> None:
+        import local_image_runtime.inference_runner as inference_runner
+
+        class FailingIfLoadedPipeline:
+            def load_ip_adapter(self, asset_dir: str, **kwargs: object) -> None:
+                raise AssertionError("missing SD1.5 style assets must be detected before IP-Adapter loading")
+
+        workspace_dir = Path(tempfile.mkdtemp(prefix="generate-missing-sd15-style-"))
+        extension_model_dir = workspace_dir / "models" / "sd15"
+        source_path = workspace_dir / "source.png"
+        reference_path = workspace_dir / "style-reference.png"
+        source_path.write_bytes(b"source")
+        reference_path.write_bytes(b"style")
+        job = {
+            "extension_id": "sd15",
+            "family": "stable-diffusion",
+            "node_id": "image-to-image",
+            "model_dir": str(extension_model_dir / "image-to-image"),
+            "workspace_dir": str(workspace_dir),
+            "output_path": str(workspace_dir / "result.png"),
+            "prompt": "variation",
+            "source_image_path": str(source_path),
+            "params": {"steps": 4, "strength": 0.55, "reference_strength": 0.4},
+            "conditioning": {"references": [{"role": "style", "filePath": str(reference_path)}]},
+        }
+
+        with patch(
+            "local_image_runtime.weights.acquire_optional_feature_weights",
+            side_effect=AssertionError("Generate must not acquire SD1.5 optional feature assets"),
+        ) as acquire_optional, patch(
+            "local_image_runtime.weights.HuggingFaceSnapshotDownloader.snapshot_download",
+            side_effect=AssertionError("Generate must not download SD1.5 optional feature assets"),
+        ) as snapshot_download:
+            with self.assertRaisesRegex(inference_runner.InferenceRunnerError, "SD1.5.*local-readiness") as cm:
+                inference_runner._configure_ip_adapter_if_present(FailingIfLoadedPipeline(), job)
+
+        message = str(cm.exception)
+        self.assertIn("models/ip-adapter_sd15.safetensors", message)
+        self.assertNotIn("sdxl_models", message)
+        acquire_optional.assert_not_called()
+        snapshot_download.assert_not_called()
 
     def test_inference_runner_fails_locally_before_loading_missing_ip_adapter_image_encoder_assets(self) -> None:
         import local_image_runtime.inference_runner as inference_runner

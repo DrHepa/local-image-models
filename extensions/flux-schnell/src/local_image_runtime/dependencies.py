@@ -32,6 +32,7 @@ _PYPI_INDEX_URL = "https://pypi.org/simple"
 _TORCH_EXTRA_INDEX_URLS = {
     "cu124": "https://download.pytorch.org/whl/cu124",
     "cu128": "https://download.pytorch.org/whl/cu128",
+    "cu130": "https://download.pytorch.org/whl/cu130",
 }
 _OPTIONAL_DEPENDENCY_GROUPS: dict[str, dict[str, dict[str, object]]] = {
     "sd15": {
@@ -134,7 +135,34 @@ _TORCH_WHEELS = {
             "torchvision": "https://download-r2.pytorch.org/whl/cu128/torchvision-0.22.0-cp313-cp313-manylinux_2_28_aarch64.whl#sha256=e4d4d5a14225875d9bf8c5221d43d8be97786adc498659493799bdeff52c54cf",
         },
     },
+    "cu130": {
+        "cp312": {
+            "torch": "https://download-r2.pytorch.org/whl/cu130/torch-2.11.0%2Bcu130-cp312-cp312-manylinux_2_28_aarch64.whl#sha256=252f237d417fac3ba59b1635815c1f035a8241f2af038f2c076ed430932d89f1",
+            "torchvision": "https://download-r2.pytorch.org/whl/cu130/torchvision-0.26.0%2Bcu130-cp312-cp312-manylinux_2_28_aarch64.whl#sha256=e2b39db78be674ee4ce7e921f54b70e5c281594c9267d981c061684ed38df936",
+        },
+    },
 }
+
+_GB10_CU130_PROVEN_EVIDENCE = {
+    "source_index": "https://download.pytorch.org/whl/cu130",
+    "torch_version": "2.11.0+cu130",
+    "torchvision_version": "0.26.0+cu130",
+    "python_tag": "cp312",
+    "platform_tag": "manylinux_2_28_aarch64",
+    "cuda_variant": "cu130",
+    "torch_cuda": "13.0",
+    "driver": "580.142",
+    "gpu_name": "NVIDIA GB10",
+}
+_GB10_CU130_REQUIRED_IMPORTS = (
+    "diffusers",
+    "transformers",
+    "accelerate",
+    "safetensors",
+    "sentencepiece",
+    "scipy",
+    "local_image_runtime",
+)
 
 
 @dataclass(frozen=True)
@@ -180,6 +208,23 @@ def _normalize_machine(value: str | None) -> str:
     return (value or "").strip().lower()
 
 
+def _normalize_gpu_sm(value: str | int | float | None) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        text = str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
+    else:
+        text = str(value)
+    normalized = "".join(character for character in text.strip().lower() if character.isdigit())
+    return normalized or None
+
+
+def _normalize_torch_arches(values: Iterable[str] | None) -> tuple[str, ...]:
+    if values is None:
+        return ()
+    return tuple(str(value).strip().lower() for value in values if isinstance(value, str) and value.strip())
+
+
 def normalize_platform_key(platform_info: dict[str, str]) -> str:
     system = _normalize_system(platform_info.get("system")) or "unknown"
     machine = _normalize_machine(platform_info.get("machine")) or "unknown"
@@ -194,6 +239,104 @@ def _unsupported_plan_diagnostic(*, system: str, machine: str) -> str:
         f"system='{system or 'unknown'}', machine='{machine or 'unknown'}'. "
         "This change currently guarantees installation ONLY on Linux ARM64 (linux + aarch64/arm64)."
     )
+
+
+def _gb10_sm121_diagnostics(
+    *,
+    gpu_sm: str,
+    cuda_variant: str,
+    torch_arch_list: Iterable[str] | None,
+    torch_version: str | None,
+) -> tuple[str, ...]:
+    arch_list = _normalize_torch_arches(torch_arch_list)
+    arch_text = ", ".join(arch_list) if arch_list else "not provided"
+    torch_label = str(torch_version).strip() if isinstance(torch_version, str) and torch_version.strip() else "current torch"
+    return (
+        "GB10 sm_121 is blocked as torch/CUDA dependency/runtime compatibility, not as an "
+        "IP-Adapter, ControlNet, or local asset failure.",
+        f"GPU sm_{gpu_sm} cannot use the {cuda_variant} plan with {torch_label}: torch arch list "
+        f"({arch_text}) lacks sm_{gpu_sm} and no verified PTX fallback/runtime proof was provided. "
+        "This matches the CUDA 'no kernel image is available for execution on the device' blocker; "
+        "collect isolated GB10 runtime proof before marking this target verified.",
+    )
+
+
+def _evidence_text(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _gb10_capability_is_12_1(value: Any) -> bool:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return False
+    return tuple(value) == (12, 1)
+
+
+def _validate_gb10_cu130_runtime_evidence(
+    evidence: dict[str, Any] | None,
+) -> tuple[bool, tuple[str, ...]]:
+    if not isinstance(evidence, dict):
+        return False, (
+            "GB10 sm_121 cu130 matrix update requires passing runtime/dependency evidence; "
+            "index availability alone is insufficient.",
+        )
+
+    diagnostics: list[str] = []
+    if evidence.get("source_index") == _GB10_CU130_PROVEN_EVIDENCE["source_index"]:
+        diagnostics.append(
+            "GB10 sm_121 cu130 index availability is not enough; runtime/dependency evidence must pass "
+            "CUDA available, capability (12,1), matmul, synchronize, and dependency import gates."
+        )
+    for field_name, expected_value in _GB10_CU130_PROVEN_EVIDENCE.items():
+        if evidence.get(field_name) != expected_value:
+            diagnostics.append(
+                f"GB10 cu130 evidence field '{field_name}' must be {expected_value!r}; "
+                f"got {evidence.get(field_name)!r}."
+            )
+    if not _gb10_capability_is_12_1(evidence.get("capability")):
+        diagnostics.append("GB10 cu130 runtime proof must record capability (12,1).")
+    if evidence.get("cuda_available") is not True:
+        diagnostics.append("GB10 cu130 runtime proof must show CUDA available.")
+    if evidence.get("matmul_passed") is not True:
+        diagnostics.append("GB10 cu130 runtime proof must include successful CUDA matmul.")
+    if evidence.get("synchronize_passed") is not True:
+        diagnostics.append("GB10 cu130 runtime proof must include successful torch.cuda.synchronize().")
+
+    imports = evidence.get("dependency_imports")
+    if not isinstance(imports, dict):
+        diagnostics.append(
+            "GB10 cu130 runtime/dependency evidence must include dependency_imports for diffusers, "
+            "transformers, accelerate, safetensors, sentencepiece, scipy, and local_image_runtime."
+        )
+    else:
+        for module_name in _GB10_CU130_REQUIRED_IMPORTS:
+            if _evidence_text(imports.get(module_name)) is None:
+                diagnostics.append(f"GB10 cu130 dependency import evidence missing '{module_name}'.")
+
+    blocking_diagnostics = tuple(
+        diagnostic
+        for diagnostic in diagnostics
+        if not diagnostic.startswith("GB10 sm_121 cu130 index availability is not enough")
+    )
+    if blocking_diagnostics:
+        return False, tuple(diagnostics)
+    return True, (
+        "Selected runtime-proven GB10 (12,1) cu130 candidate: torch 2.11.0+cu130, "
+        "torchvision 0.26.0+cu130, CUDA 13.0, driver 580.142. This is runtime-proven GB10 (12,1) "
+        "compatibility, not native sm_121 arch-list support.",
+    )
+
+
+def _gb10_sm121_is_supported_by_evidence(
+    *,
+    gpu_sm: str | None,
+    torch_arch_list: Iterable[str] | None,
+    ptx_fallback_verified: bool,
+    gb10_runtime_evidence: dict[str, Any] | None,
+) -> bool:
+    if gpu_sm != "121":
+        return True
+    evidence_ok, _ = _validate_gb10_cu130_runtime_evidence(gb10_runtime_evidence)
+    return evidence_ok
 
 
 def _windows_diagnostic(*, extension_id: str, plan_state: str) -> str:
@@ -517,6 +660,8 @@ def _select_cuda_variant(cuda_version: str | int | float | None) -> str:
         )
 
     cuda_value = int(normalized)
+    if cuda_value >= 130:
+        return "cu130"
     if cuda_value >= 128:
         return "cu128"
     if cuda_value >= 124:
@@ -640,9 +785,15 @@ def resolve_dependency_plan(
     python_tag: str,
     cuda_version: str | int | float | None,
     evidence_path: str | Path | None = None,
+    gpu_sm: str | int | float | None = None,
+    torch_arch_list: Iterable[str] | None = None,
+    torch_version: str | None = None,
+    ptx_fallback_verified: bool = False,
+    gb10_runtime_evidence: dict[str, Any] | None = None,
 ) -> DependencyPlan:
     system = _normalize_system(platform_info.get("system"))
     machine = _normalize_machine(platform_info.get("machine"))
+    normalized_gpu_sm = _normalize_gpu_sm(gpu_sm)
     platform_key = normalize_platform_key({"system": system, "machine": machine})
     if system == "windows":
         if extension_id == "sd15" and platform_key == SD15_WINDOWS_PLATFORM_KEY:
@@ -706,6 +857,34 @@ def resolve_dependency_plan(
         )
 
     cuda_variant = _select_cuda_variant(cuda_version)
+    gb10_evidence_diagnostics: tuple[str, ...] = ()
+    if normalized_gpu_sm == "121":
+        gb10_evidence_ok, gb10_evidence_diagnostics = _validate_gb10_cu130_runtime_evidence(gb10_runtime_evidence)
+    else:
+        gb10_evidence_ok = True
+    if not _gb10_sm121_is_supported_by_evidence(
+        gpu_sm=normalized_gpu_sm,
+        torch_arch_list=torch_arch_list,
+        ptx_fallback_verified=ptx_fallback_verified,
+        gb10_runtime_evidence=gb10_runtime_evidence,
+    ):
+        diagnostics = _gb10_sm121_diagnostics(
+            gpu_sm=normalized_gpu_sm or "121",
+            cuda_variant=cuda_variant,
+            torch_arch_list=torch_arch_list,
+            torch_version=torch_version,
+        )
+        return _diagnostic_plan(
+            extension_id=extension_id,
+            dependency_family=dependency_family,
+            readiness_imports=readiness_imports,
+            system=system,
+            machine=machine,
+            python_tag=python_tag,
+            cuda_version=cuda_variant,
+            plan_state=PLAN_STATE_UNSUPPORTED,
+            diagnostics=(*diagnostics, *gb10_evidence_diagnostics),
+        )
     return DependencyPlan(
         extension_id=extension_id,
         dependency_family=dependency_family,
@@ -719,7 +898,7 @@ def resolve_dependency_plan(
         plan_state=PLAN_STATE_VERIFIED,
         platform_key=platform_key,
         platform_supported=True,
-        diagnostics=(),
+        diagnostics=gb10_evidence_diagnostics if normalized_gpu_sm == "121" and gb10_evidence_ok else (),
     )
 
 

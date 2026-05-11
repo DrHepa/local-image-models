@@ -176,6 +176,7 @@ def _persist_failed_result(
     steps: Sequence[dict[str, Any]],
     diagnostics: Sequence[str],
     platform_info: dict[str, str],
+    models_dir: str | None = None,
     setup_state: str | None = None,
     dependency_plan_state: str | None = None,
     platform_key: str | None = None,
@@ -187,6 +188,7 @@ def _persist_failed_result(
         status=SETUP_STATUS_FAILED,
         ext_dir=ext_dir,
         python_exe=python_exe,
+        models_dir=models_dir,
         venv_python=str(expected_venv_python(Path(ext_dir))) if ext_dir else None,
         steps=tuple(steps),
         diagnostics=tuple(diagnostics),
@@ -256,6 +258,109 @@ def _payload_text(*, argv: Sequence[str] | None, stdin_text: str | None) -> str:
     )
 
 
+def _payload_requests_gb10_cu130_runtime_evidence(payload: SetupPayload) -> bool:
+    gpu_sm = str(payload.gpu_sm or "").strip().lower().removeprefix("sm_")
+    cuda_version = str(payload.cuda_version or "").strip().lower()
+    return gpu_sm == "121" and (cuda_version == "13" or cuda_version.startswith("13."))
+
+
+def _parse_nvidia_smi_identity(stdout: str) -> tuple[str | None, str | None]:
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None, None
+    values = [part.strip() for part in lines[1].split(",")]
+    if len(values) < 2:
+        return None, None
+    return values[0] or None, values[1] or None
+
+
+def _gb10_runtime_evidence_from_installed_venv(
+    *, venv_python: Path, ext_root: Path, python_tag: str
+) -> dict[str, Any] | None:
+    if not venv_python.exists():
+        return None
+    probe = r'''
+import importlib, json, platform, subprocess, sys, traceback
+
+result = {
+    "source_index": "https://download.pytorch.org/whl/cu130",
+    "python_tag": "__PYTHON_TAG__",
+    "platform_tag": "manylinux_2_28_aarch64",
+    "cuda_variant": "cu130",
+    "dependency_imports": {},
+    "probe_errors": [],
+}
+try:
+    smi = subprocess.run(
+        ["nvidia-smi", "--query-gpu=driver_version,name,compute_cap", "--format=csv"],
+        text=True,
+        capture_output=True,
+        timeout=15,
+    )
+    result["nvidia_smi"] = {"returncode": smi.returncode, "stdout": smi.stdout, "stderr": smi.stderr}
+    lines = [line.strip() for line in smi.stdout.splitlines() if line.strip()]
+    if len(lines) >= 2:
+        values = [part.strip() for part in lines[1].split(",")]
+        if len(values) >= 2:
+            result["driver"] = values[0]
+            result["gpu_name"] = values[1]
+except Exception as exc:
+    result["nvidia_smi"] = {"error": repr(exc)}
+
+for module_name in ("torch", "torchvision", "diffusers", "transformers", "accelerate", "safetensors", "sentencepiece", "scipy", "local_image_runtime"):
+    try:
+        module = importlib.import_module(module_name)
+        version = getattr(module, "__version__", None) or "ok"
+        result["dependency_imports"][module_name] = version
+        if module_name == "torch":
+            result["torch_version"] = version
+        if module_name == "torchvision":
+            result["torchvision_version"] = version
+    except Exception as exc:
+        result["dependency_imports"][module_name] = None
+        result["probe_errors"].append({"module": module_name, "error": repr(exc), "traceback": traceback.format_exc()})
+
+try:
+    import torch
+    result["torch_cuda"] = getattr(torch.version, "cuda", None)
+    result["cuda_available"] = bool(torch.cuda.is_available())
+    if result["cuda_available"]:
+        result["gpu_name"] = result.get("gpu_name") or torch.cuda.get_device_name(0)
+        result["capability"] = list(torch.cuda.get_device_capability(0))
+        result["arch_list"] = list(torch.cuda.get_arch_list())
+        x = torch.ones((64, 64), device="cuda", dtype=torch.float32)
+        y = x @ x
+        torch.cuda.synchronize()
+        result["matmul_passed"] = bool(torch.isfinite(y).all().item())
+        result["synchronize_passed"] = True
+        result["matmul_sum"] = float(y.sum().cpu())
+except Exception as exc:
+    result["matmul_passed"] = False
+    result["synchronize_passed"] = False
+    result["probe_errors"].append({"runtime": repr(exc), "traceback": traceback.format_exc()})
+
+print(json.dumps(result, sort_keys=True))
+'''.replace("__PYTHON_TAG__", python_tag)
+    env = os.environ.copy()
+    src_root = ext_root / "src"
+    env["PYTHONPATH"] = str(src_root) if src_root.exists() else env.get("PYTHONPATH", "")
+    completed = subprocess.run(
+        [str(venv_python), "-c", probe],
+        text=True,
+        capture_output=True,
+        cwd=ext_root,
+        env=env,
+        timeout=120,
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return None
+    try:
+        evidence = json.loads(completed.stdout)
+    except JSONDecodeError:
+        return None
+    return evidence if isinstance(evidence, dict) else None
+
+
 def parse_setup_payload(
     *, argv: Sequence[str] | None = None, stdin_text: str | None = None
 ) -> SetupPayload:
@@ -322,6 +427,7 @@ def run_install_setup_contract(
             status=SETUP_STATUS_FAILED,
             ext_dir=None,
             python_exe=None,
+            models_dir=None,
             venv_python=None,
             steps=(
                 {
@@ -376,6 +482,14 @@ def run_install_setup_contract(
         )
 
         python_tag = python_tag_from_interpreter(installer_python)
+        gb10_runtime_evidence = None
+        if _payload_requests_gb10_cu130_runtime_evidence(payload):
+            gb10_runtime_evidence = _gb10_runtime_evidence_from_installed_venv(
+                venv_python=plan_venv_python,
+                ext_root=ext_root,
+                python_tag=python_tag,
+            )
+
         plan = resolve_dependency_plan(
             extension_id=extension_id,
             dependency_family=descriptor.dependency_family,
@@ -383,6 +497,8 @@ def run_install_setup_contract(
             platform_info=platform_info,
             python_tag=python_tag,
             cuda_version=payload.cuda_version,
+            gpu_sm=payload.gpu_sm,
+            gb10_runtime_evidence=gb10_runtime_evidence,
         )
         if plan.plan_state != PLAN_STATE_VERIFIED and not _candidate_install_allowed(plan):
             plan_diagnostics = plan.diagnostics or (f"Dependency plan state is {plan.plan_state}.",)
@@ -399,6 +515,7 @@ def run_install_setup_contract(
             extension_id=extension_id,
             ext_dir=payload.ext_dir,
             python_exe=payload.python_exe,
+            models_dir=payload.models_dir,
             steps=prefix_steps,
             diagnostics=diagnostics,
             platform_info=platform_info,
@@ -414,6 +531,7 @@ def run_install_setup_contract(
         status=SETUP_STATUS_INSTALLING,
         ext_dir=payload.ext_dir,
         python_exe=payload.python_exe,
+        models_dir=payload.models_dir,
         venv_python=str(plan_venv_python),
         steps=tuple(prefix_steps)
         + (_step("install_dependencies", "installing", "Creating venv and installing runtime dependencies."),),
@@ -497,27 +615,26 @@ def run_install_setup_contract(
                 )
             )
 
-        if extension_id == "sdxl-base":
-            for feature_id, feature_spec in get_optional_feature_specs(extension_id).items():
-                if not feature_spec.get("supported", True):
-                    continue
-                step_name = f"acquire_optional_feature_{feature_id}"
-                try:
-                    optional_models_dir = payload.models_dir or installing_snapshot.paths.models_dir
-                    result = acquire_optional_feature_weights(
-                        extension_id,
-                        feature_id,
-                        optional_models_dir,
-                    )
-                except Exception as exc:
-                    raise SetupExecutionError(step_name=step_name, detail=str(exc)) from exc
-                execution_steps.append(
-                    _step(
-                        step_name,
-                        "ok",
-                        f"Acquired optional feature assets at '{result['check_path']}'.",
-                    )
+        for feature_id, feature_spec in get_optional_feature_specs(extension_id).items():
+            if not feature_spec.get("supported", True):
+                continue
+            step_name = f"acquire_optional_feature_{feature_id}"
+            try:
+                optional_models_dir = payload.models_dir or installing_snapshot.paths.models_dir
+                result = acquire_optional_feature_weights(
+                    extension_id,
+                    feature_id,
+                    optional_models_dir,
                 )
+            except Exception as exc:
+                raise SetupExecutionError(step_name=step_name, detail=str(exc)) from exc
+            execution_steps.append(
+                _step(
+                    step_name,
+                    "ok",
+                    f"Acquired optional feature assets at '{result['check_path']}'.",
+                )
+            )
 
     except SetupExecutionError as exc:
         execution_steps.append(_step(exc.step_name, "failed", exc.detail))
@@ -530,6 +647,7 @@ def run_install_setup_contract(
             extension_id=extension_id,
             ext_dir=payload.ext_dir,
             python_exe=payload.python_exe,
+            models_dir=payload.models_dir,
             steps=execution_steps,
             diagnostics=diagnostics,
             platform_info=platform_info,
@@ -540,6 +658,7 @@ def run_install_setup_contract(
         extension_id,
         ext_dir=payload.ext_dir,
         python_exe=payload.python_exe,
+        models_dir=payload.models_dir,
         step_prefix=tuple(execution_steps),
         platform_info=platform_info,
     )

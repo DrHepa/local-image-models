@@ -82,10 +82,28 @@ EXTENSION_DESCRIPTORS = (
                 "label": "SD1.5 IP-Adapter style reference",
                 "family": "stable-diffusion",
                 "node_id": "image-to-image",
-                "supported": False,
+                "supported": True,
+                "manifest_exposed": True,
+                "promotion_ready": True,
+                "hf_repo": "h94/IP-Adapter",
+                "revision": "018e402774aeeddd60609b4ecdb7e298259dc729",
+                "download_check": "models/ip-adapter_sd15.safetensors",
+                "required_files": (
+                    "models/ip-adapter_sd15.safetensors",
+                    "models/image_encoder/config.json",
+                    "models/image_encoder/model.safetensors",
+                ),
+                "allow_patterns": (
+                    "models/ip-adapter_sd15.safetensors",
+                    "models/image_encoder/config.json",
+                    "models/image_encoder/model.safetensors",
+                ),
+                "loader_subfolder": "models",
+                "loader_weight_name": "ip-adapter_sd15.safetensors",
+                "loader_image_encoder_folder": "models/image_encoder",
                 "unsupported_reason": (
-                    "SD1.5 style reference is not supported because compatible IP-Adapter adapter, "
-                    "image encoder assets, and target-platform smoke evidence are not verified yet."
+                    "SD1.5 style reference requires Install/Repair-acquired local IP-Adapter assets and "
+                    "local-only Generate execution; ControlNet remains a separate unsupported lane."
                 ),
             },
             "sd15_controlnet_canny": {
@@ -331,9 +349,15 @@ def get_optional_feature_specs(extension_id: str) -> dict[str, dict[str, Any]]:
             "node_strategy": str(spec.get("node_strategy", "")).strip(),
             "dependency_group": str(spec.get("dependency_group", "")).strip(),
             "hf_repo": str(spec.get("hf_repo", "")).strip(),
+            "revision": str(spec.get("revision", "")).strip(),
             "download_check": download_check,
             "required_files": required_files,
             "allow_patterns": allow_patterns,
+            "loader_subfolder": str(spec.get("loader_subfolder", "")).strip(),
+            "loader_weight_name": str(spec.get("loader_weight_name", "")).strip(),
+            "loader_image_encoder_folder": str(spec.get("loader_image_encoder_folder", "")).strip(),
+            "manifest_exposed": bool(spec.get("manifest_exposed", spec.get("supported", True))),
+            "promotion_ready": bool(spec.get("promotion_ready", False)),
         }
     return specs
 

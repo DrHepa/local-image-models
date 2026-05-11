@@ -26,7 +26,7 @@ from .install_contract import (
     parse_setup_payload,
     run_install_setup_contract,
 )
-from . import lifecycle
+from . import bundle_metadata, lifecycle, release_gates, smoke_evidence
 from .descriptors import (
     ExtensionDescriptor,
     get_extension_descriptor,
@@ -75,6 +75,7 @@ from .weights import (
     OptionalFeatureWeightPartialDownloadError,
     acquire_flux_schnell_weights,
     acquire_optional_feature_weights,
+    collect_optional_feature_asset_identity,
     download_check_path,
     evaluate_extension_weights,
     extension_models_dir,
@@ -139,6 +140,7 @@ __all__ = [
     "MODELS_DIR_ENV_VARS",
     "acquire_flux_schnell_weights",
     "acquire_optional_feature_weights",
+    "collect_optional_feature_asset_identity",
     "download_check_path",
     "evaluate_extension_weights",
     "extension_models_dir",

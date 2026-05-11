@@ -494,6 +494,7 @@ def _normalize_setup_state(extension_id: str, current: Any, timestamp: str) -> d
     payload = current if isinstance(current, dict) else {}
     ext_dir = _normalize_string(payload.get("ext_dir"))
     python_exe = _normalize_string(payload.get("python_exe"))
+    models_dir = _normalize_string(payload.get("models_dir"))
     platform_info = _normalize_platform_info(payload.get("platform"))
     plan_metadata = _derive_dependency_plan_metadata(
         extension_id=extension_id,
@@ -530,6 +531,7 @@ def _normalize_setup_state(extension_id: str, current: Any, timestamp: str) -> d
         else plan_metadata["platform_supported"],
         "ext_dir": ext_dir,
         "python_exe": python_exe,
+        "models_dir": models_dir,
         "venv_python": venv_python,
         "platform": platform_info,
         "steps": list(steps),
@@ -580,10 +582,13 @@ def _normalize_extension_state(
     else:
         error = None
 
+    setup_models_dir = _normalize_string(setup_state.get("models_dir"))
+    effective_models_dir = Path(setup_models_dir).expanduser().resolve() if setup_models_dir else paths.models_dir
     weight_state = evaluate_extension_weights(
         extension_id,
-        models_dir=paths.models_dir,
+        models_dir=effective_models_dir,
         legacy_models_dir=paths.models_dir,
+        source_label="setup_payload" if setup_models_dir else None,
     )
     plan_diagnostics = _normalize_string_list(setup_state.get("diagnostics"))
     weight_diagnostics = _normalize_string_list(weight_state.get("diagnostics"))
@@ -606,7 +611,7 @@ def _normalize_extension_state(
         "backend": descriptor.backend,
         "hf_repo": descriptor.hf_repo,
         "readiness_imports": list(descriptor.readiness_imports),
-        "model_dir": str(paths.models_dir / extension_id),
+        "model_dir": str(effective_models_dir / extension_id),
         "weights_dir": weight_state["extension_dir"],
         "weights": weight_state,
         "venv_python": setup_state["venv_python"],
@@ -805,6 +810,7 @@ def persist_extension_setup(
     ext_dir: str | None,
     python_exe: str | None,
     venv_python: str | None,
+    models_dir: str | None = None,
     steps: tuple[dict[str, Any], ...] | list[dict[str, Any]],
     diagnostics: tuple[str, ...] | list[str],
     platform_info: dict[str, str] | None = None,
@@ -838,6 +844,7 @@ def persist_extension_setup(
         else current_setup.get("platform_supported"),
         "ext_dir": _normalize_string(ext_dir),
         "python_exe": _normalize_string(python_exe),
+        "models_dir": _normalize_string(models_dir) or current_setup.get("models_dir"),
         "venv_python": _normalize_string(venv_python),
         "platform": _normalize_platform_info(platform_info),
         "steps": normalized_steps,
@@ -892,6 +899,7 @@ def reevaluate_extension_setup(
     *,
     ext_dir: str | None | object = _UNSET,
     python_exe: str | None | object = _UNSET,
+    models_dir: str | None | object = _UNSET,
     step_prefix: tuple[dict[str, Any], ...] | list[dict[str, Any]] = (),
     platform_info: dict[str, str] | None = None,
 ) -> RuntimeSnapshot:
@@ -899,6 +907,7 @@ def reevaluate_extension_setup(
     current_setup = current.get("setup") if isinstance(current.get("setup"), dict) else {}
     resolved_ext_dir = current_setup.get("ext_dir") if ext_dir is _UNSET else ext_dir
     resolved_python_exe = current_setup.get("python_exe") if python_exe is _UNSET else python_exe
+    resolved_models_dir = current_setup.get("models_dir") if models_dir is _UNSET else models_dir
     evaluated = _evaluate_setup_readiness(
         extension_id=extension_id,
         ext_dir=_normalize_string(resolved_ext_dir),
@@ -910,6 +919,7 @@ def reevaluate_extension_setup(
         status=evaluated["status"],
         ext_dir=_normalize_string(resolved_ext_dir),
         python_exe=_normalize_string(resolved_python_exe),
+        models_dir=_normalize_string(resolved_models_dir),
         venv_python=evaluated["venv_python"],
         steps=tuple(step_prefix) + evaluated["steps"],
         diagnostics=evaluated["diagnostics"],

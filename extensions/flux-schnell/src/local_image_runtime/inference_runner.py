@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -16,6 +17,7 @@ from .diffusers_memory import (
 from . import lifecycle
 from .denoising import validate_image_to_image_effective_denoising_steps
 from .descriptors import get_optional_feature_specs
+from .weights import collect_optional_feature_asset_identity
 
 
 class InferenceRunnerError(RuntimeError):
@@ -53,6 +55,23 @@ _SDXL_IP_ADAPTER_FEATURE_ID = "sdxl_ip_adapter_style"
 _SDXL_IP_ADAPTER_SUBFOLDER = "sdxl_models"
 _SDXL_IP_ADAPTER_WEIGHT_NAME = "ip-adapter_sdxl.bin"
 _SDXL_IP_ADAPTER_IMAGE_ENCODER_FOLDER = "sdxl_models/image_encoder"
+_SD15_IP_ADAPTER_FEATURE_ID = "sd15_ip_adapter_style"
+
+
+@dataclass(frozen=True)
+class IPAdapterLoaderConfig:
+    extension_id: str
+    family: str
+    node_id: str
+    feature_id: str
+    asset_dir: str
+    subfolder: str
+    weight_name: str
+    image_encoder_folder: str
+    local_files_only: bool
+    ready: bool
+    status: str
+    diagnostics: tuple[str, ...] = ()
 
 
 def emit_event(event_type: str, *, stdout: TextIO | None = None, **payload: Any) -> None:
@@ -223,6 +242,70 @@ def _derive_extension_model_dir(*, model_dir: str, node_id: str) -> Path:
     return resolved_model_dir
 
 
+def resolve_ip_adapter_loader_config(
+    *,
+    extension_id: str,
+    family: str,
+    node_id: str,
+    feature_id: str,
+    extension_model_dir: str | Path,
+) -> IPAdapterLoaderConfig:
+    asset_dir = Path(extension_model_dir).expanduser().resolve() / "optional" / feature_id
+    if (
+        extension_id == "sdxl-base"
+        and family == "sdxl"
+        and node_id == "image-to-image"
+        and feature_id == _SDXL_IP_ADAPTER_FEATURE_ID
+    ):
+        return IPAdapterLoaderConfig(
+            extension_id=extension_id,
+            family=family,
+            node_id=node_id,
+            feature_id=feature_id,
+            asset_dir=str(asset_dir),
+            subfolder=_SDXL_IP_ADAPTER_SUBFOLDER,
+            weight_name=_SDXL_IP_ADAPTER_WEIGHT_NAME,
+            image_encoder_folder=_SDXL_IP_ADAPTER_IMAGE_ENCODER_FOLDER,
+            local_files_only=True,
+            ready=True,
+            status="ready",
+        )
+    if (
+        extension_id == "sd15"
+        and family == "stable-diffusion"
+        and node_id == "image-to-image"
+        and feature_id == _SD15_IP_ADAPTER_FEATURE_ID
+    ):
+        feature_spec = get_optional_feature_specs(extension_id).get(feature_id, {})
+        return IPAdapterLoaderConfig(
+            extension_id=extension_id,
+            family=family,
+            node_id=node_id,
+            feature_id=feature_id,
+            asset_dir=str(asset_dir),
+            subfolder=str(feature_spec.get("loader_subfolder", "models")),
+            weight_name=str(feature_spec.get("loader_weight_name", "ip-adapter_sd15.safetensors")),
+            image_encoder_folder=str(feature_spec.get("loader_image_encoder_folder", "models/image_encoder")),
+            local_files_only=True,
+            ready=True,
+            status="ready",
+        )
+    return IPAdapterLoaderConfig(
+        extension_id=extension_id,
+        family=family,
+        node_id=node_id,
+        feature_id=feature_id,
+        asset_dir=str(asset_dir),
+        subfolder="",
+        weight_name="",
+        image_encoder_folder="",
+        local_files_only=True,
+        ready=False,
+        status="unsupported",
+        diagnostics=(f"IP-Adapter loader config is not available for '{extension_id}/{family}/{node_id}/{feature_id}'.",),
+    )
+
+
 def _build_pipeline_kwargs(job: dict[str, Any], *, execution_device: str) -> dict[str, Any]:
     params = job.get("params")
     if not isinstance(params, dict):
@@ -267,8 +350,9 @@ def _build_pipeline_kwargs(job: dict[str, Any], *, execution_device: str) -> dic
 
     style_reference = _style_reference_from_job(job)
     if style_reference is not None:
-        if family != "sdxl" or _require_string_field(job, "node_id") != "image-to-image":
-            raise InferenceRunnerError("IP-Adapter style reference is supported only for SDXL image-to-image.")
+        node_id = _require_string_field(job, "node_id")
+        if (family, node_id) not in {("sdxl", "image-to-image"), ("stable-diffusion", "image-to-image")}:
+            raise InferenceRunnerError("IP-Adapter style reference is supported only for SDXL or SD1.5 image-to-image.")
         kwargs["ip_adapter_image"] = _open_source_image(style_reference["filePath"])
 
     return kwargs
@@ -280,27 +364,49 @@ def _configure_ip_adapter_if_present(pipeline: Any, job: dict[str, Any]) -> None
         return
     family = _require_string_field(job, "family")
     node_id = _require_string_field(job, "node_id")
-    if family != "sdxl" or node_id != "image-to-image":
-        raise InferenceRunnerError("IP-Adapter style reference is supported only for SDXL image-to-image.")
+    if (family, node_id) not in {("sdxl", "image-to-image"), ("stable-diffusion", "image-to-image")}:
+        raise InferenceRunnerError("IP-Adapter style reference is supported only for SDXL or SD1.5 image-to-image.")
     model_dir = _require_string_field(job, "model_dir")
+    extension_id = job.get("extension_id") if isinstance(job.get("extension_id"), str) else ""
+    if family == "sdxl":
+        extension_id = extension_id or "sdxl-base"
+        feature_id = _SDXL_IP_ADAPTER_FEATURE_ID
+        family_label = "SDXL"
+    else:
+        extension_id = extension_id or "sd15"
+        feature_id = _SD15_IP_ADAPTER_FEATURE_ID
+        family_label = "SD1.5"
     extension_model_dir = _derive_extension_model_dir(model_dir=model_dir, node_id=node_id)
-    asset_dir = extension_model_dir / "optional" / _SDXL_IP_ADAPTER_FEATURE_ID
-    feature_spec = get_optional_feature_specs("sdxl-base")[_SDXL_IP_ADAPTER_FEATURE_ID]
-    required_files = tuple(feature_spec.get("required_files", (f"{_SDXL_IP_ADAPTER_SUBFOLDER}/{_SDXL_IP_ADAPTER_WEIGHT_NAME}",)))
-    missing_files = tuple(asset_dir / relative_path for relative_path in required_files if not (asset_dir / relative_path).exists())
-    if missing_files:
+    config = resolve_ip_adapter_loader_config(
+        extension_id=extension_id,
+        family=family,
+        node_id=node_id,
+        feature_id=feature_id,
+        extension_model_dir=extension_model_dir,
+    )
+    if not config.ready:
+        raise InferenceRunnerError(" ".join(config.diagnostics))
+    asset_ledger = collect_optional_feature_asset_identity(
+        extension_id,
+        feature_id,
+        extension_model_dir=extension_model_dir,
+    )
+    missing_paths = tuple(str(path) for path in asset_ledger.get("missing_paths", ()))
+    if missing_paths:
         raise InferenceRunnerError(
-            "Missing local SDXL IP-Adapter Style reference assets. Run Install/Repair for SDXL "
-            f"IP-Adapter Style reference assets before generation. Expected '{missing_files[0]}'."
+            f"{family_label} Generate local-readiness check failed: missing local IP-Adapter Style reference assets. "
+            f"Run Install/Repair for {family_label} IP-Adapter Style reference assets before generation. "
+            "No download was attempted during Generate. "
+            f"Expected {', '.join(missing_paths)}."
         )
     load_adapter = getattr(pipeline, "load_ip_adapter", None)
     if callable(load_adapter):
         load_adapter(
-            str(asset_dir),
-            subfolder=_SDXL_IP_ADAPTER_SUBFOLDER,
-            weight_name=_SDXL_IP_ADAPTER_WEIGHT_NAME,
-            image_encoder_folder=_SDXL_IP_ADAPTER_IMAGE_ENCODER_FOLDER,
-            local_files_only=True,
+            config.asset_dir,
+            subfolder=config.subfolder,
+            weight_name=config.weight_name,
+            image_encoder_folder=config.image_encoder_folder,
+            local_files_only=config.local_files_only,
         )
     params = job.get("params") if isinstance(job.get("params"), dict) else {}
     reference_strength = params.get("reference_strength", 0.6)

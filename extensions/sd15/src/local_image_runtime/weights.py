@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
 from pathlib import Path
 from typing import Any, Protocol
@@ -31,6 +32,7 @@ class SnapshotDownloader(Protocol):
         repo_id: str,
         local_dir: Path,
         allow_patterns: tuple[str, ...] | None = None,
+        revision: str | None = None,
     ) -> Path:
         ...
 
@@ -42,12 +44,15 @@ class HuggingFaceSnapshotDownloader:
         repo_id: str,
         local_dir: Path,
         allow_patterns: tuple[str, ...] | None = None,
+        revision: str | None = None,
     ) -> Path:
         from huggingface_hub import snapshot_download
 
         kwargs: dict[str, Any] = {"repo_id": repo_id, "local_dir": str(local_dir)}
         if allow_patterns is not None:
             kwargs["allow_patterns"] = list(allow_patterns)
+        if revision:
+            kwargs["revision"] = revision
         return Path(snapshot_download(**kwargs))
 
 
@@ -300,6 +305,7 @@ def acquire_optional_feature_weights(
         raise ValueError(str(reason))
 
     repo_id = feature_spec["hf_repo"]
+    revision = str(feature_spec.get("revision", "")).strip() or None
     download_check = feature_spec["download_check"]
     required_files = tuple(feature_spec.get("required_files", (download_check,)))
     allow_patterns = tuple(feature_spec.get("allow_patterns", required_files))
@@ -320,15 +326,19 @@ def acquire_optional_feature_weights(
             "required_files": required_files,
             "missing_files": (),
             "downloaded": False,
+            "revision": revision or "unknown",
         }
 
     active_downloader = downloader or HuggingFaceSnapshotDownloader()
     try:
-        active_downloader.snapshot_download(
-            repo_id=repo_id,
-            local_dir=target_dir,
-            allow_patterns=allow_patterns,
-        )
+        download_kwargs: dict[str, Any] = {
+            "repo_id": repo_id,
+            "local_dir": target_dir,
+            "allow_patterns": allow_patterns,
+        }
+        if revision is not None:
+            download_kwargs["revision"] = revision
+        active_downloader.snapshot_download(**download_kwargs)
     except Exception as exc:
         raise OptionalFeatureWeightDownloadError(
             f"Optional feature '{feature_id}' weight download failed for extension '{extension_id}': {exc}"
@@ -353,6 +363,129 @@ def acquire_optional_feature_weights(
         "required_files": required_files,
         "missing_files": (),
         "downloaded": True,
+        "revision": revision or "unknown",
+    }
+
+
+def collect_optional_feature_asset_identity(
+    extension_id: str,
+    feature_id: str,
+    *,
+    models_dir: str | Path | None = None,
+    extension_model_dir: str | Path | None = None,
+    revision: str | None = None,
+) -> dict[str, Any]:
+    optional_specs = get_optional_feature_specs(extension_id)
+    feature_spec = optional_specs.get(feature_id)
+    if feature_spec is None:
+        raise ValueError(f"Unknown optional feature '{feature_id}' for extension '{extension_id}'.")
+    if not feature_spec.get("supported", True):
+        return _blocked_optional_feature_asset_identity(
+            extension_id=extension_id,
+            feature_id=feature_id,
+            feature_spec=feature_spec,
+            models_dir=models_dir,
+            extension_model_dir=extension_model_dir,
+        )
+
+    if extension_model_dir is not None:
+        feature_root = Path(extension_model_dir).expanduser().resolve() / "optional" / feature_id
+    elif models_dir is not None:
+        root = Path(models_dir).expanduser().resolve()
+        feature_root = extension_models_dir(root, extension_id) / "optional" / feature_id
+    else:
+        raise ValueError("models_dir or extension_model_dir is required to collect optional feature asset identity.")
+    required_files = tuple(feature_spec.get("required_files", (feature_spec["download_check"],)))
+    repo = str(feature_spec["hf_repo"])
+    spec_revision = str(feature_spec.get("revision", "")).strip()
+    resolved_revision = revision.strip() if isinstance(revision, str) and revision.strip() else spec_revision or "unknown"
+
+    assets: list[dict[str, Any]] = []
+    missing_files: list[str] = []
+    missing_paths: list[str] = []
+    for relative_path in required_files:
+        asset_path = feature_root / relative_path
+        if not asset_path.exists():
+            missing_files.append(relative_path)
+            missing_paths.append(str(asset_path))
+            continue
+        content = asset_path.read_bytes()
+        assets.append(
+            {
+                "relative_path": relative_path,
+                "path": str(asset_path),
+                "size": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "repo": repo,
+                "revision": resolved_revision,
+            }
+        )
+
+    diagnostics: list[str] = []
+    if missing_paths:
+        diagnostics.append(
+            f"Missing local optional assets for '{extension_id}/{feature_id}': {', '.join(missing_paths)}. "
+            "Run Install/Repair to acquire supported assets; no download was attempted during this local identity check."
+        )
+
+    return {
+        "status": "ready" if not missing_files else "missing",
+        "extension_id": extension_id,
+        "feature_id": feature_id,
+        "repo": repo,
+        "revision": resolved_revision,
+        "model_dir": str(feature_root),
+        "required_files": required_files,
+        "allow_patterns": tuple(feature_spec.get("allow_patterns", required_files)),
+        "missing_files": tuple(missing_files),
+        "missing_paths": tuple(missing_paths),
+        "assets": tuple(assets),
+        "diagnostics": tuple(diagnostics),
+        "local_files_only": True,
+    }
+
+
+def _blocked_optional_feature_asset_identity(
+    *,
+    extension_id: str,
+    feature_id: str,
+    feature_spec: dict[str, Any],
+    models_dir: str | Path | None,
+    extension_model_dir: str | Path | None,
+) -> dict[str, Any]:
+    if extension_model_dir is not None:
+        feature_root = Path(extension_model_dir).expanduser().resolve() / "optional" / feature_id
+    elif models_dir is not None:
+        feature_root = extension_models_dir(Path(models_dir).expanduser().resolve(), extension_id) / "optional" / feature_id
+    else:
+        feature_root = Path(f"<modelsDir>/{extension_id}/optional/{feature_id}")
+
+    reason = feature_spec.get("unsupported_reason") or f"Optional feature '{feature_id}' is not supported."
+    repo = str(feature_spec.get("hf_repo", "")).strip() or "unknown"
+    required_files = tuple(feature_spec.get("required_files", ()))
+    allow_patterns = tuple(feature_spec.get("allow_patterns", ()))
+    diagnostics = [
+        str(reason),
+        (
+            f"Optional asset identity for '{extension_id}/{feature_id}' is blocked before model load: "
+            "exact repo/source revision, required_files, allow_patterns, adapter file, image encoder files, "
+            "sizes, and SHA256 hashes are not fully discovered."
+        ),
+    ]
+    return {
+        "status": "blocked",
+        "extension_id": extension_id,
+        "feature_id": feature_id,
+        "repo": repo,
+        "revision": "unknown",
+        "model_dir": str(feature_root),
+        "required_files": required_files,
+        "allow_patterns": allow_patterns,
+        "missing_files": required_files,
+        "missing_paths": (),
+        "assets": (),
+        "diagnostics": tuple(diagnostics),
+        "local_files_only": True,
     }
 
 
@@ -361,6 +494,7 @@ def evaluate_extension_weights(
     *,
     models_dir: str | Path | None = None,
     legacy_models_dir: str | Path | None = None,
+    source_label: str | None = None,
 ) -> dict[str, Any]:
     descriptor = get_extension_descriptor(extension_id)
     if descriptor is None:
@@ -477,7 +611,8 @@ def evaluate_extension_weights(
         else:
             feature_diagnostics.append(
                 f"Optional {spec['label']} is missing for '{extension_id}/{spec['node_id']}'. "
-                f"Expected IP-Adapter required files {', '.join(missing_files)} under '{feature_root}'."
+                f"Expected IP-Adapter required files {', '.join(missing_files)} under '{feature_root}'. "
+                "Run Install/Repair to acquire supported optional assets; readiness checks do not download."
             )
         diagnostics.extend(feature_diagnostics)
         optional_features[feature_id] = {
@@ -505,7 +640,7 @@ def evaluate_extension_weights(
     return {
         "status": overall_status,
         "models_dir": str(resolved_models_dir) if resolved_models_dir is not None else None,
-        "source": resolved_models["source"],
+        "source": source_label or resolved_models["source"],
         "extension_dir": (
             str(extension_models_dir(resolved_models_dir, extension_id))
             if resolved_models_dir is not None
@@ -538,6 +673,7 @@ __all__ = [
     "SnapshotDownloader",
     "acquire_optional_feature_weights",
     "acquire_flux_schnell_weights",
+    "collect_optional_feature_asset_identity",
     "download_check_path",
     "evaluate_extension_weights",
     "extension_models_dir",

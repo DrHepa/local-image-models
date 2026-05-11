@@ -33,7 +33,7 @@ The canonical shared code lives in `shared/runtime/local_image_runtime/` and is 
 
 These VRAM values are practical recommendations, not hard guarantees. Actual usage depends on resolution, precision, CPU/GPU offload, driver/runtime behavior, and memory optimizations available in the local environment.
 
-Current bundle support is functionally aligned for Linux ARM64 and Windows: SD15, SDXL, and FLUX.1-schnell install, download weights, and generate successfully when the local machine has the required runtime resources and upstream model access.
+Current baseline bundle flows are verified on the active Linux ARM64 path and remain intended to support the existing Windows candidate path. On Linux ARM64 with NVIDIA GB10 and `torch==2.11.0+cu130`, both SDXL Base `image-to-image` `Style reference` (`sdxl_ip_adapter_style`) and SD1.5 `image-to-image` `Style reference` (`sd15_ip_adapter_style`) have passed installed local-only smoke. SD1.5 promotion is scoped to `image-to-image` only; SD1.5 `text-to-image` is unchanged. This does **not** promote ControlNet, Windows compatibility, or public release readiness. Windows remains prepared/intended but candidate/unverified until GitHub-installed Install/Repair, readiness, and generation evidence is collected on Windows.
 
 For FLUX.1-schnell weights, open [`https://huggingface.co/black-forest-labs/FLUX.1-schnell`](https://huggingface.co/black-forest-labs/FLUX.1-schnell), log in, accept the model conditions, and share contact information if Hugging Face requests it. Use the same Hugging Face account/token that Modly uses for the download; otherwise the extension cannot download the weights.
 
@@ -46,6 +46,7 @@ For FLUX.1-schnell weights, open [`https://huggingface.co/black-forest-labs/FLUX
 ## Generation controls
 
 - SD15 and SDXL expose text-to-image and image-to-image controls such as prompt, negative prompt, size, steps, guidance scale, seed, and output format.
+- SDXL and SD1.5 image-to-image support the optional named `Style reference` input backed by IP-Adapter on the verified Linux ARM64/GB10/cu130 local path. SD1.5 text-to-image is unchanged. ControlNet remains future explicit-node work.
 - FLUX.1-schnell exposes text-to-image controls tuned for its pipeline, including prompt, size, steps, guidance scale, maximum sequence length, seed, and output format.
 - PNG is the default output format. JPEG output is available with a configurable JPEG quality value.
 - FLUX.1-schnell recommends low step counts (`1`-`4`) and guidance `0.0`, but higher values are allowed for experimentation and may not improve quality.
@@ -138,6 +139,8 @@ The operational flow has **two separate steps**:
 
 1. **Install GitHub / Repair**: run each extension's `setup.py` with a Modly JSON payload to create `venv`, install dependencies, and persist readiness.
 2. **Install Weights**: download model files outside this repo into `modelsDir/<ext.id>/<node.id>/...`.
+
+Generation is local-only/no-download after Install/Repair and weight installation have acquired the required baseline and optional assets. Install/Repair may acquire supported optional IP-Adapter assets for SDXL and SD1.5 style-reference readiness; generation must use local files only. Windows installation support is prepared as a `windows-amd64` candidate path for later validation and must not be described as verified until real Windows evidence exists. ControlNet is intentionally separate future work with explicit nodes.
 
 Example setup invocation:
 

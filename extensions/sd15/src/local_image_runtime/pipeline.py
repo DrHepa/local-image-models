@@ -41,7 +41,7 @@ JPEG_OUTPUT_EXTENSION = ".jpg"
 FLUX_SCHNELL_MAX_STEPS = 30
 FLUX_SCHNELL_MAX_GUIDANCE_SCALE = 50.0
 ANONYMOUS_IMAGE_INPUT_PATTERN = re.compile(r"^image(?:[\s_-]*[2-9]\d*)$", re.IGNORECASE)
-SDXL_STYLE_REFERENCE_INPUT_KEYS = ("Style reference", "style_reference")
+STYLE_REFERENCE_INPUT_KEYS = ("Style reference", "style_reference")
 DEFAULT_REFERENCE_STRENGTH = 0.6
 
 
@@ -240,7 +240,7 @@ def _validate_conditioning_payload(request: ExecutionRequest) -> ConditioningPay
 
 def _style_reference_paths_from_role_inputs(request: ExecutionRequest) -> tuple[str, ...]:
     paths: list[str] = []
-    for key in SDXL_STYLE_REFERENCE_INPUT_KEYS:
+    for key in STYLE_REFERENCE_INPUT_KEYS:
         raw_path = request.input.get(key)
         if raw_path is None:
             continue
@@ -248,7 +248,7 @@ def _style_reference_paths_from_role_inputs(request: ExecutionRequest) -> tuple[
     return tuple(dict.fromkeys(paths))
 
 
-def _merge_sdxl_style_reference_conditioning(
+def _merge_style_reference_conditioning(
     request: ExecutionRequest,
     conditioning: ConditioningPayload | None,
     *,
@@ -266,17 +266,13 @@ def _merge_sdxl_style_reference_conditioning(
             _validate_numeric_param(request.params, "reference_strength", expected_type=float, minimum=0.0, maximum=1.0)
         return conditioning, None
 
-    if extension_id != "sdxl-base":
-        if extension_id == "sd15":
-            raise RequestValidationError(
-                "SD1.5 style reference is not supported because compatible IP-Adapter adapter, "
-                "image encoder assets, and target-platform smoke evidence are not verified yet."
-            )
-        raise RequestValidationError("Style reference is supported only for SDXL Base image-to-image in this batch.")
+    supported_extensions = {"sdxl-base": "SDXL Base", "sd15": "SD1.5"}
+    if extension_id not in supported_extensions:
+        raise RequestValidationError("Style reference is supported only for SDXL Base or SD1.5 image-to-image.")
     if request.node_id != "image-to-image":
-        raise RequestValidationError("Style reference is supported only on SDXL Base image-to-image.")
+        raise RequestValidationError("Style reference is supported only on SDXL Base or SD1.5 image-to-image.")
     if len(style_references) != 1:
-        raise RequestValidationError("SDXL Base image-to-image supports exactly one style reference.")
+        raise RequestValidationError(f"{supported_extensions[extension_id]} image-to-image supports exactly one style reference.")
 
     reference_strength = _validate_numeric_param(
         request.params,
@@ -372,7 +368,7 @@ def _validate_node_payload(
 ) -> ValidatedPayload:
     _reject_anonymous_image_inputs(request.input)
     conditioning = _validate_conditioning_payload(request)
-    conditioning, reference_strength = _merge_sdxl_style_reference_conditioning(
+    conditioning, reference_strength = _merge_style_reference_conditioning(
         request,
         conditioning,
         extension_id=extension_id,
